@@ -224,17 +224,14 @@ class OmniGPUModelRunner(GPUModelRunner):
             # Decode additional_information payloads (dictionary)
             try:
                 payload_info = getattr(new_req_data, "additional_information", None)
-                logger.debug(f"[TTS DEBUG] req_id={req_id} additional_information type={type(payload_info)}, value={payload_info is not None}")
                 if payload_info is not None:
                     info_dict = {}
                     if isinstance(payload_info, dict):
                         info_dict = payload_info
-                        logger.debug(f"[TTS DEBUG] req_id={req_id} dict keys={list(payload_info.keys())}")
                     else:
                         from vllm_omni.engine import AdditionalInformationPayload
 
                         if isinstance(payload_info, AdditionalInformationPayload):
-                            logger.debug(f"[TTS DEBUG] req_id={req_id} payload entries keys={list(payload_info.entries.keys())}")
                             for k, entry in payload_info.entries.items():
                                 if entry.tensor_data is not None:
                                     dt = np.dtype(getattr(entry, "tensor_dtype", "float32"))
@@ -243,9 +240,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                                     info_dict[k] = torch.from_numpy(arr.copy())
                                 else:
                                     info_dict[k] = entry.list_data
-                                    logger.debug(f"[TTS DEBUG] req_id={req_id} key={k} list_data={entry.list_data is not None}")
                     if info_dict:
-                        logger.debug(f"[TTS DEBUG] req_id={req_id} setting additional_information_cpu with keys={list(info_dict.keys())}")
                         setattr(
                             self.requests[req_id],
                             "additional_information_cpu",
@@ -776,7 +771,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         for req_id in self.input_batch.req_ids:
             req_state = self.requests.get(req_id)
             info = getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
-            logger.debug(f"[TTS DEBUG] _gather req_id={req_id} has additional_information_cpu={info is not None}, keys={list(info.keys()) if info else 'N/A'}")
             if info and isinstance(info, dict):
                 per_req_runtime_info.append(info)
                 if "thinker_reply_part_per_request" in info:

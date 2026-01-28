@@ -113,11 +113,8 @@ class Qwen3TTSModelForGeneration(nn.Module):
         # Extract additional parameters from kwargs that the generation methods expect
 
         runtime_additional_information = kwargs.get("runtime_additional_information", [{}])
-        logger.debug(f"[TTS DEBUG] runtime_additional_information type={type(runtime_additional_information)}, len={len(runtime_additional_information) if isinstance(runtime_additional_information, list) else 'N/A'}")
         if isinstance(runtime_additional_information, list) and len(runtime_additional_information) > 0:
             runtime_additional_information = runtime_additional_information[0]
-        logger.debug(f"[TTS DEBUG] runtime_additional_information keys={list(runtime_additional_information.keys()) if isinstance(runtime_additional_information, dict) else 'not dict'}")
-        logger.debug(f"[TTS DEBUG] ref_audio present={runtime_additional_information.get('ref_audio') is not None}, ref_text present={runtime_additional_information.get('ref_text') is not None}")
         text = runtime_additional_information.pop("text", [""])[0]
         # Extract task_type from kwargs, default to "instruct"
         task_type = runtime_additional_information.pop("task_type", [self.task_type])[0]
