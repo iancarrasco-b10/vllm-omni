@@ -30,6 +30,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .configuration_qwen3_tts import Qwen3TTSConfig
@@ -87,6 +88,31 @@ class Qwen3TTSModelForGeneration(nn.Module):
 
         # Store vllm_config for potential future use
         self.vllm_config = vllm_config
+
+        # Apply torch.compile for inference optimization if not in eager mode
+        enforce_eager = getattr(vllm_config.model_config, "enforce_eager", False)
+        if not enforce_eager:
+            self._apply_torch_compile()
+
+    def _apply_torch_compile(self) -> None:
+        """
+        Apply torch.compile to the TTS model's transformer blocks for inference optimization.
+
+        This uses regional compilation to compile the repeated decoder layers,
+        following the same pattern as diffusion models in this codebase.
+        """
+        try:
+            # Compile the main talker model (Qwen3TTSTalkerModel)
+            talker_model = self.model.model.talker.model
+            regionally_compile(talker_model, dynamic=True)
+
+            # Compile the code predictor model (Qwen3TTSTalkerCodePredictorModel)
+            code_predictor_model = self.model.model.talker.code_predictor.model
+            regionally_compile(code_predictor_model, dynamic=True)
+
+            logger.info("Qwen3TTS: Model compiled with torch.compile (regional compilation).")
+        except Exception as e:
+            logger.warning(f"Qwen3TTS: torch.compile failed with error: {e}. Using eager mode.")
 
     def forward(
         self,

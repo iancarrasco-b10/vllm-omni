@@ -977,6 +977,7 @@ class Qwen3TTSDecoderLayer(GradientCheckpointingLayer):
 class Qwen3TTSTalkerCodePredictorModel(Qwen3TTSPreTrainedModel):
     config_class = Qwen3TTSTalkerCodePredictorConfig
     base_model_prefix = "talker.code_predictor.model"
+    _repeated_blocks = ["Qwen3TTSDecoderLayer"]
 
     def __init__(self, config: Qwen3TTSTalkerCodePredictorConfig, embedding_dim: int):
         super().__init__(config)
@@ -1386,6 +1387,7 @@ class Qwen3TTSTalkerDecoderLayer(GradientCheckpointingLayer):
 class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
     config_class = Qwen3TTSTalkerConfig
     base_model_prefix = "talker.model"
+    _repeated_blocks = ["Qwen3TTSTalkerDecoderLayer"]
 
     def __init__(self, config):
         super().__init__(config)
