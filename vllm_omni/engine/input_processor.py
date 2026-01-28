@@ -247,9 +247,11 @@ class OmniInputProcessor(InputProcessor):
                 dtype=dtype_str,
             )
         raw_info: dict[str, Any] | None = decoder_inputs.get("additional_information")  # type: ignore[operator]
+        logger.debug(f"[TTS DEBUG] input_processor raw_info keys={list(raw_info.keys()) if raw_info else 'None'}")
         if raw_info is not None:
             entries: dict[str, AdditionalInformationEntry] = {}
             for key, value in raw_info.items():
+                logger.debug(f"[TTS DEBUG] input_processor processing key={key}, value_type={type(value)}, is_list={isinstance(value, list)}")
                 if isinstance(value, torch.Tensor):
                     v_cpu = value.detach().to("cpu").contiguous()
                     dtype_str = self._dtype_to_name(v_cpu.dtype)
@@ -261,10 +263,12 @@ class OmniInputProcessor(InputProcessor):
                     )
                 elif isinstance(value, list):
                     entry = AdditionalInformationEntry(list_data=value)
+                    logger.debug(f"[TTS DEBUG] input_processor key={key} list_data={value}")
                 else:
                     raise ValueError("additional_information values must be Tensor or list")
                 entries[key] = entry
             additional_information_payload = AdditionalInformationPayload(entries=entries)
+            logger.debug(f"[TTS DEBUG] input_processor created payload with keys={list(entries.keys())}")
 
         return OmniEngineCoreRequest(
             request_id=request_id,

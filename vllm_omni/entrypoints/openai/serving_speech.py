@@ -217,10 +217,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 prompt = {"prompt": request.input}
 
             logger.info(
-                "TTS speech request %s: text=%r, task_type=%s",
+                "TTS speech request %s: text=%r, task_type=%s, ref_audio=%s, ref_text=%s",
                 request_id,
                 request.input[:50] + "..." if len(request.input) > 50 else request.input,
                 tts_params.get("task_type", ["unknown"])[0],
+                tts_params.get("ref_audio", [None])[0][:50] + "..." if tts_params.get("ref_audio") else None,
+                tts_params.get("ref_text", [None])[0][:30] + "..." if tts_params.get("ref_text") else None,
             )
 
             sampling_params_list = self.engine_client.default_sampling_params_list
