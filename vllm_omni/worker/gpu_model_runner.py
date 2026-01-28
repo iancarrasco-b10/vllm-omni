@@ -223,8 +223,8 @@ class OmniGPUModelRunner(GPUModelRunner):
                 logger.error(f"Error decoding prompt embeds: {e}")
             # Decode additional_information payloads (dictionary)
             try:
-                payload_info = getattr(new_req_data, "additional_information", None)
-                if payload_info is not None:
+                if getattr(new_req_data, "additional_information", None) is not None:
+                    payload_info = new_req_data.additional_information
                     info_dict = {}
                     if isinstance(payload_info, dict):
                         info_dict = payload_info
@@ -248,8 +248,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                         )
             except Exception as e:
                 logger.error(f"Error decoding additional information: {e}")
-                import traceback
-                traceback.print_exc()
+                pass
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
