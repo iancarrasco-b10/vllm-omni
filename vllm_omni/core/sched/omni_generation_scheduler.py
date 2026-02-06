@@ -1,6 +1,7 @@
 import time
 from collections import defaultdict
 
+import torch
 from vllm.distributed.kv_events import KVEventBatch
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -315,14 +316,24 @@ class OmniGenerationScheduler(VLLMScheduler):
             if pooler_outputs:
                 pooler_output = pooler_outputs[req_index]
 
-            # Diffusion request: completes in one step; mark finished and free resources
-            if request.status == RequestStatus.FINISHED_STOPPED or (
-                self.omni_connector is None and request.num_computed_tokens >= request.num_prompt_tokens
+            # Check if streaming model has signaled completion
+            streaming_finished = True
+            if pooler_output and isinstance(pooler_output, dict):
+                finished_val = pooler_output.get("finished")
+                if finished_val is not None:
+                    if isinstance(finished_val, torch.Tensor):
+                        streaming_finished = bool(finished_val.item())
+                    else:
+                        streaming_finished = bool(finished_val)
+
+            # Diffusion/streaming request: completes when model signals done
+            if streaming_finished and (
+                request.status == RequestStatus.FINISHED_STOPPED or (
+                    self.omni_connector is None and request.num_computed_tokens >= request.num_prompt_tokens
+                )
             ):
                 request.status = RequestStatus.FINISHED_STOPPED
-                # Optional: set a stop_reason for front-end clarity
-                # (does not affect protocol)
-                request.stop_reason = request.stop_reason  # or "generation_done"
+                request.stop_reason = request.stop_reason
                 kv_transfer_params = self._free_request(request)
                 stopped_running_reqs.add(request)
 

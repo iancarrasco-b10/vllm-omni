@@ -991,6 +991,10 @@ class Qwen3TTSTokenizerV2Model(Qwen3TTSTokenizerV2PreTrainedModel):
         """
         return_dict = return_dict if return_dict is not None else self.config.return_dict
 
+        # Clamp codec tokens to valid range to prevent crashes during streaming decode
+        codebook_size = self.config.codebook_size
+        audio_codes = audio_codes.clamp(max=codebook_size - 1)
+
         audio_values = self.decoder.chunked_decode(audio_codes.transpose(1, 2)).squeeze(1)
 
         audio_lengths = (audio_codes[..., 0] > 0).sum(1) * self.decode_upsample_rate

@@ -13,7 +13,7 @@ from http import HTTPStatus
 from typing import Any, cast
 
 import vllm.envs as envs
-from fastapi import Depends, HTTPException, Request
+from fastapi import Depends, HTTPException, Request, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.datastructures import State
 from starlette.routing import Route
@@ -81,6 +81,7 @@ from vllm_omni.entrypoints.openai.protocol.images import (
 )
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
@@ -655,6 +656,7 @@ async def omni_init_app_state(
     state.openai_serving_speech = OmniOpenAIServingSpeech(
         engine_client, state.openai_serving_models, request_logger=request_logger
     )
+    state.openai_streaming_speech = OmniStreamingSpeechHandler(state.openai_serving_speech)
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
@@ -760,6 +762,15 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
         return await handler.create_speech(request, raw_request)
     except Exception as e:
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
+
+
+@router.websocket("/v1/audio/speech/stream")
+async def websocket_speech_stream(websocket: WebSocket):
+    handler = websocket.app.state.openai_streaming_speech
+    if handler is None:
+        await websocket.close(code=1003, reason="Streaming speech not available")
+        return
+    await handler.handle(websocket)
 
 
 # Health and Model endpoints for diffusion mode

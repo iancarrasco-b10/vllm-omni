@@ -67,6 +67,7 @@ class OmniRequestOutput:
         stage_id: int,
         final_output_type: str,
         request_output: RequestOutput,
+        finished: bool = True,
     ) -> "OmniRequestOutput":
         """Create output from pipeline stage.
 
@@ -74,6 +75,7 @@ class OmniRequestOutput:
             stage_id: Stage identifier
             final_output_type: Type of output
             request_output: The stage's output
+            finished: Whether generation is complete
 
         Returns:
             OmniRequestOutput configured for pipeline mode
@@ -83,7 +85,7 @@ class OmniRequestOutput:
             stage_id=stage_id,
             final_output_type=final_output_type,
             request_output=request_output,
-            finished=True,
+            finished=finished,
         )
 
     @classmethod

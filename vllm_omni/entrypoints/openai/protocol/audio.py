@@ -48,6 +48,10 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description="Maximum tokens to generate",
     )
+    stream: bool = Field(
+        default=False,
+        description="Enable streaming audio output",
+    )
 
     @field_validator("stream_format")
     @classmethod
@@ -67,6 +71,19 @@ class CreateAudio(BaseModel):
 
     class Config:
         arbitrary_types_allowed = True
+
+
+class StreamingSpeechSessionConfig(BaseModel):
+    """Configuration for a WebSocket streaming TTS session."""
+    voice: str | None = "Vivian"
+    task_type: str = "CustomVoice"
+    language: str = "Auto"
+    instructions: str | None = None
+    response_format: str = "pcm"
+    ref_audio: str | None = None
+    ref_text: str | None = None
+    x_vector_only_mode: bool | None = None
+    max_new_tokens: int | None = None
 
 
 class AudioResponse(BaseModel):

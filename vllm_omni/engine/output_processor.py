@@ -162,7 +162,11 @@ class OmniRequestState(RequestState):
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
 
         if not finished and final_only:
-            return None
+            # For streaming audio, still emit intermediate outputs
+            if self.mm_accumulated is not None and self.mm_type == "audio":
+                pass  # Fall through to create output
+            else:
+                return None
 
         if self.stream_interval > 1:
             assert self.detokenizer is not None
@@ -215,6 +219,11 @@ class OmniRequestState(RequestState):
                         mm_out[k] = v
                 else:
                     setattr(base_output, "multimodal_output", self.mm_accumulated)
+
+                # For streaming audio, reset accumulated data after attaching
+                # so next intermediate output only contains the new chunk
+                if self.mm_type == "audio" and finish_reason is None:
+                    self.mm_accumulated = None
         except Exception:
             logger.exception("Error in _new_completion_output")
         return base_output

@@ -1,8 +1,9 @@
 import asyncio
 from typing import Any
 
+import numpy as np
 from fastapi import Request
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from vllm.entrypoints.openai.serving_engine import OpenAIServing
 from vllm.logger import init_logger
 from vllm.utils import random_uuid
@@ -184,7 +185,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         - ref_text: Transcript of reference audio (Base task)
         - x_vector_only_mode: Use speaker embedding only (Base task)
 
-        NOTE: Streaming audio generation is not currently supported.
+        Streaming is supported via stream=True parameter.
         """
 
         error_check_ret = await self._check_model(request)
@@ -194,6 +195,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         if self.engine_client.errored:
             raise self.engine_client.dead_error
+
+        # Route to streaming if requested
+        if request.stream:
+            return await self.create_speech_streaming(request, raw_request)
 
         request_id = f"speech-{random_uuid()}"
 
@@ -283,3 +288,133 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except Exception as e:
             logger.exception("Speech generation failed: %s", e)
             return self.create_error_response(f"Speech generation failed: {e}")
+
+    async def _generate_audio_chunks(
+        self, request: OpenAICreateSpeechRequest
+    ):
+        """Generate streaming audio chunks from the engine.
+
+        Yields:
+            tuple: (audio_bytes, is_finished)
+        """
+        request_id = f"speech-stream-{random_uuid()}"
+
+        if self._is_tts_model():
+            validation_error = self._validate_tts_request(request)
+            if validation_error:
+                raise ValueError(validation_error)
+
+            tts_params = self._build_tts_params(request)
+            tts_params["stream"] = [True]
+            tts_params["request_id"] = [request_id]
+            prompt_text = self._build_tts_prompt(request.input)
+            prompt = {
+                "prompt": prompt_text,
+                "additional_information": tts_params,
+            }
+        else:
+            raise ValueError("Streaming is only supported for TTS models")
+
+        sampling_params_list = self.engine_client.default_sampling_params_list
+
+        generator = self.engine_client.generate(
+            prompt=prompt,
+            request_id=request_id,
+            sampling_params_list=sampling_params_list,
+            output_modalities=["audio"],
+        )
+
+        async for res in generator:
+            if res is None:
+                continue
+
+            audio_output = None
+            if hasattr(res, "multimodal_output") and res.multimodal_output:
+                audio_output = res.multimodal_output
+            elif hasattr(res, "request_output") and res.request_output:
+                if hasattr(res.request_output, "multimodal_output"):
+                    audio_output = res.request_output.multimodal_output
+
+            if not audio_output:
+                continue
+
+            # Extract audio data
+            audio_key = "audio" if "audio" in audio_output else "model_outputs"
+            if audio_key not in audio_output:
+                continue
+
+            audio_tensor = audio_output[audio_key]
+            sample_rate = audio_output.get("sr", 24000)
+            if hasattr(sample_rate, "item"):
+                sample_rate = sample_rate.item()
+
+            is_finished = getattr(res, "finished", True)
+            finished_val = audio_output.get("finished")
+            if finished_val is not None:
+                if hasattr(finished_val, "item"):
+                    is_finished = bool(finished_val.item())
+                else:
+                    is_finished = bool(finished_val)
+
+            if hasattr(audio_tensor, "float"):
+                audio_tensor = audio_tensor.float().detach().cpu().numpy()
+
+            if isinstance(audio_tensor, np.ndarray) and audio_tensor.ndim > 1:
+                audio_tensor = audio_tensor.squeeze()
+
+            # Convert to requested format
+            audio_obj = CreateAudio(
+                audio_tensor=audio_tensor,
+                sample_rate=int(sample_rate),
+                response_format=request.response_format or "pcm",
+                speed=request.speed or 1.0,
+                stream_format=request.stream_format,
+                base64_encode=False,
+            )
+
+            audio_response: AudioResponse = self.create_audio(audio_obj)
+            yield audio_response.audio_data, is_finished
+
+    async def create_speech_streaming(
+        self,
+        request: OpenAICreateSpeechRequest,
+        raw_request: Request | None = None,
+    ):
+        """Create streaming speech response with chunked transfer encoding."""
+        try:
+            # Default to pcm for streaming (lower latency, no container overhead)
+            if request.response_format == "wav":
+                request.response_format = "pcm"
+
+            media_type_map = {
+                "pcm": "audio/pcm",
+                "wav": "audio/wav",
+                "mp3": "audio/mpeg",
+                "flac": "audio/flac",
+                "aac": "audio/aac",
+                "opus": "audio/opus",
+            }
+            media_type = media_type_map.get(request.response_format, "audio/pcm")
+
+            async def audio_stream_generator():
+                async for chunk_bytes, is_finished in self._generate_audio_chunks(request):
+                    if chunk_bytes:
+                        yield chunk_bytes
+                    if is_finished:
+                        break
+
+            return StreamingResponse(
+                content=audio_stream_generator(),
+                media_type=media_type,
+                headers={
+                    "Transfer-Encoding": "chunked",
+                    "X-Audio-Sample-Rate": "24000",
+                    "X-Audio-Format": request.response_format,
+                },
+            )
+
+        except ValueError as e:
+            return self.create_error_response(str(e))
+        except Exception as e:
+            logger.exception("Streaming speech generation failed: %s", e)
+            return self.create_error_response(f"Streaming speech generation failed: {e}")
