@@ -1128,7 +1128,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
         ):
             req_embeds, audio_codes = self.talker_mtp(req_input_ids, req_embeds, last_talker_hidden, text_step)
-        # Store per-step codec codes in additional_information_cpu under talker_mtp_output_key for make_omni_output.
+        # update the inputs_embeds and audio_codes
         audio_codes_cpu = audio_codes.detach().to("cpu").contiguous()
         out_key = getattr(self.model, "talker_mtp_output_key", "audio_codes")
         for idx, req_id in enumerate(decode_req_ids):

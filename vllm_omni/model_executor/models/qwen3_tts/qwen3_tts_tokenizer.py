@@ -14,8 +14,6 @@
 # limitations under the License.
 import base64
 import io
-import json
-from pathlib import Path
 import urllib.request
 from urllib.parse import urlparse
 from typing import Any
@@ -26,12 +24,16 @@ import soundfile as sf
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoConfig, AutoFeatureExtractor, AutoModel
-from transformers.utils.hub import cached_file
 
 from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Config
 from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
     Qwen3TTSTokenizerV2EncoderOutput,
     Qwen3TTSTokenizerV2Model,
+)
+from .tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1 import Qwen3TTSTokenizerV1Config
+from .tokenizer_25hz.modeling_qwen3_tts_tokenizer_v1 import (
+    Qwen3TTSTokenizerV1EncoderOutput,
+    Qwen3TTSTokenizerV1Model,
 )
 
 AudioInput = (
@@ -61,18 +63,6 @@ class Qwen3TTSTokenizer:
         self.config = None
         self.device = None
 
-    @staticmethod
-    def _resolve_local_config_path(pretrained_model_name_or_path: str) -> str:
-        p = Path(pretrained_model_name_or_path)
-        if p.is_dir():
-            cfg = p / "config.json"
-            if cfg.exists():
-                return str(cfg)
-        cfg = cached_file(pretrained_model_name_or_path, "config.json")
-        if cfg is None:
-            raise ValueError(f"config.json not found under {pretrained_model_name_or_path!r}")
-        return str(cfg)
-
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs) -> "Qwen3TTSTokenizer":
         """
@@ -93,42 +83,19 @@ class Qwen3TTSTokenizer:
 
         load_feature_extractor = bool(kwargs.pop("load_feature_extractor", True))
 
-        # Register 12Hz tokenizer (no optional deps).
         AutoConfig.register("qwen3_tts_tokenizer_12hz", Qwen3TTSTokenizerV2Config)
         AutoModel.register(Qwen3TTSTokenizerV2Config, Qwen3TTSTokenizerV2Model)
 
-        # Register 25Hz tokenizer only when needed (avoids importing optional 25Hz backends for 12Hz models).
-        cfg_path = cls._resolve_local_config_path(pretrained_model_name_or_path)
-        try:
-            cfg_json = json.loads(Path(cfg_path).read_text())
-        except Exception as e:
-            raise ValueError(f"Failed to parse tokenizer config.json at {cfg_path!r}: {e}") from e
-
-        model_type = str(cfg_json.get("model_type") or "")
-        if model_type == "qwen3_tts_tokenizer_25hz":
-            from .tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1 import Qwen3TTSTokenizerV1Config
-            from .tokenizer_25hz.modeling_qwen3_tts_tokenizer_v1 import Qwen3TTSTokenizerV1Model
-
-            AutoConfig.register("qwen3_tts_tokenizer_25hz", Qwen3TTSTokenizerV1Config)
-            AutoModel.register(Qwen3TTSTokenizerV1Config, Qwen3TTSTokenizerV1Model)
-        elif model_type != "qwen3_tts_tokenizer_12hz":
-            raise ValueError(f"Unsupported Qwen3-TTS tokenizer model_type={model_type!r} at {cfg_path!r}")
+        AutoConfig.register("qwen3_tts_tokenizer_25hz", Qwen3TTSTokenizerV1Config)
+        AutoModel.register(Qwen3TTSTokenizerV1Config, Qwen3TTSTokenizerV1Model)
 
         inst.model = AutoModel.from_pretrained(pretrained_model_name_or_path, **kwargs)
         inst.config = inst.model.config
 
-        if load_feature_extractor:
-            try:
-                inst.feature_extractor = AutoFeatureExtractor.from_pretrained(pretrained_model_name_or_path)
-            except Exception as e:
-                raise ValueError(
-                    "Failed to load Qwen3-TTS speech tokenizer feature extractor. "
-                    "Please make sure the checkpoint contains the required HF "
-                    "preprocessing files (e.g. preprocessor_config.json) under "
-                    "the speech_tokenizer directory."
-                ) from e
-        else:
-            inst.feature_extractor = None
+        inst.feature_extractor = (
+            AutoFeatureExtractor.from_pretrained(pretrained_model_name_or_path)
+            if load_feature_extractor else None
+        )
 
         inst.device = getattr(inst.model, "device", None)
         if inst.device is None:
@@ -220,8 +187,6 @@ class Qwen3TTSTokenizer:
             List[np.ndarray]:
                 List of float32 waveforms resampled to model input SR.
         """
-        if self.feature_extractor is None:
-            raise ValueError("Speech tokenizer feature extractor is not loaded; audio encode is not available.")
         target_sr = int(self.feature_extractor.sampling_rate)
 
         if isinstance(audios, (str, np.ndarray)):
@@ -254,7 +219,7 @@ class Qwen3TTSTokenizer:
         audios: AudioInput,
         sr: int | None = None,
         return_dict: bool = True,
-    ) -> Any:
+    ) -> Qwen3TTSTokenizerV1EncoderOutput | Qwen3TTSTokenizerV2EncoderOutput | tuple:
         """
         Batch-encode audio into discrete codes (and optional conditioning, depending on 25Hz/12Hz).
 
@@ -271,7 +236,7 @@ class Qwen3TTSTokenizer:
                 Forwarded to model.encode(...). If True, returns ModelOutput.
 
         Returns:
-            Any:
+            Qwen3TTSTokenizerV1EncoderOutput | Qwen3TTSTokenizerV2EncoderOutput | tuple:
                 Encoder output or tuple returned by model.encode. If return_dict=True,
                 returns a model-specific encoder output. For 25Hz models, this includes
                 audio_codes/xvectors/ref_mels; for 12Hz models, this includes audio_codes.
@@ -279,24 +244,18 @@ class Qwen3TTSTokenizer:
         """
         wavs = self._normalize_audio_inputs(audios, sr=sr)
 
-        if self.feature_extractor is None:
-            raise ValueError("Speech tokenizer feature extractor is not loaded; audio encode is not available.")
         inputs = self.feature_extractor(
             raw_audio=wavs,
             sampling_rate=int(self.feature_extractor.sampling_rate),
             return_tensors="pt",
         )
-        # Normalize to tensors and keep padding_mask integer (tokenizer expects 0/1).
-        input_values = inputs["input_values"].squeeze(1).to(self.device).to(self.model.dtype)
-        padding_mask = inputs["padding_mask"].squeeze(1).to(self.device)
-        if padding_mask.dtype == torch.bool:
-            padding_mask = padding_mask.to(torch.long)
+        inputs = inputs.to(self.device).to(self.model.dtype)
 
         with torch.inference_mode():
             # model.encode expects (B, T) and (B, T)
             enc = self.model.encode(
-                input_values,
-                padding_mask,
+                inputs["input_values"].squeeze(1),
+                inputs["padding_mask"].squeeze(1),
                 return_dict=return_dict,
             )
         return enc
