@@ -58,7 +58,6 @@ class OmniModelConfig(ModelConfig):
         }
     )
     omni_kv_config: dict | None = None
-    # Codec frame rate (frames/sec) for prompt length estimation.
     codec_frame_rate_hz: float | None = None
 
     @property

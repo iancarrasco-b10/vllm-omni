@@ -511,6 +511,17 @@ class Qwen3TTSConfig(PretrainedConfig):
         self.vision_config = PretrainedConfig()  # dummy vision config
         self.vision_config.spatial_merge_size = 1
 
+    @property
+    def codec_frame_rate_hz(self) -> float | None:
+        pos_per_sec = getattr(self.talker_config, "position_id_per_seconds", None)
+        if pos_per_sec is None:
+            return None
+        try:
+            fps = float(pos_per_sec)
+        except (TypeError, ValueError):
+            return None
+        return fps if fps > 0 else None
+
     def get_text_config(self, **kwargs):
         # vLLM expects text config to expose hidden_size/num_attention_heads.
         # For Qwen3 TTS, the talker config is the text model config.
