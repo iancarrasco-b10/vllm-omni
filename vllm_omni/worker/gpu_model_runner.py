@@ -321,8 +321,19 @@ class OmniGPUModelRunner(GPUModelRunner):
             req_index = self.input_batch.req_id_to_index.get(req_id)
 
             if req_state.prev_num_draft_len and self.use_async_scheduling:
-                # Async scheduling + spec decode: adjust num_computed_tokens only when prev_num_draft_len > 0.
-                # This accounts for rejected draft tokens from the previous step.
+                # prev_num_draft_len is used in async scheduling mode with
+                # spec decode. it indicates if need to update num_computed_tokens
+                # of the request. for example:
+                # fist step: num_computed_tokens = 0, spec_tokens = [],
+                # prev_num_draft_len = 0.
+                # second step: num_computed_tokens = 100(prompt length),
+                # spec_tokens = [a,b], prev_num_draft_len = 0.
+                # third step: num_computed_tokens = 100 + 2, spec_tokens = [c,d],
+                # prev_num_draft_len = 2.
+                # num_computed_tokens in first step and second step does't contain
+                # the spec tokens length, but in third step it contains the
+                # spec tokens length. we only need to update num_computed_tokens
+                # when prev_num_draft_len > 0.
                 if req_index is None:
                     req_state.prev_num_draft_len = 0
                 else:
@@ -815,47 +826,8 @@ class OmniGPUModelRunner(GPUModelRunner):
                 for req_id, payload_info in cached_infos.items():
                     if req_id not in self.requests:
                         continue
-                    if payload_info is None:
-                        continue
-                    info_dict: dict[str, object] | None = None
-                    if isinstance(payload_info, dict):
-                        info_dict = payload_info
-                    else:
-                        entries = getattr(payload_info, "entries", None)
-                        if isinstance(entries, dict):
-                            decoded: dict[str, object] = {}
-                            for k, entry in entries.items():
-                                tensor_data = getattr(entry, "tensor_data", None)
-                                if tensor_data is not None:
-                                    dt = np.dtype(getattr(entry, "tensor_dtype", "float32"))
-                                    arr = np.frombuffer(tensor_data, dtype=dt)
-                                    arr = arr.reshape(getattr(entry, "tensor_shape", ()))
-                                    decoded[k] = torch.from_numpy(arr.copy())
-                                else:
-                                    decoded[k] = getattr(entry, "list_data", None)
-                            info_dict = decoded
-
-                    if not info_dict:
-                        continue
-
-                    req_state = self.requests[req_id]
-                    existing = getattr(req_state, "additional_information_cpu", None)
-                    if not isinstance(existing, dict) or not existing:
-                        setattr(req_state, "additional_information_cpu", info_dict)
-                        continue
-
-                    merged = dict(existing)
-                    for k, v in info_dict.items():
-                        if isinstance(v, torch.Tensor):
-                            merged[k] = v.detach().to("cpu").contiguous()
-                        elif isinstance(v, list):
-                            merged[k] = [
-                                (item.detach().to("cpu").contiguous() if isinstance(item, torch.Tensor) else item)
-                                for item in v
-                            ]
-                        else:
-                            merged[k] = v
-                    setattr(req_state, "additional_information_cpu", merged)
+                    if isinstance(payload_info, dict) and payload_info:
+                        self._merge_additional_information_update(req_id, payload_info)
         except Exception as e:
             logger.error(f"Error decoding prompt_embeds / additional_information: {e}")
 
