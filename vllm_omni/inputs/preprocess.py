@@ -26,33 +26,6 @@ class OmniInputPreprocessor(InputPreprocessor):
     Supports processing tokens, embeddings, text, and multimodal inputs.
     """
 
-    @staticmethod
-    def _get_prompt_placeholder(additional_information: dict[str, Any] | None) -> tuple[int, int] | None:
-        """Extract generic placeholder length and pad_id from additional_information.
-
-        Returns (prompt_placeholder_len, prompt_placeholder_pad_id) if the
-        upstream serving layer pre-computed them, else None.
-        """
-        if not isinstance(additional_information, dict):
-            return None
-        raw_len = additional_information.get("prompt_placeholder_len")
-        raw_pad = additional_information.get("prompt_placeholder_pad_id")
-        if raw_len is None:
-            return None
-        # Values are wrapped in lists by the serving layer.
-        if isinstance(raw_len, list):
-            raw_len = raw_len[0] if raw_len else None
-        if isinstance(raw_pad, list):
-            raw_pad = raw_pad[0] if raw_pad else 0
-        try:
-            ph_len = int(raw_len)
-            ph_pad = int(raw_pad) if raw_pad is not None else 0
-        except (TypeError, ValueError):
-            return None
-        if ph_len <= 0:
-            return None
-        return ph_len, max(0, ph_pad)
-
     def _process_text(
         self,
         parsed_content: OmniTextPrompt,
@@ -78,18 +51,10 @@ class OmniInputPreprocessor(InputPreprocessor):
             if additional_information is not None:
                 inputs["additional_information"] = additional_information
         else:
-            additional_information = parsed_content.get("additional_information")
-            placeholder = self._get_prompt_placeholder(additional_information)
-            if placeholder is not None:
-                # Upstream serving layer pre-computed placeholder length/pad_id
-                # (e.g. TTS models whose text tokens are OOV in the codec vocab).
-                ph_len, ph_pad = placeholder
-                prompt_token_ids = [ph_pad] * ph_len
-            else:
-                prompt_token_ids = self._tokenize_prompt(
-                    prompt_text,
-                    tokenization_kwargs=tokenization_kwargs,
-                )
+            prompt_token_ids = self._tokenize_prompt(
+                prompt_text,
+                tokenization_kwargs=tokenization_kwargs,
+            )
             inputs = token_inputs_omni(
                 prompt_token_ids,
                 prompt_embeds=parsed_content.get("prompt_embeds"),

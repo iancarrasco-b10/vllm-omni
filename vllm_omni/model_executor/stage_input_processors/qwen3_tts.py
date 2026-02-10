@@ -1,84 +1,131 @@
-"""Stage input processor for Qwen3-TTS: Talker → SpeechTokenizer transition."""
+"""Stage input processor for Qwen3-TTS: Talker -> Code2Wav."""
 
 from typing import Any
 
 import torch
 
 
-def talker2speech_tokenizer_async_chunk(
-    pooling_output: dict[str, Any],
-    request: Any,
-) -> dict[str, Any] | None:
-    """Async-chunk payload extractor for Qwen3-TTS Talker → SpeechTokenizer.
-
-    Stage-0 emits per-step codec codes; they are sent via connector and consumed by Stage-1 as `prompt_token_ids`.
-    Returns: `code_predictor_codes` (List[int]) / `codec_streaming` (bool) / `finished` (torch.bool).
-    """
-    if not isinstance(pooling_output, dict):
-        return None
-
-    # `codec_streaming` is the cross-stage streaming toggle (not the official `non_streaming_mode`).
-    # It can be overridden per request.
+def _get_request_info(request: Any) -> dict[str, Any]:
     info = getattr(request, "additional_information_cpu", None)
     if info is None:
         info = getattr(request, "additional_information", None)
-    # vLLM may pass additional information as a list for batched requests; Qwen3-TTS typically uses batch=1.
     if isinstance(info, list) and info and isinstance(info[0], dict):
         info = info[0]
-    if not isinstance(info, dict):
-        info = {}
+    return info if isinstance(info, dict) else {}
 
-    def _first(x: object, default: object) -> object:
-        if isinstance(x, list):
-            return x[0] if x else default
-        return x if x is not None else default
 
-    # In async_chunk, Stage-1 consumes only newly scheduled tokens per step; Stage-0 must stream frame-aligned windows.
-    # Stage-1 trims left-context each step.
-    codec_streaming_val = _first(info.get("codec_streaming"), True)
-    codec_streaming = bool(codec_streaming_val) if isinstance(codec_streaming_val, bool) else True
-    # Do not override from `pooling_output`: this is a pipeline contract.
-    # Mis-overrides can break Stage-1 trim/paste rules.
+def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
+    audio_codes = pooling_output.get("audio_codes")
+    if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
+        return None
+    if audio_codes.ndim == 2:
+        frame = audio_codes[-1]
+        if frame.numel() == 0 or not bool(frame.any().item()):
+            return None
+        return frame.to(torch.long).reshape(-1)
+    if audio_codes.ndim == 1:
+        return audio_codes.to(torch.long).reshape(-1)
+    raise ValueError(f"Invalid audio_codes shape for Qwen3-TTS async_chunk: {tuple(audio_codes.shape)}")
 
-    # The stop-token step is not a decodable frame; only notify Stage-1 via `finished`.
-    finished = False
-    try:
-        finished = bool(request.is_finished())
-    except Exception:
-        finished = False
 
-    if finished:
+def talker2code2wav_async_chunk(
+    connector: Any,
+    pooling_output: dict[str, Any],
+    request: Any,
+) -> dict[str, Any] | None:
+    if not isinstance(pooling_output, dict):
+        return None
+
+    info = _get_request_info(request)
+    request_id = request.external_req_id
+
+    codec_streaming_raw = info.get("codec_streaming", True)
+    if isinstance(codec_streaming_raw, list):
+        codec_streaming_raw = codec_streaming_raw[0] if codec_streaming_raw else True
+    codec_streaming = codec_streaming_raw if isinstance(codec_streaming_raw, bool) else True
+
+    raw_cfg = getattr(connector, "config", {}) or {}
+    cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
+    chunk_size = int(cfg.get("codec_chunk_frames", 25))
+    left_context_size = int(cfg.get("codec_left_context_frames", 25))
+    if chunk_size <= 0 or left_context_size < 0:
+        raise ValueError(
+            f"Invalid codec chunk config: codec_chunk_frames={chunk_size}, "
+            f"codec_left_context_frames={left_context_size}"
+        )
+
+    finished = bool(request.is_finished())
+
+    appended_frame = False
+    if not finished:
+        frame = _extract_last_frame(pooling_output)
+        if frame is None:
+            return None
+        codec_codes = frame.cpu().tolist()
+        connector.code_prompt_token_ids[request_id].append(codec_codes)
+        appended_frame = True
+
+    length = len(connector.code_prompt_token_ids[request_id])
+    chunk_length = length % chunk_size
+
+    if chunk_length != 0 and not finished:
+        return None
+
+    context_length = chunk_length if chunk_length != 0 else chunk_size
+
+    if finished and (not appended_frame) and chunk_length == 0:
         return {
             "code_predictor_codes": [],
             "codec_streaming": codec_streaming,
+            "codec_context_codes": [],
+            "codec_context_frames": 0,
+            "codec_total_frames": 0,
+            "codec_chunk_frames": 0,
+            "codec_num_code_groups": 0,
+            "codec_layout": "codebook_major",
             "finished": torch.tensor(True, dtype=torch.bool),
         }
 
-    # Talker AR stage exposes per-step codes as `audio_codes` (shape [T, Q]).
-    audio_codes = pooling_output.get("audio_codes")
-    if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
-        # Nothing to send for this step.
-        return None
+    if length <= 0:
+        return {
+            "code_predictor_codes": [],
+            "codec_streaming": codec_streaming,
+            "codec_context_codes": [],
+            "codec_context_frames": 0,
+            "codec_total_frames": 0,
+            "codec_chunk_frames": 0,
+            "codec_num_code_groups": 0,
+            "codec_layout": "codebook_major",
+            "finished": torch.tensor(bool(finished), dtype=torch.bool),
+        }
 
-    # `audio_codes` may include prefill/placeholder frames (shape [T,Q]); take only the last frame and skip if all-zero.
-    if audio_codes.ndim == 2:
-        frame = audio_codes[-1]
-        try:
-            if frame.numel() == 0 or not bool(frame.any().item()):
-                return None
-        except Exception:
-            # If `.any()` is unreliable, prefer sending the last frame and let Stage-1 fail-fast on misalignment.
-            pass
-    elif audio_codes.ndim == 1:
-        frame = audio_codes
+    end_index = min(length, left_context_size + context_length)
+    ctx_frames = max(0, int(end_index - context_length))
+    window_frames = connector.code_prompt_token_ids[request_id][-end_index:]
+
+    if ctx_frames > 0:
+        ctx_part = window_frames[:ctx_frames]
+        codec_context_codes = torch.tensor(ctx_part).transpose(0, 1).reshape(-1).tolist()
     else:
-        raise ValueError(f"Invalid audio_codes shape for Qwen3-TTS async_chunk: {tuple(audio_codes.shape)}")
+        codec_context_codes = []
 
-    frame = frame.to(torch.long).reshape(-1)
-    codec_codes = frame.cpu().tolist()
+    chunk_part = window_frames[ctx_frames:]
+    code_predictor_codes = torch.tensor(chunk_part).transpose(0, 1).reshape(-1).tolist()
+
+    num_code_groups = int(
+        len(connector.code_prompt_token_ids[request_id][-1])
+        if connector.code_prompt_token_ids[request_id]
+        else 0
+    )
 
     return {
-        "code_predictor_codes": codec_codes,
+        "code_predictor_codes": code_predictor_codes,
         "codec_streaming": codec_streaming,
+        "codec_context_codes": codec_context_codes,
+        "codec_context_frames": int(ctx_frames),
+        "codec_total_frames": int(end_index),
+        "codec_chunk_frames": int(context_length),
+        "codec_num_code_groups": num_code_groups,
+        "codec_layout": "codebook_major",
         "finished": torch.tensor(bool(finished), dtype=torch.bool),
     }

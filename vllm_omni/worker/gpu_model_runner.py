@@ -72,6 +72,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         super().load_model(*args, **kwargs)
 
         # TODO move this model specific logic to a separate class
+        # TTS model IS the talker (no .talker sub-attr); use getattr to support both Omni and TTS.
         talker_mtp = getattr(self.model, "talker_mtp", None)
         if talker_mtp is not None:
             self.talker_mtp = talker_mtp  # type: ignore[assignment]
@@ -79,6 +80,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             assert cudagraph_mode is not None
             if cudagraph_mode.has_full_cudagraphs():
                 self.talker_mtp = CUDAGraphWrapper(talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
+            # TTS exposes mtp_hidden_size; Omni uses hf_text_config.hidden_size.
             hidden_size = int(
                 getattr(self.model, "mtp_hidden_size", 0) or getattr(self.model_config.hf_text_config, "hidden_size")
             )
@@ -308,12 +310,6 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests[req_id]
-            # async_chunk: keep per-step additional_information_cpu in sync (e.g. codec window metadata).
-            cached_infos = getattr(req_data, "additional_information", None)
-            if isinstance(cached_infos, dict):
-                info = cached_infos.get(req_id)
-                if isinstance(info, dict) and info:
-                    self._merge_additional_information_update(req_id, info)
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_id in req_data.resumed_req_ids
@@ -818,16 +814,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                                     info_dict[k] = getattr(entry, "list_data", None)
                     if info_dict and req_id in self.requests:
                         setattr(self.requests[req_id], "additional_information_cpu", info_dict)
-
-            # async_chunk: refresh additional_information_cpu for cached/running requests too (metadata can change per step).
-            cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
-            cached_infos = getattr(cached_reqs, "additional_information", None) if cached_reqs is not None else None
-            if isinstance(cached_infos, dict) and cached_infos:
-                for req_id, payload_info in cached_infos.items():
-                    if req_id not in self.requests:
-                        continue
-                    if isinstance(payload_info, dict) and payload_info:
-                        self._merge_additional_information_update(req_id, payload_info)
         except Exception as e:
             logger.error(f"Error decoding prompt_embeds / additional_information: {e}")
 
@@ -945,9 +931,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         intermediate_tensors: IntermediateTensors | None = None,
     ):
         """Align with v0.14.0 preprocess and omni's additional information handling."""
-        # Decode prompt_embeds/additional_information payloads before model.preprocess() uses them.
-        self._decode_and_store_request_payloads(scheduler_output)
-
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         is_first_rank = get_pp_group().is_first_rank
         is_encoder_decoder = self.model_config.is_encoder_decoder
@@ -1169,7 +1152,10 @@ class OmniGPUModelRunner(GPUModelRunner):
         self._omni_last_model_output = model_output
         return model_output
 
-    def _merge_additional_information_update(self, req_id: str, upd: dict) -> None:
+    def _merge_additional_information_update(self, req_id: str, upd: dict | None) -> None:
+        # Guard: _update_additional_information may pass None when additional_information is absent.
+        if not isinstance(upd, dict):
+            return
         req_state = self.requests.get(req_id)
         if req_state is None:
             return
