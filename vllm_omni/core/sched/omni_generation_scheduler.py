@@ -136,7 +136,9 @@ class OmniGenerationScheduler(VLLMScheduler):
                     except Exception:
                         pass
                 else:
-                    break
+                    self.waiting.pop_request()
+                    skipped_waiting_requests.prepend_request(request)
+                    continue
 
             # Uniformly treat as diffusion. A feature flag can be added later
             # via config or request tag.
@@ -212,11 +214,11 @@ class OmniGenerationScheduler(VLLMScheduler):
         )
 
         # async_chunk: forward per-step additional_information updates for cached requests.
-        cached_ai: dict[str, object] = {}
+        per_req_additional_info: dict[str, object] = {}
         for req in scheduled_running_reqs:
-            ai = getattr(req, "additional_information", None)
-            if isinstance(ai, dict) and ai:
-                cached_ai[req.request_id] = ai
+            req_info = getattr(req, "additional_information", None)
+            if isinstance(req_info, dict) and req_info:
+                per_req_additional_info[req.request_id] = req_info
 
         cached_reqs_data = OmniCachedRequestData(
             req_ids=cached_reqs_data.req_ids,
@@ -227,8 +229,9 @@ class OmniGenerationScheduler(VLLMScheduler):
             num_computed_tokens=cached_reqs_data.num_computed_tokens,
             num_output_tokens=cached_reqs_data.num_output_tokens,
             prompt_token_ids=cached_prompt_token_ids,
-            additional_information=cached_ai,
         )
+        if per_req_additional_info:
+            cached_reqs_data.additional_information = per_req_additional_info
 
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         scheduler_output = SchedulerOutput(

@@ -45,6 +45,15 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._stream_left_context_frames = 25
         self._logged_codec_stats = False
 
+    @staticmethod
+    def _module_device(module: nn.Module) -> torch.device:
+        try:
+            return next(module.parameters()).device
+        except StopIteration:
+            for _, buf in module.named_buffers(recurse=True):
+                return buf.device
+            return torch.device("cpu")
+
     def _ensure_speech_tokenizer_loaded(self) -> Qwen3TTSTokenizer:
         if self._speech_tokenizer is not None:
             return self._speech_tokenizer
@@ -70,28 +79,16 @@ class Qwen3TTSCode2Wav(nn.Module):
             load_feature_extractor=False,
         )
 
-        # Align device with vLLM worker.
-        device = getattr(self.vllm_config.device_config, "device", None)
-        if device is None:
-            device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        try:
-            if tok.model is not None:
-                tok.model.to(device=device)
-                tok.device = device
-        except Exception as e:
-            raise RuntimeError(f"Failed to move SpeechTokenizer to device={device}: {e}") from e
+        # Align device with vLLM worker, then read back from module.
+        if tok.model is not None:
+            tok.model.to(device=self.vllm_config.device_config.device)
+            tok.device = self._module_device(tok.model)
 
-        # Derive codec group count and rates from tokenizer config if possible.
-        num_q = None
-        try:
-            dec_cfg = getattr(tok.model.config, "decoder_config", None)
-            if dec_cfg is not None:
-                num_q = getattr(dec_cfg, "num_quantizers", None)
-        except Exception:
-            num_q = None
+        # Derive codec group count and rates from tokenizer config.
+        dec_cfg = getattr(tok.model.config, "decoder_config", None)
+        num_q = getattr(dec_cfg, "num_quantizers", None) if dec_cfg is not None else None
         if num_q is None:
-            # Fallback: many code2wav stages use 16 quantizers.
-            num_q = 16
+            raise ValueError("speech_tokenizer decoder_config.num_quantizers not found")
         num_q = int(num_q)
         if num_q <= 0:
             raise ValueError(f"Invalid speech_tokenizer num_quantizers={num_q}")
@@ -105,8 +102,8 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         try:
             out_sr = int(tok.get_output_sample_rate())
-        except Exception:
-            out_sr = 24000
+        except Exception as e:
+            raise ValueError(f"Failed to get output sample rate: {e}") from e
 
         self._speech_tokenizer = tok
         self._num_quantizers = num_q

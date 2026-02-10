@@ -63,6 +63,15 @@ class Qwen3TTSForConditionalGenerationDisaggregatedVLLM(nn.Module):
             if self._num_code_groups <= 0:
                 raise ValueError(f"Invalid num_code_groups={self._num_code_groups} for Qwen3-TTS.")
 
+    @staticmethod
+    def _module_device(module: nn.Module) -> torch.device:
+        try:
+            return next(module.parameters()).device
+        except StopIteration:
+            for _, buf in module.named_buffers(recurse=True):
+                return buf.device
+            return torch.device("cpu")
+
     def _ensure_speech_tokenizer_loaded(self) -> Qwen3TTSTokenizer:
         if self._speech_tokenizer is not None:
             return self._speech_tokenizer
@@ -77,16 +86,10 @@ class Qwen3TTSForConditionalGenerationDisaggregatedVLLM(nn.Module):
             torch_dtype=torch.bfloat16,
             load_feature_extractor=False,
         )
-        # Run decode on the vLLM worker device (fallback to best-effort CUDA/CPU).
-        device = getattr(self.vllm_config.device_config, "device", None)
-        if device is None:
-            device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        try:
-            if hasattr(self._speech_tokenizer, "model") and self._speech_tokenizer.model is not None:
-                self._speech_tokenizer.model.to(device=device)
-                self._speech_tokenizer.device = device
-        except Exception as e:
-            raise RuntimeError(f"Failed to move SpeechTokenizer to device={device}: {e}") from e
+        # Run decode on the vLLM worker device, then read back from module.
+        if self._speech_tokenizer.model is not None:
+            self._speech_tokenizer.model.to(device=self.vllm_config.device_config.device)
+            self._speech_tokenizer.device = self._module_device(self._speech_tokenizer.model)
         return self._speech_tokenizer
 
     def preprocess(
