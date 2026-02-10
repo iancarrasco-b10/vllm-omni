@@ -718,11 +718,6 @@ class Qwen3TTSTalkerForConditionalGenerationARVLLM(nn.Module):
                     wav_candidates.append(obj_list)
                     return
 
-                # If this is a long list of numbers, treat it as waveform and stop.
-                if isinstance(obj, list) and len(obj) >= 512 and _is_number_sequence(obj_list):  # type: ignore[arg-type]
-                    wav_candidates.append(obj)
-                    return
-
                 # Otherwise, recurse into elements (but avoid descending into huge numeric lists).
                 for item in obj_list:
                     if isinstance(item, list) and len(item) >= 512 and _is_number_sequence(item):  # type: ignore[arg-type]
@@ -780,7 +775,6 @@ class Qwen3TTSTalkerForConditionalGenerationARVLLM(nn.Module):
         if wav_np.size < 1024:
             raise ValueError(f"ref_audio waveform too short: {wav_np.size} samples")
         return wav_np, sr
-        raise TypeError(f"Unsupported ref_audio type: {type(ref_audio)}")
 
     def _extract_speaker_embedding(self, wav: np.ndarray, sr: int) -> torch.Tensor:
         if self.speaker_encoder is None:

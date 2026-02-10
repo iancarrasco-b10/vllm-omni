@@ -8,7 +8,6 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.config.vllm import set_current_vllm_config
 from vllm.forward_context import set_forward_context
-from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
@@ -20,8 +19,6 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheS
 from vllm.v1.worker.gpu import attn_utils
 
 from .configuration_qwen3_tts import Qwen3TTSTalkerCodePredictorConfig, Qwen3TTSTalkerConfig
-
-logger = init_logger(__name__)
 
 
 class _LocalPredictorKVCache:

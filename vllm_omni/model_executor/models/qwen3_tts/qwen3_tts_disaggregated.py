@@ -7,16 +7,12 @@ import torch
 import torch.nn as nn
 from transformers.utils.hub import cached_file
 from vllm.config import VllmConfig
-from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .qwen3_tts import Qwen3TTSModel
 from .qwen3_tts_tokenizer import Qwen3TTSTokenizer
 
-logger = init_logger(__name__)
-
-_VALID_TASK_TYPES = ("CustomVoice", "VoiceDesign", "Base")
 _VALID_STAGES = ("talker", "speech_tokenizer")
 
 

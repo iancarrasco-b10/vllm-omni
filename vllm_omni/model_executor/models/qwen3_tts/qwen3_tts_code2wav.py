@@ -39,10 +39,6 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._num_quantizers: int | None = None
         self._decode_upsample_rate: int | None = None
         self._output_sample_rate: int | None = None
-
-        # Default streaming window (must match connector config by convention).
-        self._stream_chunk_frames = 25
-        self._stream_left_context_frames = 25
         self._logged_codec_stats = False
 
     @staticmethod
