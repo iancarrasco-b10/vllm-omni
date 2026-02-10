@@ -163,7 +163,8 @@ class Qwen3TTSCode2Wav(nn.Module):
             logger.warning(
                 "Code2Wav input_ids length %d not divisible by num_quantizers %d, "
                 "likely a warmup run; returning empty audio.",
-                n_tokens, q,
+                n_tokens,
+                q,
             )
             return empty_ret
 
@@ -178,10 +179,15 @@ class Qwen3TTSCode2Wav(nn.Module):
                 uniq = int(torch.unique(codes_fq).numel())
                 cmin = int(codes_fq.min().item())
                 cmax = int(codes_fq.max().item())
-                head = codes_fq[:min(2, total_frames), :min(8, q)].cpu().tolist()
+                head = codes_fq[: min(2, total_frames), : min(8, q)].cpu().tolist()
                 logger.info(
                     "Code2Wav codec: frames=%d q=%d uniq=%d range=[%d,%d] head=%s",
-                    total_frames, q, uniq, cmin, cmax, head,
+                    total_frames,
+                    q,
+                    uniq,
+                    cmin,
+                    cmax,
+                    head,
                 )
             except Exception:
                 pass
@@ -202,7 +208,8 @@ class Qwen3TTSCode2Wav(nn.Module):
             else:
                 logger.warning(
                     "Context trim %d >= decoded length %d; returning empty audio.",
-                    cut, audio_np.shape[0],
+                    cut,
+                    audio_np.shape[0],
                 )
                 return empty_ret
 

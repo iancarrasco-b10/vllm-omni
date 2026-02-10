@@ -384,7 +384,8 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         with (
             set_current_vllm_config(self._vllm_config),
             set_forward_context(
-                attn_metadata, self._vllm_config,
+                attn_metadata,
+                self._vllm_config,
                 num_tokens=int(hs.shape[0]),
                 slot_mapping=slot_mappings,
             ),
@@ -419,7 +420,8 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         with (
             set_current_vllm_config(self._vllm_config),
             set_forward_context(
-                attn_metadata, self._vllm_config,
+                attn_metadata,
+                self._vllm_config,
                 num_tokens=int(hs.shape[0]),
                 slot_mapping=slot_mappings,
             ),

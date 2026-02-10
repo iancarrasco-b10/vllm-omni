@@ -77,9 +77,7 @@ def talker2code2wav_async_chunk(
     window_frames = connector.code_prompt_token_ids[request_id][-end_index:]
 
     # Pack context + chunk into codebook-major flat codes for adapter.
-    code_predictor_codes = (
-        torch.tensor(window_frames).transpose(0, 1).reshape(-1).tolist()
-    )
+    code_predictor_codes = torch.tensor(window_frames).transpose(0, 1).reshape(-1).tolist()
 
     return {
         "code_predictor_codes": code_predictor_codes,

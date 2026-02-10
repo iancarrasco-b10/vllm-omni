@@ -311,6 +311,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # Streaming accumulates chunks as a list; concat first.
             if isinstance(audio_tensor, list):
                 import torch
+
                 audio_tensor = torch.cat(audio_tensor, dim=-1)
             # Convert tensor to numpy
             if hasattr(audio_tensor, "float"):

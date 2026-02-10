@@ -92,8 +92,7 @@ class Qwen3TTSTokenizer:
         inst.config = inst.model.config
 
         inst.feature_extractor = (
-            AutoFeatureExtractor.from_pretrained(pretrained_model_name_or_path)
-            if load_feature_extractor else None
+            AutoFeatureExtractor.from_pretrained(pretrained_model_name_or_path) if load_feature_extractor else None
         )
 
         inst.device = getattr(inst.model, "device", None)
