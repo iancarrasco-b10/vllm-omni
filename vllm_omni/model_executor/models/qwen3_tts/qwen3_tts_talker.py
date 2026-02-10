@@ -13,7 +13,10 @@ import numpy as np
 import soundfile as sf
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from librosa.filters import mel as librosa_mel_fn
 from transformers import AutoTokenizer
+from transformers.activations import ACT2FN
 from transformers.utils.hub import cached_file
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
@@ -26,19 +29,254 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
-from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSTalkerConfig
-from .modeling_qwen3_tts import (
-    Qwen3TTSSpeakerEncoder,
-    Qwen3TTSTalkerResizeMLP,
-    mel_spectrogram,
-)
+from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSSpeakerEncoderConfig, Qwen3TTSTalkerConfig
 from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
 from .qwen3_tts_tokenizer import Qwen3TTSTokenizer
 
 logger = init_logger(__name__)
 
 
-class Qwen3TTSTalkerForConditionalGenerationARVLLM(nn.Module):
+# ---------------------------------------------------------------------------
+# Components ported from the HuggingFace Qwen3-TTS reference implementation.
+# Only the classes actually needed by the vLLM AR Talker are kept here.
+# ---------------------------------------------------------------------------
+
+
+class Qwen3TTSTalkerResizeMLP(nn.Module):
+    """Two-layer MLP that maps between hidden sizes with an activation in between."""
+
+    def __init__(self, input_size: int, intermediate_size: int, output_size: int, act: str, bias=False):
+        super().__init__()
+        self.linear_fc1 = nn.Linear(input_size, intermediate_size, bias=bias)
+        self.linear_fc2 = nn.Linear(intermediate_size, output_size, bias=bias)
+        self.act_fn = ACT2FN[act]
+
+    def forward(self, hidden_state):
+        return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_state)))
+
+
+# ---- Speaker encoder (ECAPA-TDNN) and helpers ----
+
+
+class TimeDelayNetBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, dilation):
+        super().__init__()
+        self.conv = nn.Conv1d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            dilation=dilation,
+            padding="same",
+            padding_mode="reflect",
+        )
+        self.activation = nn.ReLU()
+
+    def forward(self, hidden_states: torch.Tensor):
+        return self.activation(self.conv(hidden_states))
+
+
+class Res2NetBlock(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, scale=8, kernel_size=3, dilation=1):
+        super().__init__()
+        in_channel = in_channels // scale
+        hidden_channel = out_channels // scale
+        self.blocks = nn.ModuleList(
+            [
+                TimeDelayNetBlock(in_channel, hidden_channel, kernel_size=kernel_size, dilation=dilation)
+                for _ in range(scale - 1)
+            ]
+        )
+        self.scale = scale
+
+    def forward(self, hidden_states):
+        outputs = []
+        for i, hidden_part in enumerate(torch.chunk(hidden_states, self.scale, dim=1)):
+            if i == 0:
+                output_part = hidden_part
+            elif i == 1:
+                output_part = self.blocks[i - 1](hidden_part)
+            else:
+                output_part = self.blocks[i - 1](hidden_part + output_part)
+            outputs.append(output_part)
+        return torch.cat(outputs, dim=1)
+
+
+class SqueezeExcitationBlock(nn.Module):
+    def __init__(self, in_channels, se_channels, out_channels):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_channels, se_channels, kernel_size=1, padding="same", padding_mode="reflect")
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv1d(se_channels, out_channels, kernel_size=1, padding="same", padding_mode="reflect")
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, hidden_states):
+        hidden_states_mean = hidden_states.mean(dim=2, keepdim=True)
+        hidden_states_mean = self.relu(self.conv1(hidden_states_mean))
+        hidden_states_mean = self.sigmoid(self.conv2(hidden_states_mean))
+        return hidden_states * hidden_states_mean
+
+
+class SqueezeExcitationRes2NetBlock(nn.Module):
+    """TDNN-Res2Net-TDNN-SE building block used in ECAPA-TDNN."""
+
+    def __init__(self, in_channels, out_channels, res2net_scale=8, se_channels=128, kernel_size=1, dilation=1):
+        super().__init__()
+        self.out_channels = out_channels
+        self.tdnn1 = TimeDelayNetBlock(in_channels, out_channels, kernel_size=1, dilation=1)
+        self.res2net_block = Res2NetBlock(out_channels, out_channels, res2net_scale, kernel_size, dilation)
+        self.tdnn2 = TimeDelayNetBlock(out_channels, out_channels, kernel_size=1, dilation=1)
+        self.se_block = SqueezeExcitationBlock(out_channels, se_channels, out_channels)
+
+    def forward(self, hidden_state):
+        residual = hidden_state
+        hidden_state = self.tdnn1(hidden_state)
+        hidden_state = self.res2net_block(hidden_state)
+        hidden_state = self.tdnn2(hidden_state)
+        hidden_state = self.se_block(hidden_state)
+        return hidden_state + residual
+
+
+class AttentiveStatisticsPooling(nn.Module):
+    """Attentive statistic pooling layer: returns concatenated mean and std."""
+
+    def __init__(self, channels, attention_channels=128):
+        super().__init__()
+        self.eps = 1e-12
+        self.tdnn = TimeDelayNetBlock(channels * 3, attention_channels, 1, 1)
+        self.tanh = nn.Tanh()
+        self.conv = nn.Conv1d(attention_channels, channels, kernel_size=1, padding="same", padding_mode="reflect")
+
+    @staticmethod
+    def _length_to_mask(length, max_len=None, dtype=None, device=None):
+        if max_len is None:
+            max_len = length.max().long().item()
+        mask = torch.arange(max_len, device=length.device, dtype=length.dtype).expand(
+            len(length), max_len
+        ) < length.unsqueeze(1)
+        return torch.as_tensor(mask, dtype=dtype, device=device)
+
+    @staticmethod
+    def _compute_statistics(x, m, dim=2, eps=1e-12):
+        mean = (m * x).sum(dim)
+        std = torch.sqrt((m * (x - mean.unsqueeze(dim)).pow(2)).sum(dim).clamp(eps))
+        return mean, std
+
+    def forward(self, hidden_states):
+        seq_length = hidden_states.shape[-1]
+        lengths = torch.ones(hidden_states.shape[0], device=hidden_states.device)
+        mask = self._length_to_mask(
+            lengths * seq_length, max_len=seq_length, dtype=hidden_states.dtype, device=hidden_states.device
+        )
+        mask = mask.unsqueeze(1)
+        total = mask.sum(dim=2, keepdim=True)
+        mean, std = self._compute_statistics(hidden_states, mask / total)
+        mean = mean.unsqueeze(2).repeat(1, 1, seq_length)
+        std = std.unsqueeze(2).repeat(1, 1, seq_length)
+        attention = torch.cat([hidden_states, mean, std], dim=1)
+        attention = self.conv(self.tanh(self.tdnn(attention)))
+        attention = attention.masked_fill(mask == 0, float("-inf"))
+        attention = F.softmax(attention, dim=2)
+        mean, std = self._compute_statistics(hidden_states, attention)
+        pooled_stats = torch.cat((mean, std), dim=1)
+        return pooled_stats.unsqueeze(2)
+
+
+class Qwen3TTSSpeakerEncoder(torch.nn.Module):
+    """ECAPA-TDNN speaker encoder.
+
+    Reference: "ECAPA-TDNN: Emphasized Channel Attention, Propagation and Aggregation in
+    TDNN Based Speaker Verification" (https://huggingface.co/papers/2005.07143).
+    """
+
+    def __init__(self, config: Qwen3TTSSpeakerEncoderConfig):
+        super().__init__()
+        if len(config.enc_channels) != len(config.enc_kernel_sizes) or len(config.enc_channels) != len(
+            config.enc_dilations
+        ):
+            raise ValueError("enc_channels, enc_kernel_sizes and enc_dilations should have same length")
+        self.channels = config.enc_channels
+        self.blocks = nn.ModuleList()
+        self.blocks.append(
+            TimeDelayNetBlock(
+                config.mel_dim, config.enc_channels[0], config.enc_kernel_sizes[0], config.enc_dilations[0],
+            )
+        )
+        for i in range(1, len(config.enc_channels) - 1):
+            self.blocks.append(
+                SqueezeExcitationRes2NetBlock(
+                    config.enc_channels[i - 1],
+                    config.enc_channels[i],
+                    res2net_scale=config.enc_res2net_scale,
+                    se_channels=config.enc_se_channels,
+                    kernel_size=config.enc_kernel_sizes[i],
+                    dilation=config.enc_dilations[i],
+                )
+            )
+        self.mfa = TimeDelayNetBlock(
+            config.enc_channels[-1], config.enc_channels[-1], config.enc_kernel_sizes[-1], config.enc_dilations[-1]
+        )
+        self.asp = AttentiveStatisticsPooling(config.enc_channels[-1], attention_channels=config.enc_attention_channels)
+        self.fc = nn.Conv1d(
+            config.enc_channels[-1] * 2, config.enc_dim, kernel_size=1, padding="same", padding_mode="reflect",
+        )
+
+    def forward(self, hidden_states):
+        hidden_states = hidden_states.transpose(1, 2)
+        hidden_states_list = []
+        for layer in self.blocks:
+            hidden_states = layer(hidden_states)
+            hidden_states_list.append(hidden_states)
+        hidden_states = torch.cat(hidden_states_list[1:], dim=1)
+        hidden_states = self.mfa(hidden_states)
+        hidden_states = self.asp(hidden_states)
+        hidden_states = self.fc(hidden_states)
+        return hidden_states.squeeze(-1)
+
+
+# ---- Audio utilities ----
+
+
+def _dynamic_range_compression(x, c=1, clip_val=1e-5):
+    return torch.log(torch.clamp(x, min=clip_val) * c)
+
+
+def mel_spectrogram(
+    y: torch.Tensor,
+    n_fft: int,
+    num_mels: int,
+    sampling_rate: int,
+    hop_size: int,
+    win_size: int,
+    fmin: int,
+    fmax: int | None = None,
+    center: bool = False,
+) -> torch.Tensor:
+    """Calculate mel spectrogram of an input signal using librosa mel filterbank and torch STFT."""
+    if torch.min(y) < -1.0:
+        logger.warning("Min value of input waveform signal is %s", torch.min(y))
+    if torch.max(y) > 1.0:
+        logger.warning("Max value of input waveform signal is %s", torch.max(y))
+    device = y.device
+    mel = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax)
+    mel_basis = torch.from_numpy(mel).float().to(device)
+    hann_window = torch.hann_window(win_size).to(device)
+    padding = (n_fft - hop_size) // 2
+    y = torch.nn.functional.pad(y.unsqueeze(1), (padding, padding), mode="reflect").squeeze(1)
+    spec = torch.stft(
+        y, n_fft, hop_length=hop_size, win_length=win_size, window=hann_window,
+        center=center, pad_mode="reflect", normalized=False, onesided=True, return_complex=True,
+    )
+    spec = torch.sqrt(torch.view_as_real(spec).pow(2).sum(-1) + 1e-9)
+    mel_spec = torch.matmul(mel_basis, spec)
+    return _dynamic_range_compression(mel_spec)
+
+
+# ---------------------------------------------------------------------------
+# Main AR Talker model
+# ---------------------------------------------------------------------------
+
+
+class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
     """vLLM-AR talker: step-wise layer-0 codec decoding.
     Predicts residual codebooks (1..Q-1) into `audio_codes` and streams text via `tailing_text_hidden`."""
 
@@ -433,7 +671,7 @@ class Qwen3TTSTalkerForConditionalGenerationARVLLM(nn.Module):
 
         instruct_len = 0
         if instruct.strip():
-            instruct_text = Qwen3TTSTalkerForConditionalGenerationARVLLM._build_instruct_text(instruct)
+            instruct_text = Qwen3TTSTalkerForConditionalGeneration._build_instruct_text(instruct)
             instruct_len = len(tokenize_prompt(instruct_text))
 
         # ---- codec prefix portion (matches _build_prompt_embeds) ----
@@ -463,7 +701,7 @@ class Qwen3TTSTalkerForConditionalGenerationARVLLM(nn.Module):
         prompt_len = instruct_len + role_len + codec_prefix_len
 
         # ---- text conditioning portion (matches _build_prompt_embeds) ----
-        assistant_text = Qwen3TTSTalkerForConditionalGenerationARVLLM._build_assistant_text(text)
+        assistant_text = Qwen3TTSTalkerForConditionalGeneration._build_assistant_text(text)
         assistant_len = len(tokenize_prompt(assistant_text))
         if assistant_len < 8:
             raise ValueError(f"Unexpected assistant prompt length: {assistant_len}")
@@ -529,7 +767,7 @@ class Qwen3TTSTalkerForConditionalGenerationARVLLM(nn.Module):
                                 "Base in-context non-streaming requires `ref_text` or tokenized `ref_ids`."
                             )
                         ref_text_ids = tokenize_prompt(
-                            Qwen3TTSTalkerForConditionalGenerationARVLLM._build_ref_text(ref_text)
+                            Qwen3TTSTalkerForConditionalGeneration._build_ref_text(ref_text)
                         )
                         ref_ids_len = len(ref_text_ids)
                     elif hasattr(ref_ids, "shape"):
@@ -866,7 +1104,7 @@ class Qwen3TTSTalkerForConditionalGenerationARVLLM(nn.Module):
         tts_eos_embed: torch.Tensor,
         non_streaming_mode: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Ported from official `generate_icl_prompt` in modeling_qwen3_tts.py
+        # Ported from official Qwen3TTSForConditionalGeneration.generate_icl_prompt
         text_embed = self.text_projection(self.text_embedding(torch.cat([ref_id, text_id], dim=-1)))
         text_embed = torch.cat([text_embed, tts_eos_embed], dim=1)
 
@@ -1272,7 +1510,7 @@ class Qwen3TTSTalkerForConditionalGenerationARVLLM(nn.Module):
             if self.speaker_encoder is None:
                 self.speaker_encoder = Qwen3TTSSpeakerEncoder(self.config.speaker_encoder_config)
             loaded |= loader.load_weights(speaker_weights, mapper=self.hf_to_vllm_mapper)
-        logger.info("Loaded %d weights for Qwen3TTSTalkerForConditionalGenerationARVLLM", len(loaded))
+        logger.info("Loaded %d weights for Qwen3TTSTalkerForConditionalGeneration", len(loaded))
         return loaded
 
     # -------------------- GPU-side MTP fast-path --------------------

@@ -48,25 +48,15 @@ _OMNI_MODELS = {
         "qwen3_omni_code2wav",
         "Qwen3OmniMoeCode2Wav",
     ),
-    "Qwen3TTSTalkerForConditionalGenerationARVLLM": (
+    "Qwen3TTSTalkerForConditionalGeneration": (
         "qwen3_tts",
-        "qwen3_tts_talker_ar",
-        "Qwen3TTSTalkerForConditionalGenerationARVLLM",
+        "qwen3_tts_talker",
+        "Qwen3TTSTalkerForConditionalGeneration",
     ),
     "Qwen3TTSCode2Wav": (
         "qwen3_tts",
         "qwen3_tts_code2wav",
         "Qwen3TTSCode2Wav",
-    ),
-    "Qwen3TTSForConditionalGenerationDisaggregatedVLLM": (
-        "qwen3_tts",
-        "qwen3_tts_disaggregated",
-        "Qwen3TTSForConditionalGenerationDisaggregatedVLLM",
-    ),
-    "Qwen3TTSForConditionalGeneration": (
-        "qwen3_tts",
-        "qwen3_tts_disaggregated",
-        "Qwen3TTSForConditionalGenerationDisaggregatedVLLM",
     ),
 }
 

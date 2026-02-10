@@ -66,8 +66,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def _estimate_prompt_len(self, tts_params: dict[str, Any]) -> int:
         """Estimate prompt length so the placeholder matches model-side embeddings."""
         try:
-            from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker_ar import (
-                Qwen3TTSTalkerForConditionalGenerationARVLLM,
+            from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
+                Qwen3TTSTalkerForConditionalGeneration,
             )
 
             if self._tts_tokenizer is None:
@@ -82,7 +82,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             hf_config = self.engine_client.model_config.hf_config
             talker_config = hf_config.talker_config
             task_type = (tts_params.get("task_type") or ["CustomVoice"])[0]
-            return Qwen3TTSTalkerForConditionalGenerationARVLLM.estimate_prompt_len_from_additional_information(
+            return Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
                 additional_information=tts_params,
                 task_type=task_type,
                 tokenize_prompt=lambda t: self._tts_tokenizer(t, padding=False)["input_ids"],
