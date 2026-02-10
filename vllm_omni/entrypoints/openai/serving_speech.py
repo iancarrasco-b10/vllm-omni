@@ -125,10 +125,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return None
 
-    def _build_tts_prompt(self, text: str) -> str:
-        """Build TTS prompt from input text."""
-        return f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
-
     def _build_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         """Build TTS parameters from request.
 
@@ -221,11 +217,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if validation_error:
                     return self.create_error_response(validation_error)
 
-                # Build TTS parameters and prompt
+                # Must use prompt_token_ids (not text prompt): the AR Talker
+                # operates on codec tokens; text token IDs exceed codec vocab.
+                # model.preprocess replaces all embeddings, so value 0 is fine.
                 tts_params = self._build_tts_params(request)
-                prompt_text = self._build_tts_prompt(request.input)
                 prompt = {
-                    "prompt": prompt_text,
+                    "prompt_token_ids": [1] * 2048,
                     "additional_information": tts_params,
                 }
             else:

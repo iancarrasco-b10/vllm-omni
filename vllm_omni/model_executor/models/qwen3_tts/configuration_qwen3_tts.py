@@ -504,10 +504,11 @@ class Qwen3TTSConfig(PretrainedConfig):
         self.tts_bos_token_id = tts_bos_token_id
         self.tts_eos_token_id = tts_eos_token_id
 
-        # TODO: remove these dummy values after
-        self.image_token_id = 0  # dummy image token id
-        self.video_token_id = 0  # dummy video token id
-        self.vision_start_token_id = 0  # dummy vision start token id
+        # Dummy vision token IDs that must never collide with real codec tokens.
+        # mrope scans prompt_token_ids for these; using -1 ensures no false match.
+        self.image_token_id = -1
+        self.video_token_id = -1
+        self.vision_start_token_id = -1
         self.vision_config = PretrainedConfig()  # dummy vision config
         self.vision_config.spatial_merge_size = 1
 
