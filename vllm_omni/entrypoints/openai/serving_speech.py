@@ -69,11 +69,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker_ar import (
                 Qwen3TTSTalkerForConditionalGenerationARVLLM,
             )
+
             if self._tts_tokenizer is None:
                 from transformers import AutoTokenizer
+
                 model_name = self.engine_client.model_config.model
                 self._tts_tokenizer = AutoTokenizer.from_pretrained(
-                    model_name, trust_remote_code=True, padding_side="left",
+                    model_name,
+                    trust_remote_code=True,
+                    padding_side="left",
                 )
             hf_config = self.engine_client.model_config.hf_config
             talker_config = hf_config.talker_config
