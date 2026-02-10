@@ -5,15 +5,6 @@ from typing import Any
 import torch
 
 
-def _get_request_info(request: Any) -> dict[str, Any]:
-    info = getattr(request, "additional_information_cpu", None)
-    if info is None:
-        info = getattr(request, "additional_information", None)
-    if isinstance(info, list) and info and isinstance(info[0], dict):
-        info = info[0]
-    return info if isinstance(info, dict) else {}
-
-
 def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
     audio_codes = pooling_output.get("audio_codes")
     if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
@@ -36,13 +27,7 @@ def talker2code2wav_async_chunk(
     if not isinstance(pooling_output, dict):
         return None
 
-    info = _get_request_info(request)
     request_id = request.external_req_id
-
-    codec_streaming_raw = info.get("codec_streaming", True)
-    if isinstance(codec_streaming_raw, list):
-        codec_streaming_raw = codec_streaming_raw[0] if codec_streaming_raw else True
-    codec_streaming = codec_streaming_raw if isinstance(codec_streaming_raw, bool) else True
 
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
@@ -76,26 +61,14 @@ def talker2code2wav_async_chunk(
     if finished and (not appended_frame) and chunk_length == 0:
         return {
             "code_predictor_codes": [],
-            "codec_streaming": codec_streaming,
-            "codec_context_codes": [],
             "codec_context_frames": 0,
-            "codec_total_frames": 0,
-            "codec_chunk_frames": 0,
-            "codec_num_code_groups": 0,
-            "codec_layout": "codebook_major",
             "finished": torch.tensor(True, dtype=torch.bool),
         }
 
     if length <= 0:
         return {
             "code_predictor_codes": [],
-            "codec_streaming": codec_streaming,
-            "codec_context_codes": [],
             "codec_context_frames": 0,
-            "codec_total_frames": 0,
-            "codec_chunk_frames": 0,
-            "codec_num_code_groups": 0,
-            "codec_layout": "codebook_major",
             "finished": torch.tensor(bool(finished), dtype=torch.bool),
         }
 
@@ -103,29 +76,13 @@ def talker2code2wav_async_chunk(
     ctx_frames = max(0, int(end_index - context_length))
     window_frames = connector.code_prompt_token_ids[request_id][-end_index:]
 
-    if ctx_frames > 0:
-        ctx_part = window_frames[:ctx_frames]
-        codec_context_codes = torch.tensor(ctx_part).transpose(0, 1).reshape(-1).tolist()
-    else:
-        codec_context_codes = []
-
-    chunk_part = window_frames[ctx_frames:]
-    code_predictor_codes = torch.tensor(chunk_part).transpose(0, 1).reshape(-1).tolist()
-
-    num_code_groups = int(
-        len(connector.code_prompt_token_ids[request_id][-1])
-        if connector.code_prompt_token_ids[request_id]
-        else 0
+    # Pack context + chunk into codebook-major flat codes for adapter.
+    code_predictor_codes = (
+        torch.tensor(window_frames).transpose(0, 1).reshape(-1).tolist()
     )
 
     return {
         "code_predictor_codes": code_predictor_codes,
-        "codec_streaming": codec_streaming,
-        "codec_context_codes": codec_context_codes,
         "codec_context_frames": int(ctx_frames),
-        "codec_total_frames": int(end_index),
-        "codec_chunk_frames": int(context_length),
-        "codec_num_code_groups": num_code_groups,
-        "codec_layout": "codebook_major",
         "finished": torch.tensor(bool(finished), dtype=torch.bool),
     }

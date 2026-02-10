@@ -43,6 +43,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Load supported speakers
         self.supported_speakers = self._load_supported_speakers()
         logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
+        self._tts_tokenizer = None
 
     def _load_supported_speakers(self) -> set[str]:
         """Load supported speakers (case-insensitive) from the model configuration."""
@@ -61,6 +62,32 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             logger.warning(f"Could not load speakers from model config: {e}")
 
         return set()
+
+    def _estimate_prompt_len(self, tts_params: dict[str, Any]) -> int:
+        """Estimate prompt length so the placeholder matches model-side embeddings."""
+        try:
+            from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker_ar import (
+                Qwen3TTSTalkerForConditionalGenerationARVLLM,
+            )
+            if self._tts_tokenizer is None:
+                from transformers import AutoTokenizer
+                model_name = self.engine_client.model_config.model
+                self._tts_tokenizer = AutoTokenizer.from_pretrained(
+                    model_name, trust_remote_code=True, padding_side="left",
+                )
+            hf_config = self.engine_client.model_config.hf_config
+            talker_config = hf_config.talker_config
+            task_type = (tts_params.get("task_type") or ["CustomVoice"])[0]
+            return Qwen3TTSTalkerForConditionalGenerationARVLLM.estimate_prompt_len_from_additional_information(
+                additional_information=tts_params,
+                task_type=task_type,
+                tokenize_prompt=lambda t: self._tts_tokenizer(t, padding=False)["input_ids"],
+                codec_language_id=getattr(talker_config, "codec_language_id", None),
+                spk_is_dialect=getattr(talker_config, "spk_is_dialect", None),
+            )
+        except Exception as e:
+            logger.warning("Failed to estimate TTS prompt length, using fallback 2048: %s", e)
+            return 2048
 
     def _is_tts_model(self) -> bool:
         """Check if the current model is a supported TTS model."""
@@ -219,10 +246,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
                 # Must use prompt_token_ids (not text prompt): the AR Talker
                 # operates on codec tokens; text token IDs exceed codec vocab.
-                # model.preprocess replaces all embeddings, so value 0 is fine.
+                # model.preprocess replaces all embeddings, so placeholder value
+                # is irrelevant -- but length must match to avoid excess padding.
                 tts_params = self._build_tts_params(request)
+                ph_len = self._estimate_prompt_len(tts_params)
                 prompt = {
-                    "prompt_token_ids": [1] * 2048,
+                    "prompt_token_ids": [1] * ph_len,
                     "additional_information": tts_params,
                 }
             else:
@@ -279,6 +308,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if hasattr(sample_rate, "item"):
                 sample_rate = sample_rate.item()
 
+            # Streaming accumulates chunks as a list; concat first.
+            if isinstance(audio_tensor, list):
+                import torch
+                audio_tensor = torch.cat(audio_tensor, dim=-1)
             # Convert tensor to numpy
             if hasattr(audio_tensor, "float"):
                 audio_tensor = audio_tensor.float().detach().cpu().numpy()
