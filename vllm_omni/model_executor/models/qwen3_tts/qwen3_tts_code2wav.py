@@ -237,7 +237,8 @@ class Qwen3TTSCode2Wav(nn.Module):
             if ctx_frames < 0:
                 raise ValueError(f"Invalid codec_context_frames={ctx_frames} (must be >=0).")
 
-        # input_ids may be padded; use codec_chunk_frames to slice the exact chunk (chunk_frames * q) and ignore padding.
+        # input_ids may be padded; use codec_chunk_frames to slice the
+        # exact chunk (chunk_frames * q) and ignore padding.
         if chunk_frames is None:
             raise ValueError(
                 "Missing codec_chunk_frames in runtime_additional_information for Qwen3TTSCode2Wav. "

@@ -526,8 +526,16 @@ class Qwen3TTSConfig(PretrainedConfig):
         # vLLM expects text config to expose hidden_size/num_attention_heads.
         # For Qwen3 TTS, the talker config is the text model config.
         config = self.talker_config
-        # if hasattr(config, "rope_parameters"):
-        #     delattr(config, "rope_parameters")
+        # Code2Wav is a pure convolutional waveform decoder; it does NOT use
+        # rotary position embeddings.  When hf_overrides sets architectures
+        # to [Qwen3TTSCode2Wav], strip rope_parameters so that the model
+        # runner sees uses_mrope == False and skips mrope position computation
+        # on codec tokens.  Each stage loads its own config instance, so this
+        # in-place mutation does not affect the Talker stage.
+        archs = getattr(self, "architectures", []) or []
+        if any("Code2Wav" in str(a) for a in archs):
+            if hasattr(config, "rope_parameters"):
+                delattr(config, "rope_parameters")
         return config
 
 

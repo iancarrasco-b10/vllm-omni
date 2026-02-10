@@ -25,7 +25,8 @@ logger = init_logger(__name__)
 
 
 class _LocalPredictorKVCache:
-    """Minimal local KV cache + attention metadata for running code_predictor inside one worker (independent of engine KV)."""
+    """Minimal local KV cache + attention metadata for running
+    code_predictor inside one worker (independent of engine KV)."""
 
     def __init__(
         self,
@@ -93,11 +94,20 @@ class _LocalPredictorKVCache:
         num_reqs: int,
         query_lens: torch.Tensor,  # (num_reqs,) int32 on cpu
         seq_lens: torch.Tensor,  # (num_reqs,) int32 on cpu
-    ) -> tuple[dict[str, Any], torch.Tensor]:
-        """Build attention metadata and return (attn_metadata, positions)."""
+    ) -> tuple[dict[str, Any], torch.Tensor, dict[str, torch.Tensor]]:
+        """Build attention metadata, positions, and slot_mapping dict.
+
+        Returns:
+            (attn_metadata, positions, slot_mappings_by_layer)
+            - attn_metadata: per-layer attention metadata for attn backends.
+            - positions: (num_tokens,) position IDs on device.
+            - slot_mappings_by_layer: {layer_name: slot_mapping_tensor} for
+              set_forward_context so that unified_kv_cache_update can write
+              the KV cache correctly.
+        """
         num_reqs = int(num_reqs)
         if num_reqs <= 0:
-            return {}, torch.empty((0,), dtype=torch.int64, device=self.device)
+            return {}, torch.empty((0,), dtype=torch.int64, device=self.device), {}
         if num_reqs > self.max_batch_size:
             raise ValueError(f"num_reqs={num_reqs} exceeds local predictor max_batch_size={self.max_batch_size}")
 
@@ -109,7 +119,7 @@ class _LocalPredictorKVCache:
         qsl[1:] = torch.cumsum(query_lens_i32, dim=0)
         num_tokens = int(qsl[-1].item())
         if num_tokens <= 0:
-            return {}, torch.empty((0,), dtype=torch.int64, device=self.device)
+            return {}, torch.empty((0,), dtype=torch.int64, device=self.device), {}
 
         # positions: for each request i, emit positions [seq_len-query_len .. seq_len-1]
         pos_list: list[torch.Tensor] = []
@@ -153,7 +163,15 @@ class _LocalPredictorKVCache:
             slot_mappings=[slot_mapping_gpu],
             kv_cache_config=self.kv_cache_config,
         )
-        return attn_metadata, positions_cpu.to(device=self.device)
+
+        # Build slot_mappings_by_layer for set_forward_context.
+        # Fix for vllm 0.15.0
+        slot_mappings_by_layer: dict[str, torch.Tensor] = {}
+        for kv_cache_group in self.kv_cache_config.kv_cache_groups:
+            for layer_name in kv_cache_group.layer_names:
+                slot_mappings_by_layer[layer_name] = slot_mapping_gpu
+
+        return attn_metadata, positions_cpu.to(device=self.device), slot_mappings_by_layer
 
 
 class Qwen3TTSTalkerCodePredictorModelVLLM(nn.Module):
@@ -362,13 +380,17 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
 
         query_lens = torch.full((bsz,), qlen, dtype=torch.int32)
         seq_lens = query_lens.clone()
-        attn_metadata, positions = self._kv_cache.build_attn_metadata(
+        attn_metadata, positions, slot_mappings = self._kv_cache.build_attn_metadata(
             num_reqs=bsz, query_lens=query_lens, seq_lens=seq_lens
         )
 
         with (
             set_current_vllm_config(self._vllm_config),
-            set_forward_context(attn_metadata, self._vllm_config, num_tokens=int(hs.shape[0])),
+            set_forward_context(
+                attn_metadata, self._vllm_config,
+                num_tokens=int(hs.shape[0]),
+                slot_mapping=slot_mappings,
+            ),
         ):
             out = self.model(positions=positions, inputs_embeds=hs)
 
@@ -393,13 +415,17 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
 
         query_lens = torch.ones((bsz,), dtype=torch.int32)
         seq_lens = torch.full((bsz,), int(past_seq_len) + 1, dtype=torch.int32)
-        attn_metadata, positions = self._kv_cache.build_attn_metadata(
+        attn_metadata, positions, slot_mappings = self._kv_cache.build_attn_metadata(
             num_reqs=bsz, query_lens=query_lens, seq_lens=seq_lens
         )
 
         with (
             set_current_vllm_config(self._vllm_config),
-            set_forward_context(attn_metadata, self._vllm_config, num_tokens=int(hs.shape[0])),
+            set_forward_context(
+                attn_metadata, self._vllm_config,
+                num_tokens=int(hs.shape[0]),
+                slot_mapping=slot_mappings,
+            ),
         ):
             out = self.model(positions=positions, inputs_embeds=hs)
 

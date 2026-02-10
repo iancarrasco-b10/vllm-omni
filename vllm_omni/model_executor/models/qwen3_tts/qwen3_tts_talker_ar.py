@@ -250,15 +250,6 @@ class Qwen3TTSTalkerForConditionalGenerationARVLLM(nn.Module):
             raise ValueError("Missing additional_information.text for Qwen3-TTS AR talker.")
 
         task_type = (info_dict.get("task_type") or ["CustomVoice"])[0]
-        non_streaming_mode_val = info_dict.get("non_streaming_mode")
-        if isinstance(non_streaming_mode_val, list):
-            non_streaming_mode_raw = non_streaming_mode_val[0] if non_streaming_mode_val else None
-        else:
-            non_streaming_mode_raw = non_streaming_mode_val
-        if isinstance(non_streaming_mode_raw, bool):
-            non_streaming_mode = non_streaming_mode_raw
-        else:
-            non_streaming_mode = task_type in ("CustomVoice", "VoiceDesign")
         codec_streaming_val = info_dict.get("codec_streaming")
         if isinstance(codec_streaming_val, list):
             codec_streaming_raw = codec_streaming_val[0] if codec_streaming_val else None

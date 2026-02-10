@@ -16,7 +16,6 @@ import base64
 import io
 import urllib.request
 from urllib.parse import urlparse
-from typing import Any
 
 import librosa
 import numpy as np

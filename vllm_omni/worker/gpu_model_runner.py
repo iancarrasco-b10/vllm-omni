@@ -771,6 +771,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         This version avoids hard dependency on payload classes by duck-typing."""
         try:
             new_reqs = getattr(scheduler_output, "scheduled_new_reqs", [])
+            if not new_reqs:
+                return
             for nr in new_reqs:
                 req_id = getattr(nr, "req_id", None) or getattr(nr, "request_id", None)
                 if req_id is None:
@@ -1110,15 +1112,15 @@ class OmniGPUModelRunner(GPUModelRunner):
         with set_forward_context(
             None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
         ):
-            req_embeds, audio_codes = self.talker_mtp(req_input_ids, req_embeds, last_talker_hidden, text_step)
-        # update the inputs_embeds and audio_codes
-        audio_codes_cpu = audio_codes.detach().to("cpu").contiguous()
-        out_key = getattr(self.model, "talker_mtp_output_key", "audio_codes")
+            req_embeds, code_predictor_codes = self.talker_mtp(req_input_ids, req_embeds, last_talker_hidden, text_step)
+        # update the inputs_embeds and code_predictor_codes
+        code_predictor_codes_cpu = code_predictor_codes.detach().to("cpu").contiguous()
+        out_key = getattr(self.model, "talker_mtp_output_key", "code_predictor_codes")
         for idx, req_id in enumerate(decode_req_ids):
             req_index = self.input_batch.req_ids.index(req_id)
             start_offset = int(self.query_start_loc.cpu[req_index])
             inputs_embeds[start_offset : start_offset + 1] = req_embeds[idx : idx + 1]
-            update_dict = {out_key: audio_codes_cpu[idx : idx + 1]}
+            update_dict = {out_key: code_predictor_codes_cpu[idx : idx + 1]}
             self._merge_additional_information_update(req_id, update_dict)
 
     def _model_forward(
@@ -1153,7 +1155,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         return model_output
 
     def _merge_additional_information_update(self, req_id: str, upd: dict | None) -> None:
-        # Guard: _update_additional_information may pass None when additional_information is absent.
         if not isinstance(upd, dict):
             return
         req_state = self.requests.get(req_id)

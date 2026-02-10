@@ -6,7 +6,7 @@ stage_args:
       devices: "0"
       max_batch_size: 1
     engine_args:
-      model_stage: talker
+      model_stage: qwen3_tts
       model_arch: Qwen3TTSTalkerForConditionalGenerationARVLLM
       # Force stage-specific registered architecture.
       hf_overrides:
@@ -22,7 +22,7 @@ stage_args:
       distributed_executor_backend: "mp"
       max_num_batched_tokens: 512
       max_model_len: 4096
-      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2speech_tokenizer_async_chunk
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav_async_chunk
     # Use named connector to apply runtime.connectors.extra.
     output_connectors:
       to_stage_1: connector_of_shared_memory
@@ -87,6 +87,10 @@ runtime:
         shm_threshold_bytes: 65536
         # Frame-aligned codec streaming transport.
         codec_streaming: true
+        # Connector polling / timeout (unit: loop count, sleep interval in seconds).
+        connector_get_sleep_s: 0.01
+        connector_get_max_wait_first_chunk: 3000
+        connector_get_max_wait: 300
         # Match official chunked_decode defaults.
         codec_chunk_frames: 300
         codec_left_context_frames: 25
