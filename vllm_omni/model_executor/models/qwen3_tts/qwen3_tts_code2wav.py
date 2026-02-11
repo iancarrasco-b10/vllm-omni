@@ -150,7 +150,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         if n_tokens == 0:
             return empty_ret
 
-        # input_ids[0] = codec_context_frames (prepended by adapter).
+        # input_ids[0] = codec_context_frames (prepended by stage_input_processor).
         ctx_frames = int(ids[0].item())
         ids = ids[1:]
         n_tokens = ids.numel()

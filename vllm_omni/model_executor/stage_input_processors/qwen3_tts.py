@@ -61,14 +61,12 @@ def talker2code2wav_async_chunk(
     if finished and (not appended_frame) and chunk_length == 0:
         return {
             "code_predictor_codes": [],
-            "codec_context_frames": 0,
             "finished": torch.tensor(True, dtype=torch.bool),
         }
 
     if length <= 0:
         return {
             "code_predictor_codes": [],
-            "codec_context_frames": 0,
             "finished": torch.tensor(bool(finished), dtype=torch.bool),
         }
 
@@ -79,8 +77,9 @@ def talker2code2wav_async_chunk(
     # Pack context + chunk into codebook-major flat codes for adapter.
     code_predictor_codes = torch.tensor(window_frames).transpose(0, 1).reshape(-1).tolist()
 
+    # Build final prompt_token_ids with ctx_frames header for Qwen3-TTS Code2Wav.
+    # The model expects input_ids layout: [ctx_frames, *flat_codes].
     return {
-        "code_predictor_codes": code_predictor_codes,
-        "codec_context_frames": int(ctx_frames),
+        "code_predictor_codes": [int(ctx_frames)] + code_predictor_codes,
         "finished": torch.tensor(bool(finished), dtype=torch.bool),
     }
