@@ -380,6 +380,16 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 prefix="code_predictor",
             )
 
+        # Constant logit mask: allow only codec ids [1, codebook_vocab_size) plus codec EOS.
+        vocab = int(self.talker_config.vocab_size)
+        codec_mask = torch.zeros((vocab,), dtype=torch.bool)
+        lo, hi = 1, min(self._codebook_vocab_size, vocab)
+        if hi > lo:
+            codec_mask[lo:hi] = True
+        if 0 <= self._codec_eos_token_id < vocab:
+            codec_mask[self._codec_eos_token_id] = True
+        self.register_buffer("_codec_allowed_mask", codec_mask, persistent=False)
+
         # Tokenizer for prompt building.
         self._tokenizer = None
         self._speech_tokenizer: Qwen3TTSTokenizer | None = None
@@ -410,17 +420,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         if logits is None:
             return None
 
-        # Allow only real codec ids (1..codebook_vocab_size-1) plus codec EOS; specials can crash SpeechTokenizer.
-        # Also, id 0 is padding for the 12Hz decoder.
-        vocab = int(logits.shape[-1])
-        allowed = torch.zeros((vocab,), dtype=torch.bool, device=logits.device)
-        lo = 1
-        hi = min(self._codebook_vocab_size, vocab)
-        if hi > lo:
-            allowed[lo:hi] = True
-        if 0 <= self._codec_eos_token_id < vocab:
-            allowed[self._codec_eos_token_id] = True
-        logits = logits.masked_fill(~allowed, float("-inf"))
+        # Mask out invalid codec ids using the pre-built constant buffer.
+        logits = logits.masked_fill(~self._codec_allowed_mask, float("-inf"))
         return logits
 
     # -------------------- Omni multimodal output plumbing --------------------
@@ -515,13 +516,15 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         if span_len > 1:
             # Prefill (prompt embeddings)
             prompt_embeds_cpu = info_dict.get("talker_prompt_embeds")
-            prompt_embeds = None
             tts_pad_embed_cpu = info_dict.get("tts_pad_embed")
             tts_pad_embed = None
             if isinstance(tts_pad_embed_cpu, torch.Tensor) and tts_pad_embed_cpu.numel() > 0:
                 tts_pad_embed = tts_pad_embed_cpu.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
 
-            if prompt_embeds is None:
+            # First prefill round: prompt_embeds_cpu is not yet populated.
+            # Subsequent prefill rounds (multi-chunk): prompt_embeds_cpu is a Tensor stored by the first round.
+            is_first_prefill = not isinstance(prompt_embeds_cpu, torch.Tensor) or prompt_embeds_cpu.ndim != 2
+            if is_first_prefill:
                 full_prompt_embeds, tailing_text_hidden, tts_pad_embed, ref_code_len = self._build_prompt_embeds(
                     task_type=task_type, info_dict=info_dict
                 )
@@ -549,9 +552,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
                 info_update["talker_prefill_offset"] = int(offset + span_len)
             else:
-                # Subsequent prefill chunk: slice from our own running offset.
-                if not isinstance(prompt_embeds_cpu, torch.Tensor) or prompt_embeds_cpu.ndim != 2:
-                    raise RuntimeError("Invalid talker_prompt_embeds in additional_information.")
+                # Subsequent prefill chunk: slice from stored embeddings at running offset.
                 if tts_pad_embed is None:
                     raise RuntimeError("Missing `tts_pad_embed` in additional_information; prefill must initialize it.")
                 offset = int(info_dict.get("talker_prefill_offset", 0) or 0)
@@ -1550,55 +1551,25 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             audio_codes = input_ids.reshape(bsz, 1)
             return (last_id_hidden + text_step).reshape(bsz, -1), audio_codes
 
-        # Subtalker sampling defaults (match official defaults).
-        do_sample = True
-        top_k = 50
-        top_p = 1.0
-        temperature = 0.9
-
-        def _sample_next(logits: torch.Tensor) -> torch.Tensor:
-            # logits: [B,V]
-            if temperature and float(temperature) > 0:
-                logits = logits / float(temperature)
-            if top_k and int(top_k) > 0 and int(top_k) < logits.shape[-1]:
-                v, _ = torch.topk(logits, int(top_k), dim=-1)
-                min_keep = v[:, -1].unsqueeze(-1)
-                logits = torch.where(logits < min_keep, torch.tensor(float("-inf"), device=logits.device), logits)
-            if top_p is not None and 0.0 < float(top_p) < 1.0:
-                sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
-                probs = torch.softmax(sorted_logits, dim=-1)
-                cum = torch.cumsum(probs, dim=-1)
-                remove = cum > float(top_p)
-                remove[:, 0] = False
-                sorted_logits = torch.where(remove, torch.tensor(float("-inf"), device=logits.device), sorted_logits)
-                logits = torch.empty_like(logits).scatter(-1, sorted_idx, sorted_logits)
-            if not do_sample:
-                return torch.argmax(logits, dim=-1, keepdim=True)
-            probs = torch.softmax(logits, dim=-1)
-            return torch.multinomial(probs, num_samples=1)
-
-        predictor_inputs = torch.cat([past_hidden, last_id_hidden], dim=1)  # [B,2,H]
-        self.code_predictor.reset_cache()
-        tok = _sample_next(self.code_predictor.prefill_logits(predictor_inputs))
-        residual_ids = [tok]
-        past_seq_len = 2
-        for step in range(1, max_steps):
-            logits = self.code_predictor.decode_logits(tok, generation_step=step, past_seq_len=past_seq_len)
-            tok = _sample_next(logits)
-            residual_ids.append(tok)
-            past_seq_len += 1
-
-        residual_ids_t = torch.cat(residual_ids, dim=1).to(dtype=torch.long, device=dev)  # [B, Q-1]
-        audio_codes = torch.cat([input_ids, residual_ids_t], dim=1)  # [B,Q]
+        # Single forward call: predicts all residual codes (1..Q-1) autoregressively.
+        audio_codes = self.code_predictor(
+            layer0_code=input_ids.reshape(bsz, 1),
+            layer0_embed=last_id_hidden,
+            last_talker_hidden=past_hidden,
+            do_sample=True,
+            temperature=0.9,
+            top_k=50,
+            top_p=1.0,
+        )  # [B, Q]
 
         # Map invalid layer-0 ids (e.g. EOS) to PAD=0 so SpeechTokenizer sees only real codes.
-        # vLLM still uses EOS for stopping.
         layer0 = audio_codes[:, :1]
         invalid0 = (layer0 < 0) | (layer0 >= int(self._codebook_vocab_size))
         if invalid0.any():
             audio_codes = torch.where(invalid0.expand_as(audio_codes), torch.zeros_like(audio_codes), audio_codes)
 
         # Sum embeddings of all code groups, then add the current text step.
+        residual_ids_t = audio_codes[:, 1:]
         embeds: list[torch.Tensor] = [last_id_hidden]
         for i in range(max_steps):
             embeds.append(self.code_predictor.get_input_embeddings()[i](residual_ids_t[:, i : i + 1]))
