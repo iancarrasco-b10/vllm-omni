@@ -1,6 +1,12 @@
 import asyncio
+import base64
+import io
 from typing import Any
+from urllib.parse import urlparse
+from urllib.request import urlopen
 
+import numpy as np
+import soundfile as sf
 from fastapi import Request
 from fastapi.responses import Response
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
@@ -16,6 +22,9 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+_REF_AUDIO_TIMEOUT_S = 15
+_REF_AUDIO_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
 
 # TTS Configuration (currently supports Qwen3-TTS)
 _TTS_MODEL_STAGES: set[str] = {"qwen3_tts"}
@@ -156,6 +165,34 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return None
 
+    @staticmethod
+    async def _resolve_ref_audio(ref_audio_str: str) -> tuple[list[float], int]:
+        """Resolve ref_audio URL/base64 to (wav_samples, sample_rate)."""
+        parsed = urlparse(ref_audio_str)
+
+        def _fetch_sync() -> tuple[np.ndarray, int]:
+            if parsed.scheme in ("http", "https"):
+                with urlopen(ref_audio_str, timeout=_REF_AUDIO_TIMEOUT_S) as resp:
+                    data = resp.read(_REF_AUDIO_MAX_BYTES + 1)
+                    if len(data) > _REF_AUDIO_MAX_BYTES:
+                        raise ValueError(f"ref_audio URL exceeds {_REF_AUDIO_MAX_BYTES} bytes")
+                buf = io.BytesIO(data)
+            elif ref_audio_str.startswith("data:"):
+                b64 = ref_audio_str
+                if "," in b64:
+                    b64 = b64.split(",", 1)[1]
+                buf = io.BytesIO(base64.b64decode(b64))
+            else:
+                raise ValueError("ref_audio must be an http(s) URL or data: base64 URI")
+            audio, sr = sf.read(buf, dtype="float32", always_2d=False)
+            if isinstance(audio, np.ndarray) and audio.ndim > 1:
+                audio = np.mean(audio, axis=-1)
+            return np.asarray(audio, dtype=np.float32), int(sr)
+
+        loop = asyncio.get_running_loop()
+        wav_np, sr = await loop.run_in_executor(None, _fetch_sync)
+        return wav_np.tolist(), sr
+
     def _build_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         """Build TTS parameters from request.
 
@@ -191,9 +228,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         else:
             params["instruct"] = [""]
 
-        # Voice clone parameters (used with Base task)
-        if request.ref_audio is not None:
-            params["ref_audio"] = [request.ref_audio]
+        # Voice clone: ref_audio resolved in create_speech(), not here.
         if request.ref_text is not None:
             params["ref_text"] = [request.ref_text]
         if request.x_vector_only_mode is not None:
@@ -253,6 +288,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 # model.preprocess replaces all embeddings, so placeholder value
                 # is irrelevant -- but length must match to avoid excess padding.
                 tts_params = self._build_tts_params(request)
+
+                if request.ref_audio is not None:
+                    wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+                    tts_params["ref_audio"] = [[wav_list, sr]]
+
                 ph_len = self._estimate_prompt_len(tts_params)
                 prompt = {
                     "prompt_token_ids": [1] * ph_len,

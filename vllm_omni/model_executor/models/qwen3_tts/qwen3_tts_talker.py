@@ -7,7 +7,6 @@ import os
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 from urllib.parse import urlparse
-from urllib.request import urlopen
 
 import numpy as np
 import soundfile as sf
@@ -198,7 +197,10 @@ class Qwen3TTSSpeakerEncoder(torch.nn.Module):
         self.blocks = nn.ModuleList()
         self.blocks.append(
             TimeDelayNetBlock(
-                config.mel_dim, config.enc_channels[0], config.enc_kernel_sizes[0], config.enc_dilations[0],
+                config.mel_dim,
+                config.enc_channels[0],
+                config.enc_kernel_sizes[0],
+                config.enc_dilations[0],
             )
         )
         for i in range(1, len(config.enc_channels) - 1):
@@ -217,7 +219,11 @@ class Qwen3TTSSpeakerEncoder(torch.nn.Module):
         )
         self.asp = AttentiveStatisticsPooling(config.enc_channels[-1], attention_channels=config.enc_attention_channels)
         self.fc = nn.Conv1d(
-            config.enc_channels[-1] * 2, config.enc_dim, kernel_size=1, padding="same", padding_mode="reflect",
+            config.enc_channels[-1] * 2,
+            config.enc_dim,
+            kernel_size=1,
+            padding="same",
+            padding_mode="reflect",
         )
 
     def forward(self, hidden_states):
@@ -263,8 +269,16 @@ def mel_spectrogram(
     padding = (n_fft - hop_size) // 2
     y = torch.nn.functional.pad(y.unsqueeze(1), (padding, padding), mode="reflect").squeeze(1)
     spec = torch.stft(
-        y, n_fft, hop_length=hop_size, win_length=win_size, window=hann_window,
-        center=center, pad_mode="reflect", normalized=False, onesided=True, return_complex=True,
+        y,
+        n_fft,
+        hop_length=hop_size,
+        win_length=win_size,
+        window=hann_window,
+        center=center,
+        pad_mode="reflect",
+        normalized=False,
+        onesided=True,
+        return_complex=True,
     )
     spec = torch.sqrt(torch.view_as_real(spec).pow(2).sum(-1) + 1e-9)
     mel_spec = torch.matmul(mel_basis, spec)
@@ -766,9 +780,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                             raise ValueError(
                                 "Base in-context non-streaming requires `ref_text` or tokenized `ref_ids`."
                             )
-                        ref_text_ids = tokenize_prompt(
-                            Qwen3TTSTalkerForConditionalGeneration._build_ref_text(ref_text)
-                        )
+                        ref_text_ids = tokenize_prompt(Qwen3TTSTalkerForConditionalGeneration._build_ref_text(ref_text))
                         ref_ids_len = len(ref_text_ids)
                     elif hasattr(ref_ids, "shape"):
                         shape = getattr(ref_ids, "shape", None)
@@ -815,14 +827,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         return base64.b64decode(b64)
 
     def _load_audio_to_np(self, x: str) -> tuple[np.ndarray, int]:
+        """Load audio from local path or base64 data URI (no network I/O)."""
         import librosa
 
         if self._is_url(x):
-            with urlopen(x) as resp:
-                audio_bytes = resp.read()
-            with io.BytesIO(audio_bytes) as f:
-                audio, sr = sf.read(f, dtype="float32", always_2d=False)
-        elif self._is_probably_base64(x):
+            raise ValueError("ref_audio URLs must be resolved by the serving layer before reaching the model worker.")
+        if self._is_probably_base64(x):
             wav_bytes = self._decode_base64_to_wav_bytes(x)
             with io.BytesIO(wav_bytes) as f:
                 audio, sr = sf.read(f, dtype="float32", always_2d=False)
