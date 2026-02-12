@@ -182,7 +182,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
                 req.prompt_token_ids = payload_data.get("code_predictor_codes", [])
                 req.num_computed_tokens = 0
-                req.additional_information = payload_data
 
             # Mark as finished for consumption
             with self.lock:

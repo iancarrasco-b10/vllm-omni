@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Temporary compatibility shim for vllm_omni.entrypoints.omni_stage.py / omni_llm.py.
+# temporary for compatibility with vllm_omni.entrypoints.omni_stage.py
+# and vllm_omni.entrypoints.omni_llm.py
 
 import time
 from collections.abc import Callable
@@ -25,7 +26,12 @@ def try_send_via_connector(
     next_stage_queue_submit_fn: Callable[[dict[str, Any]], None],
     metrics: OrchestratorAggregator,
 ) -> bool:
-    """Send payload via OmniConnector and enqueue notification/metrics; return True on success."""
+    """
+    Attempts to send data via OmniConnector.
+    Returns True if successful, False otherwise.
+    Encapsulates the logic of preparing payload, sending via connector,
+    sending notification, and recording metrics.
+    """
     try:
         t0 = time.time()
 
@@ -90,7 +96,10 @@ def try_recv_via_connector(
     connectors: dict[Any, Any],
     stage_id: int,
 ) -> tuple[Any, dict[str, Any] | None]:
-    """Resolve engine_inputs from connector/IPC payload; returns (engine_inputs, rx_metrics) or (None, None)."""
+    """
+    Attempts to resolve input data from either connector or IPC.
+    Returns (engine_inputs, rx_metrics) or (None, None) if failed/skipped.
+    """
     rid = task["request_id"]
 
     if task.get("from_connector"):
@@ -145,7 +154,10 @@ def try_recv_via_connector(
             )
             return None, None
     else:
-        # Queue path (e.g. Stage-0 seed): task should carry direct inputs, but still decode SHM/IPC if present.
+        # Data comes from queue as usual (e.g. seed request for Stage-0)
+        # Since fallback logic is deprecated, we assume this is a direct inputs payload.
+        # We still need to decode it if it used SHM (via legacy stage_utils logic, or new shm_connector format)
+        # For Stage-0 specifically, 'engine_inputs' is often directly in the task dict.
 
         # Try to use the new stage_utils which uses OmniSerializer
         from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc_with_metrics
@@ -162,7 +174,14 @@ def try_recv_via_connector(
 
 
 def compute_talker_prompt_ids_length(prompt_ids: list[int]) -> int:
-    """Compute talker prompt length for chat-style prompt ids (system/user/assistant)."""
+    """Compute the length of the talker prompt ids.
+
+    Args:
+        prompt_ids: The prompt ids tensor.
+
+    Returns:
+        The length of the talker prompt ids.
+    """
     im_start_token_id = 151644
     system_token_id = 8948
     user_token_id = 872

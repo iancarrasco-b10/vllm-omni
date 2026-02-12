@@ -213,13 +213,6 @@ class OmniGenerationScheduler(VLLMScheduler):
             req_to_new_blocks=req_to_new_blocks,
         )
 
-        # async_chunk: forward per-step additional_information updates for cached requests.
-        per_req_additional_info: dict[str, object] = {}
-        for req in scheduled_running_reqs:
-            req_info = getattr(req, "additional_information", None)
-            if isinstance(req_info, dict) and req_info:
-                per_req_additional_info[req.request_id] = req_info
-
         cached_reqs_data = OmniCachedRequestData(
             req_ids=cached_reqs_data.req_ids,
             resumed_req_ids=cached_reqs_data.resumed_req_ids,
@@ -230,8 +223,6 @@ class OmniGenerationScheduler(VLLMScheduler):
             num_output_tokens=cached_reqs_data.num_output_tokens,
             prompt_token_ids=cached_prompt_token_ids,
         )
-        if per_req_additional_info:
-            cached_reqs_data.additional_information = per_req_additional_info
 
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         scheduler_output = SchedulerOutput(

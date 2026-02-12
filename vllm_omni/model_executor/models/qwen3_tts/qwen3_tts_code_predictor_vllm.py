@@ -430,3 +430,66 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
 
         logits = self.lm_head[generation_step](out)
         return logits
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        layer0_code: torch.Tensor,
+        layer0_embed: torch.Tensor,
+        last_talker_hidden: torch.Tensor,
+        do_sample: bool = True,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 1.0,
+    ) -> torch.Tensor:
+        """Full autoregressive prediction of residual codebooks 1..Q-1.
+
+        Args:
+            layer0_code: [B, 1] first-layer codec token ids.
+            layer0_embed: [B, 1, H] embedding of layer0_code.
+            last_talker_hidden: [B, 1, H] hidden state from the talker.
+            do_sample: whether to sample or take argmax.
+            temperature: sampling temperature.
+            top_k: top-k filtering.
+            top_p: top-p (nucleus) filtering.
+
+        Returns:
+            audio_codes: [B, Q] all codebook tokens (layer0 + residuals).
+        """
+        bsz = int(layer0_code.shape[0])
+        num_groups = int(self.config.num_code_groups)
+        max_steps = num_groups - 1
+
+        # Reset KV cache for a fresh sequence.
+        self.reset_cache()
+
+        # Prefill: feed [last_talker_hidden, layer0_embed] → logits for group 1.
+        prefill_input = torch.cat([last_talker_hidden, layer0_embed], dim=1)  # [B, 2, H]
+        logits = self.prefill_logits(prefill_input)  # [B, vocab]
+
+        all_codes = [layer0_code.reshape(bsz, 1)]
+        past_seq_len = 2
+
+        for step in range(1, num_groups):
+            # Sample or argmax from logits.
+            if do_sample and temperature > 0:
+                scaled = logits / temperature
+                if top_k > 0:
+                    topk_vals, _ = scaled.topk(top_k, dim=-1)
+                    scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
+                probs = torch.softmax(scaled, dim=-1)
+                next_ids = torch.multinomial(probs, num_samples=1)  # [B, 1]
+            else:
+                next_ids = logits.argmax(dim=-1, keepdim=True)  # [B, 1]
+            all_codes.append(next_ids)
+
+            # If not the last step, decode one more token.
+            if step < max_steps:
+                logits = self.decode_logits(
+                    next_ids.reshape(bsz),
+                    generation_step=step,
+                    past_seq_len=past_seq_len,
+                )
+                past_seq_len += 1
+
+        return torch.cat(all_codes, dim=1)  # [B, Q]
