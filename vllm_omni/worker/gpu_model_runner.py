@@ -78,7 +78,11 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.talker_mtp = talker_mtp  # type: ignore[assignment]
             cudagraph_mode = self.compilation_config.cudagraph_mode
             assert cudagraph_mode is not None
-            if cudagraph_mode.has_full_cudagraphs():
+            # Only wrap talker_mtp in CUDAGraphWrapper for Omni models that
+            # have a separate .talker sub-module.  TTS models' code predictor
+            # has internal AR loops / torch.multinomial — not graph-safe.
+            has_separate_talker = getattr(self.model, "talker", None) is not None
+            if cudagraph_mode.has_full_cudagraphs() and has_separate_talker:
                 self.talker_mtp = CUDAGraphWrapper(talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
             # TTS exposes mtp_hidden_size; Omni uses hf_text_config.hidden_size.
             hidden_size = int(
@@ -648,6 +652,11 @@ class OmniGPUModelRunner(GPUModelRunner):
                 input_ids = None
                 inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
                 model_kwargs = self._init_model_kwargs()
+            elif getattr(getattr(self, "model", None), "has_preprocess", False):
+                # Capture CUDA graph with inputs_embeds path so replay reads
+                # from the same buffer that _preprocess writes into.
+                input_ids = self.input_ids.gpu[:num_tokens_padded]
+                inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
             else:
                 input_ids = self.input_ids.gpu[:num_tokens_padded]
                 inputs_embeds = None
@@ -990,6 +999,11 @@ class OmniGPUModelRunner(GPUModelRunner):
             inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
             model_kwargs = self._init_model_kwargs()
             input_ids = self.input_ids.gpu[:num_input_tokens]
+        elif getattr(self.model, "has_preprocess", False):
+            # Use pre-allocated buffer for CUDA graph compatibility.
+            input_ids = self.input_ids.gpu[:num_input_tokens]
+            inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
+            model_kwargs = self._init_model_kwargs()
         else:
             # For text-only models, we use token ids as input.
             # While it is possible to use embeddings as input just like the
@@ -1104,6 +1118,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             max_num_scheduled_tokens=1,
             use_cascade_attn=False,
         )
+        # Force eager for unwrapped code predictors (AR loops / multinomial).
+        if not isinstance(self.talker_mtp, CUDAGraphWrapper):
+            _cudagraph_mode = CUDAGraphMode.NONE
         num_tokens_padded = batch_desc.num_tokens
         req_input_ids = self.talker_mtp_input_ids.gpu[:num_tokens_padded]
         req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]

@@ -20,7 +20,7 @@ def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
 
 
 def talker2code2wav_async_chunk(
-    connector: Any,
+    transfer_manager: Any,
     pooling_output: dict[str, Any],
     request: Any,
 ) -> dict[str, Any] | None:
@@ -29,6 +29,7 @@ def talker2code2wav_async_chunk(
 
     request_id = request.external_req_id
 
+    connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
     chunk_size = int(cfg.get("codec_chunk_frames", 25))
@@ -41,28 +42,18 @@ def talker2code2wav_async_chunk(
 
     finished = bool(request.is_finished())
 
-    appended_frame = False
-    if not finished:
-        frame = _extract_last_frame(pooling_output)
-        if frame is None:
-            return None
+    frame = _extract_last_frame(pooling_output)
+    if frame is not None:
         codec_codes = frame.cpu().tolist()
-        connector.code_prompt_token_ids[request_id].append(codec_codes)
-        appended_frame = True
+        transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
 
-    length = len(connector.code_prompt_token_ids[request_id])
+    length = len(transfer_manager.code_prompt_token_ids[request_id])
     chunk_length = length % chunk_size
 
     if chunk_length != 0 and not finished:
         return None
 
     context_length = chunk_length if chunk_length != 0 else chunk_size
-
-    if finished and (not appended_frame) and chunk_length == 0:
-        return {
-            "code_predictor_codes": [],
-            "finished": torch.tensor(True, dtype=torch.bool),
-        }
 
     if length <= 0:
         return {
@@ -72,7 +63,7 @@ def talker2code2wav_async_chunk(
 
     end_index = min(length, left_context_size + context_length)
     ctx_frames = max(0, int(end_index - context_length))
-    window_frames = connector.code_prompt_token_ids[request_id][-end_index:]
+    window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
 
     # Pack context + chunk into codebook-major flat codes for adapter.
     code_predictor_codes = torch.tensor(window_frames).transpose(0, 1).reshape(-1).tolist()

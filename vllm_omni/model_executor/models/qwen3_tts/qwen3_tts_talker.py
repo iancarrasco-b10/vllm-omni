@@ -327,6 +327,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             )
         self._codec_eos_token_id = int(getattr(self.talker_config, "codec_eos_token_id", -1))
 
+        self._eos_logit_bias: float = 0.0
+
         self.have_multimodal_outputs = True
         self.has_preprocess = True
         self.has_postprocess = True
@@ -366,9 +368,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Keep it optional to avoid strict weight-loading failures.
         self.speaker_encoder: Qwen3TTSSpeakerEncoder | None = None
 
-        # Residual code predictor (1..Q-1) uses a dedicated vLLM config to build its own KV cache.
-        # This avoids polluting the main engine's static forward context.
+        # Code predictor uses an isolated vLLM config so its KV cache doesn't
+        # pollute the main engine's static_forward_context (shallow-copy shares
+        # the dict by reference — must assign a fresh one).
         predictor_compilation = dataclasses.replace(vllm_config.compilation_config)
+        predictor_compilation.static_forward_context = {}
         self._code_predictor_vllm_config = dataclasses.replace(vllm_config, compilation_config=predictor_compilation)
         from vllm.config.vllm import set_current_vllm_config as _set_cfg
 
@@ -422,6 +426,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         # Mask out invalid codec ids using the pre-built constant buffer.
         logits = logits.masked_fill(~self._codec_allowed_mask, float("-inf"))
+
+        if self._eos_logit_bias != 0.0:
+            eos_id = self._codec_eos_token_id
+            if 0 <= eos_id < logits.shape[-1]:
+                logits[:, eos_id] = logits[:, eos_id] + self._eos_logit_bias
+
         return logits
 
     # -------------------- Omni multimodal output plumbing --------------------
@@ -1551,7 +1561,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             audio_codes = input_ids.reshape(bsz, 1)
             return (last_id_hidden + text_step).reshape(bsz, -1), audio_codes
 
-        # Single forward call: predicts all residual codes (1..Q-1) autoregressively.
+        # Predict residual codes (1..Q-1) with HF reference sampling params.
         audio_codes = self.code_predictor(
             layer0_code=input_ids.reshape(bsz, 1),
             layer0_embed=last_id_hidden,
@@ -1565,8 +1575,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Map invalid layer-0 ids (e.g. EOS) to PAD=0 so SpeechTokenizer sees only real codes.
         layer0 = audio_codes[:, :1]
         invalid0 = (layer0 < 0) | (layer0 >= int(self._codebook_vocab_size))
-        if invalid0.any():
-            audio_codes = torch.where(invalid0.expand_as(audio_codes), torch.zeros_like(audio_codes), audio_codes)
+        audio_codes = torch.where(invalid0.expand_as(audio_codes), torch.zeros_like(audio_codes), audio_codes)
 
         # Sum embeddings of all code groups, then add the current text step.
         residual_ids_t = audio_codes[:, 1:]

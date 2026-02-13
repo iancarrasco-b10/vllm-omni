@@ -1,6 +1,8 @@
 import asyncio
 import base64
 import io
+import ipaddress
+import socket
 from typing import Any
 from urllib.parse import urlparse
 from urllib.request import urlopen
@@ -25,6 +27,16 @@ logger = init_logger(__name__)
 
 _REF_AUDIO_TIMEOUT_S = 15
 _REF_AUDIO_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
+_REF_AUDIO_BLOCKED_NETWORKS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+]
 
 # TTS Configuration (currently supports Qwen3-TTS)
 _TTS_MODEL_STAGES: set[str] = {"qwen3_tts"}
@@ -170,8 +182,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Resolve ref_audio URL/base64 to (wav_samples, sample_rate)."""
         parsed = urlparse(ref_audio_str)
 
+        def _check_ssrf(url: str) -> None:
+            host = urlparse(url).hostname
+            if not host:
+                raise ValueError("ref_audio URL must include a hostname")
+            for info in socket.getaddrinfo(host, None):
+                ip_str = str(info[4][0]).split("%", 1)[0]
+                addr = ipaddress.ip_address(ip_str)
+                if any(addr in net for net in _REF_AUDIO_BLOCKED_NETWORKS):
+                    raise ValueError(f"ref_audio URL resolves to blocked address: {addr}")
+
         def _fetch_sync() -> tuple[np.ndarray, int]:
             if parsed.scheme in ("http", "https"):
+                _check_ssrf(ref_audio_str)
                 with urlopen(ref_audio_str, timeout=_REF_AUDIO_TIMEOUT_S) as resp:
                     data = resp.read(_REF_AUDIO_MAX_BYTES + 1)
                     if len(data) > _REF_AUDIO_MAX_BYTES:
