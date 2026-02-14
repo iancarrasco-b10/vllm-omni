@@ -349,7 +349,8 @@ class OmniGenerationScheduler(VLLMScheduler):
                 continue
             request = self.requests.get(req_id)
             if request is None or request.is_finished():
-                # Request may already be finished (e.g., aborted during execution / pipeline parallelism / async scheduling).
+                # Request may already be finished (e.g., aborted during
+                # execution / pipeline parallelism / async scheduling).
                 continue
 
             req_index = model_runner_output.req_id_to_index[req_id]
