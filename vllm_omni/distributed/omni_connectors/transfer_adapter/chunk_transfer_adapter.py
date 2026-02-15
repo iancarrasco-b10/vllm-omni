@@ -180,8 +180,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 if payload_data.get("finished"):
                     self.finished_requests.add(req_id)
 
-                req.prompt_token_ids = payload_data.get("code_predictor_codes", [])
+                # req.prompt_token_ids = payload_data.get("code_predictor_codes", [])
+                # req.num_computed_tokens = 0
+                new_ids = payload_data.get("code_predictor_codes", [])
+                req.prompt_token_ids = new_ids
                 req.num_computed_tokens = 0
+
+                # Empty chunk with more data expected: keep polling.
+                if not new_ids and not payload_data.get("finished"):
+                    return
 
             # Mark as finished for consumption
             with self.lock:
