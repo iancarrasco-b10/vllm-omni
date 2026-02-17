@@ -48,6 +48,10 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description="Maximum tokens to generate",
     )
+    stream: bool = Field(
+        default=False,
+        description="Stream audio chunks as they are generated",
+    )
 
     @field_validator("stream_format")
     @classmethod

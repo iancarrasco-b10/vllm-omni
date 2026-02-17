@@ -10,7 +10,7 @@ from urllib.request import urlopen
 import numpy as np
 import soundfile as sf
 from fastapi import Request
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
 from vllm.logger import init_logger
 from vllm.utils import random_uuid
@@ -216,6 +216,52 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         wav_np, sr = await loop.run_in_executor(None, _fetch_sync)
         return wav_np.tolist(), sr
 
+    @staticmethod
+    def _extract_audio_from_output(output: OmniRequestOutput) -> tuple[np.ndarray, int] | None:
+        """Extract audio tensor and sample rate from an OmniRequestOutput.
+
+        Returns (audio_numpy, sample_rate) or None if no audio found.
+        """
+        audio_output = None
+        if hasattr(output, "multimodal_output") and output.multimodal_output:
+            audio_output = output.multimodal_output
+        if not audio_output and hasattr(output, "request_output"):
+            if output.request_output and hasattr(output.request_output, "multimodal_output"):
+                audio_output = output.request_output.multimodal_output
+
+        if not audio_output:
+            return None
+
+        # Check for audio data using either "audio" or "model_outputs" key
+        audio_key = None
+        if "audio" in audio_output:
+            audio_key = "audio"
+        elif "model_outputs" in audio_output:
+            audio_key = "model_outputs"
+
+        if audio_key is None:
+            return None
+
+        audio_tensor = audio_output[audio_key]
+        sample_rate = audio_output.get("sr", 24000)
+        if hasattr(sample_rate, "item"):
+            sample_rate = sample_rate.item()
+
+        # Streaming accumulates chunks as a list; concat first.
+        if isinstance(audio_tensor, list):
+            import torch
+
+            audio_tensor = torch.cat(audio_tensor, dim=-1)
+        # Convert tensor to numpy
+        if hasattr(audio_tensor, "float"):
+            audio_tensor = audio_tensor.float().detach().cpu().numpy()
+
+        # Squeeze batch dimension if present, but preserve channel dimension for stereo
+        if audio_tensor.ndim > 1:
+            audio_tensor = audio_tensor.squeeze()
+
+        return audio_tensor, int(sample_rate)
+
     def _build_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         """Build TTS parameters from request.
 
@@ -286,7 +332,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         - ref_text: Transcript of reference audio (Base task)
         - x_vector_only_mode: Use speaker embedding only (Base task)
 
-        NOTE: Streaming audio generation is not currently supported.
+        When stream=True, audio chunks are yielded as raw bytes
+        (PCM/WAV per response_format) via a StreamingResponse.
         """
 
         error_check_ret = await self._check_model(request)
@@ -342,6 +389,44 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 output_modalities=["audio"],
             )
 
+            response_format = request.response_format or "wav"
+            speed = request.speed or 1.0
+
+            # --- Streaming path ---
+            if request.stream:
+                media_type_map = {
+                    "wav": "audio/wav",
+                    "pcm": "audio/pcm",
+                    "flac": "audio/flac",
+                    "mp3": "audio/mpeg",
+                    "aac": "audio/aac",
+                    "opus": "audio/ogg",
+                }
+                media_type = media_type_map.get(response_format, "audio/wav")
+
+                async def audio_stream_generator():
+                    async for res in generator:
+                        audio_chunk = self._extract_audio_from_output(res)
+                        if audio_chunk is None:
+                            continue
+                        audio_tensor, sample_rate = audio_chunk
+                        audio_obj = CreateAudio(
+                            audio_tensor=audio_tensor,
+                            sample_rate=int(sample_rate),
+                            response_format=response_format,
+                            speed=speed,
+                            stream_format=request.stream_format,
+                            base64_encode=False,
+                        )
+                        audio_response: AudioResponse = self.create_audio(audio_obj)
+                        yield audio_response.audio_data
+
+                return StreamingResponse(
+                    audio_stream_generator(),
+                    media_type=media_type,
+                )
+
+            # --- Non-streaming path (default) ---
             final_output: OmniRequestOutput | None = None
             async for res in generator:
                 final_output = res
@@ -349,50 +434,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if final_output is None:
                 return self.create_error_response("No output generated from the model.")
 
-            # Extract audio from output
-            # Audio can be in final_output.multimodal_output or final_output.request_output.multimodal_output
-            # Support both "audio" and "model_outputs" keys for compatibility with different models
-            audio_output = None
-            if hasattr(final_output, "multimodal_output") and final_output.multimodal_output:
-                audio_output = final_output.multimodal_output
-            if not audio_output and hasattr(final_output, "request_output"):
-                if final_output.request_output and hasattr(final_output.request_output, "multimodal_output"):
-                    audio_output = final_output.request_output.multimodal_output
-
-            # Check for audio data using either "audio" or "model_outputs" key
-            audio_key = None
-            if audio_output:
-                if "audio" in audio_output:
-                    audio_key = "audio"
-                elif "model_outputs" in audio_output:
-                    audio_key = "model_outputs"
-
-            if not audio_output or audio_key is None:
+            audio_chunk = self._extract_audio_from_output(final_output)
+            if audio_chunk is None:
                 return self.create_error_response("TTS model did not produce audio output.")
 
-            audio_tensor = audio_output[audio_key]
-            sample_rate = audio_output.get("sr", 24000)
-            if hasattr(sample_rate, "item"):
-                sample_rate = sample_rate.item()
-
-            # Streaming accumulates chunks as a list; concat first.
-            if isinstance(audio_tensor, list):
-                import torch
-
-                audio_tensor = torch.cat(audio_tensor, dim=-1)
-            # Convert tensor to numpy
-            if hasattr(audio_tensor, "float"):
-                audio_tensor = audio_tensor.float().detach().cpu().numpy()
-
-            # Squeeze batch dimension if present, but preserve channel dimension for stereo
-            if audio_tensor.ndim > 1:
-                audio_tensor = audio_tensor.squeeze()
+            audio_tensor, sample_rate = audio_chunk
 
             audio_obj = CreateAudio(
                 audio_tensor=audio_tensor,
                 sample_rate=int(sample_rate),
-                response_format=request.response_format or "wav",
-                speed=request.speed or 1.0,
+                response_format=response_format,
+                speed=speed,
                 stream_format=request.stream_format,
                 base64_encode=False,
             )

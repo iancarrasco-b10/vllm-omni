@@ -178,7 +178,17 @@ class OmniRequestState(RequestState):
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
 
-        if not finished and final_only:
+        # Detect streaming multimodal mode: Code2Wav emits chunks with
+        # a "finished" key to signal that intermediate outputs should be
+        # forwarded to the client instead of suppressed.
+        has_streaming_mm_output = (
+            not finished
+            and self.mm_accumulated is not None
+            and isinstance(self.mm_accumulated, dict)
+            and "finished" in self.mm_accumulated
+        )
+
+        if not finished and final_only and not has_streaming_mm_output:
             return None
 
         # Consolidate accumulated tensors when finishing.
@@ -216,7 +226,14 @@ class OmniRequestState(RequestState):
                 return None
             external_req_id = self.parent_req.external_req_id
 
-        return self._new_request_output(external_req_id, outputs, finished, kv_transfer_params)
+        req_output = self._new_request_output(external_req_id, outputs, finished, kv_transfer_params)
+
+        # After emitting a streaming intermediate output, reset accumulated
+        # multimodal data so the next chunk starts fresh.
+        if has_streaming_mm_output and req_output is not None:
+            self.mm_accumulated = None
+
+        return req_output
 
     def _new_completion_output(
         self,

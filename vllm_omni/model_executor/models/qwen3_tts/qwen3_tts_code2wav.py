@@ -230,6 +230,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             multimodal_outputs={
                 "model_outputs": audio_tensor,
                 "sr": sr,
+                "finished": torch.tensor(False),
             },
         )
 
