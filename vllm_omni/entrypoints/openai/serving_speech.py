@@ -311,6 +311,113 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return params
 
+    async def _prepare_tts_generator(
+        self,
+        request: OpenAICreateSpeechRequest,
+    ):
+        """Validate request, build prompt, and return the async generator.
+
+        Shared by both _generate_audio_bytes() and the streaming output path
+        in create_speech().
+
+        Returns:
+            The async generator from engine_client.generate().
+
+        Raises:
+            ValueError: If validation fails.
+        """
+        if self._is_tts_model():
+            validation_error = self._validate_tts_request(request)
+            if validation_error:
+                raise ValueError(validation_error)
+
+            # Must use prompt_token_ids (not text prompt): the AR Talker
+            # operates on codec tokens; text token IDs exceed codec vocab.
+            # model.preprocess replaces all embeddings, so placeholder value
+            # is irrelevant -- but length must match to avoid excess padding.
+            tts_params = self._build_tts_params(request)
+
+            if request.ref_audio is not None:
+                wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+                tts_params["ref_audio"] = [[wav_list, sr]]
+
+            ph_len = self._estimate_prompt_len(tts_params)
+            prompt = {
+                "prompt_token_ids": [1] * ph_len,
+                "additional_information": tts_params,
+            }
+        else:
+            tts_params = {}
+            prompt = {"prompt": request.input}
+
+        request_id = f"speech-{random_uuid()}"
+
+        logger.info(
+            "TTS speech request %s: text=%r, task_type=%s",
+            request_id,
+            request.input[:50] + "..." if len(request.input) > 50 else request.input,
+            tts_params.get("task_type", ["unknown"])[0],
+        )
+
+        sampling_params_list = self.engine_client.default_sampling_params_list
+
+        generator = self.engine_client.generate(
+            prompt=prompt,
+            request_id=request_id,
+            sampling_params_list=sampling_params_list,
+            output_modalities=["audio"],
+        )
+
+        return generator
+
+    async def _generate_audio_bytes(
+        self,
+        request: OpenAICreateSpeechRequest,
+    ) -> tuple[bytes, str]:
+        """Core TTS generation logic: validate, generate, and encode audio.
+
+        Extracted from create_speech() so it can be reused by the streaming
+        WebSocket handler for per-sentence generation.
+
+        Args:
+            request: The speech request with text and parameters.
+
+        Returns:
+            Tuple of (audio_bytes, media_type).
+
+        Raises:
+            ValueError: If validation fails or generation produces no output.
+        """
+        if self.engine_client.errored:
+            raise self.engine_client.dead_error
+
+        generator = await self._prepare_tts_generator(request)
+
+        final_output: OmniRequestOutput | None = None
+        async for res in generator:
+            final_output = res
+
+        if final_output is None:
+            raise ValueError("No output generated from the model.")
+
+        audio_chunk = self._extract_audio_from_output(final_output)
+        if audio_chunk is None:
+            raise ValueError("TTS model did not produce audio output.")
+
+        audio_tensor, sample_rate = audio_chunk
+
+        audio_obj = CreateAudio(
+            audio_tensor=audio_tensor,
+            sample_rate=int(sample_rate),
+            response_format=request.response_format or "wav",
+            speed=request.speed or 1.0,
+            stream_format=request.stream_format,
+            base64_encode=False,
+        )
+
+        audio_response: AudioResponse = self.create_audio(audio_obj)
+        return audio_response.audio_data, audio_response.media_type
+
     async def create_speech(
         self,
         request: OpenAICreateSpeechRequest,
@@ -341,59 +448,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             logger.error("Error with model %s", error_check_ret)
             return error_check_ret
 
-        if self.engine_client.errored:
-            raise self.engine_client.dead_error
-
-        request_id = f"speech-{random_uuid()}"
-
         try:
-            if self._is_tts_model():
-                # Validate TTS parameters
-                validation_error = self._validate_tts_request(request)
-                if validation_error:
-                    return self.create_error_response(validation_error)
-
-                # Must use prompt_token_ids (not text prompt): the AR Talker
-                # operates on codec tokens; text token IDs exceed codec vocab.
-                # model.preprocess replaces all embeddings, so placeholder value
-                # is irrelevant -- but length must match to avoid excess padding.
-                tts_params = self._build_tts_params(request)
-
-                if request.ref_audio is not None:
-                    wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
-                    tts_params["ref_audio"] = [[wav_list, sr]]
-
-                ph_len = self._estimate_prompt_len(tts_params)
-                prompt = {
-                    "prompt_token_ids": [1] * ph_len,
-                    "additional_information": tts_params,
-                }
-            else:
-                # Fallback for unsupported models
-                tts_params = {}
-                prompt = {"prompt": request.input}
-
-            logger.info(
-                "TTS speech request %s: text=%r, task_type=%s",
-                request_id,
-                request.input[:50] + "..." if len(request.input) > 50 else request.input,
-                tts_params.get("task_type", ["unknown"])[0],
-            )
-
-            sampling_params_list = self.engine_client.default_sampling_params_list
-
-            generator = self.engine_client.generate(
-                prompt=prompt,
-                request_id=request_id,
-                sampling_params_list=sampling_params_list,
-                output_modalities=["audio"],
-            )
-
-            response_format = request.response_format or "wav"
-            speed = request.speed or 1.0
-
-            # --- Streaming path ---
+            # --- Streaming audio output path ---
             if request.stream:
+                if self.engine_client.errored:
+                    raise self.engine_client.dead_error
+
+                generator = await self._prepare_tts_generator(request)
+
+                response_format = request.response_format or "wav"
+                speed = request.speed or 1.0
+
                 media_type_map = {
                     "wav": "audio/wav",
                     "pcm": "audio/pcm",
@@ -427,30 +492,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 )
 
             # --- Non-streaming path (default) ---
-            final_output: OmniRequestOutput | None = None
-            async for res in generator:
-                final_output = res
-
-            if final_output is None:
-                return self.create_error_response("No output generated from the model.")
-
-            audio_chunk = self._extract_audio_from_output(final_output)
-            if audio_chunk is None:
-                return self.create_error_response("TTS model did not produce audio output.")
-
-            audio_tensor, sample_rate = audio_chunk
-
-            audio_obj = CreateAudio(
-                audio_tensor=audio_tensor,
-                sample_rate=int(sample_rate),
-                response_format=response_format,
-                speed=speed,
-                stream_format=request.stream_format,
-                base64_encode=False,
-            )
-
-            audio_response: AudioResponse = self.create_audio(audio_obj)
-            return Response(content=audio_response.audio_data, media_type=audio_response.media_type)
+            audio_data, media_type = await self._generate_audio_bytes(request)
+            return Response(content=audio_data, media_type=media_type)
 
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
