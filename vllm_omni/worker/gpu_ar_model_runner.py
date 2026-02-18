@@ -287,6 +287,8 @@ class GPUARModelRunner(OmniGPUModelRunner):
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
+            import time as _time
+            _fwd_t0 = _time.perf_counter()
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -297,6 +299,20 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 logits_index=logits_indices,
                 sampler=self.sampler,
             )
+            _fwd_t1 = _time.perf_counter()
+            _fwd_ms = (_fwd_t1 - _fwd_t0) * 1000.0
+            if not hasattr(self, "_fwd_count"):
+                self._fwd_count = 0
+                self._fwd_total_ms = 0.0
+            self._fwd_count += 1
+            self._fwd_total_ms += _fwd_ms
+            if self._fwd_count % 5 == 1:
+                logger.info(
+                    "[Stage-0 AR] #%d  model_forward=%.1fms  num_tokens=%d  "
+                    "cudagraph=%s  avg=%.1fms",
+                    self._fwd_count, _fwd_ms, num_scheduled_tokens,
+                    cudagraph_mode, self._fwd_total_ms / self._fwd_count,
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -522,7 +538,22 @@ class GPUARModelRunner(OmniGPUModelRunner):
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
 
+        import time as _time
+        _hs_t0 = _time.perf_counter()
         hidden_states_cpu = hidden_states.detach().to("cpu").contiguous()
+        _hs_t1 = _time.perf_counter()
+        _hs_ms = (_hs_t1 - _hs_t0) * 1000.0
+        if not hasattr(self, "_hs_copy_count"):
+            self._hs_copy_count = 0
+            self._hs_copy_total_ms = 0.0
+        self._hs_copy_count += 1
+        self._hs_copy_total_ms += _hs_ms
+        if self._hs_copy_count % 5 == 1:
+            logger.info(
+                "[Stage-0 AR] #%d  hidden_states→cpu=%.1fms  shape=%s  avg=%.1fms",
+                self._hs_copy_count, _hs_ms, list(hidden_states.shape),
+                self._hs_copy_total_ms / self._hs_copy_count,
+            )
         num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
         if num_scheduled_tokens_np is None:
             req_ids = self.input_batch.req_ids

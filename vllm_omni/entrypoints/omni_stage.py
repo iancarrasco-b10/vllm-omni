@@ -922,7 +922,22 @@ def _stage_worker(
                 gen_outputs.extend(results)
             _gen_t1 = _time.time()
             _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
-            logger.debug(f"Generate done: batch={len(batch_tasks)}, req_ids={batch_request_ids}, gen_ms={_gen_ms:.1f}")
+            _total_out_tokens = sum(
+                len(getattr(getattr(ro, "outputs", [None])[0], "token_ids", []))
+                for ro in gen_outputs
+                if getattr(ro, "outputs", None)
+            )
+            _total_in_tokens = sum(
+                len(getattr(ro, "prompt_token_ids", []))
+                for ro in gen_outputs
+            )
+            _tps = _total_out_tokens / (_gen_ms / 1000.0) if _gen_ms > 0 else 0.0
+            logger.info(
+                "[Stage-%s] Generate done: batch=%d reqs=%s  "
+                "prompt_tokens=%d  output_tokens=%d  time=%.1fms  TPS=%.1f tok/s",
+                stage_id, len(batch_tasks), batch_request_ids,
+                _total_in_tokens, _total_out_tokens, _gen_ms, _tps,
+            )
 
             # Group outputs per request id with fallback
             req_to_outputs: dict[Any, list[Any]] = {rid: [] for rid in batch_request_ids}
@@ -1257,12 +1272,30 @@ async def _stage_worker_async(
                 ein = cast(PromptType, ein)
                 llm_sampling_params: SamplingParams = task["sampling_params"]
                 gen_output = None
+                _req_gen_start = _time.time()
+                _step_count = 0
                 async for res in cast(AsyncLLM, stage_engine).generate(ein, llm_sampling_params, rid):
                     gen_output = res
+                    _step_count += 1
                     _gen_t1 = _time.time()
                     _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
                     _gen_t0 = _gen_t1
                     await generation_out_q.put((rid, gen_output, _gen_ms))
+                _req_gen_end = _time.time()
+                _req_gen_total_ms = (_req_gen_end - _req_gen_start) * 1000.0
+                _req_total_out = 0
+                _req_total_in = 0
+                if gen_output is not None:
+                    _req_total_in = len(getattr(gen_output, "prompt_token_ids", []))
+                    for _out in getattr(gen_output, "outputs", []):
+                        _req_total_out += len(getattr(_out, "token_ids", []))
+                _req_tps = _req_total_out / (_req_gen_total_ms / 1000.0) if _req_gen_total_ms > 0 else 0.0
+                logger.info(
+                    "[Stage-%s] Request %s done: prompt_tokens=%d  output_tokens=%d  "
+                    "steps=%d  time=%.1fms  TPS=%.1f tok/s",
+                    stage_id, rid, _req_total_in, _req_total_out,
+                    _step_count, _req_gen_total_ms, _req_tps,
+                )
         except Exception as e:
             logger.exception("Failed on request %s: %s", rid, e)
             out_q.put(

@@ -108,7 +108,7 @@ class Qwen3TTSModelForGeneration(nn.Module):
                 logger.info("CUDA Graph not enabled: decoder is on %s", device)
                 return
             if hasattr(decoder, "enable_cudagraph"):
-                decoder.enable_cudagraph(capture_sizes=[25, 50, 100, 150, 200, 250, 300])
+                decoder.enable_cudagraph()
                 logger.info("CUDA Graph enabled for speech tokenizer decoder")
         except Exception:
             logger.warning("Failed to enable CUDA Graph for decoder", exc_info=True)

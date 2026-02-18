@@ -3,11 +3,15 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
+import math
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.config.vllm import set_current_vllm_config
 from vllm.forward_context import set_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
@@ -19,6 +23,41 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheS
 from vllm.v1.worker.gpu import attn_utils
 
 from .configuration_qwen3_tts import Qwen3TTSTalkerCodePredictorConfig, Qwen3TTSTalkerConfig
+
+logger = init_logger(__name__)
+
+
+def _build_rope_cache(head_dim: int, max_seq: int, theta: float, device: torch.device, dtype: torch.float32):
+    """Pre-compute RoPE cos/sin tables: [max_seq, head_dim/2]."""
+    dim_half = head_dim // 2
+    freqs = 1.0 / (theta ** (torch.arange(0, dim_half, dtype=torch.float32, device=device) / dim_half))
+    t = torch.arange(max_seq, dtype=torch.float32, device=device)
+    angles = torch.outer(t, freqs)  # [max_seq, dim_half]
+    return torch.cos(angles).to(dtype), torch.sin(angles).to(dtype)
+
+
+def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, positions: torch.Tensor):
+    """Apply RoPE to x: [batch, heads, seq, head_dim]. positions: [batch, seq] or [seq]."""
+    dim_half = x.shape[-1] // 2
+    # cos/sin are [max_seq, dim_half]; gather by position
+    if positions.dim() == 1:
+        c = cos[positions]  # [seq, dim_half]
+        s = sin[positions]
+        c = c.unsqueeze(0).unsqueeze(0)  # [1, 1, seq, dim_half]
+        s = s.unsqueeze(0).unsqueeze(0)
+    else:
+        c = cos[positions].unsqueeze(1)  # [batch, 1, seq, dim_half]
+        s = sin[positions].unsqueeze(1)
+    x1 = x[..., :dim_half]
+    x2 = x[..., dim_half:]
+    return torch.cat([x1 * c - x2 * s, x2 * c + x1 * s], dim=-1)
+
+
+def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Simple RMS normalization."""
+    var = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
+    x_normed = x * torch.rsqrt(var + eps)
+    return (x_normed * weight).to(x.dtype)
 
 
 class _LocalPredictorKVCache:
@@ -315,9 +354,267 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
             self.small_to_mtp_projection = nn.Identity()
 
         self._kv_cache: _LocalPredictorKVCache | None = None
+        self._fast_ready = False
 
     def get_input_embeddings(self) -> nn.ModuleList:
         return self.model.get_input_embeddings()
+
+    # ---- Fast SDPA path (bypasses vLLM attention infrastructure) ----
+
+    def _init_fast_path(self, device: torch.device) -> None:
+        """One-time setup: pre-compute RoPE and allocate KV cache tensors."""
+        if self._fast_ready:
+            return
+        cfg = self.config
+        num_layers = cfg.num_hidden_layers
+        num_q_heads = cfg.num_attention_heads
+        num_kv_heads = cfg.num_key_value_heads
+        head_dim = getattr(cfg, "head_dim", cfg.hidden_size // num_q_heads)
+        max_seq = cfg.num_code_groups + 2  # prefill(2) + decode(Q-1)
+        rope_theta = getattr(cfg, "rope_theta", 10000.0)
+        eps = cfg.rms_norm_eps
+
+        self._fast_num_layers = num_layers
+        self._fast_num_q_heads = num_q_heads
+        self._fast_num_kv_heads = num_kv_heads
+        self._fast_head_dim = head_dim
+        self._fast_q_size = num_q_heads * head_dim
+        self._fast_kv_size = num_kv_heads * head_dim
+        self._fast_gqa_groups = num_q_heads // num_kv_heads
+        self._fast_eps = eps
+        self._fast_max_seq = max_seq
+        self._fast_hidden = cfg.hidden_size
+        self._fast_intermediate = cfg.intermediate_size
+
+        self._fast_rope_cos, self._fast_rope_sin = _build_rope_cache(
+            head_dim, max_seq, rope_theta, device, torch.bfloat16
+        )
+
+        # KV cache: [num_layers, 2(k,v), max_batch=1, max_seq, kv_heads, head_dim]
+        self._fast_k_cache = torch.zeros(
+            num_layers, 1, max_seq, num_kv_heads, head_dim,
+            dtype=torch.bfloat16, device=device,
+        )
+        self._fast_v_cache = torch.zeros(
+            num_layers, 1, max_seq, num_kv_heads, head_dim,
+            dtype=torch.bfloat16, device=device,
+        )
+
+        # Pre-compute causal mask for SDPA (avoids recomputation per call)
+        self._fast_causal_mask = torch.tril(
+            torch.ones(max_seq, max_seq, dtype=torch.bool, device=device)
+        )
+
+        # CUDA graph infrastructure for decode steps
+        self._graph_pool = torch.cuda.graph_pool_handle()
+        self._decode_graphs: dict[int, tuple[torch.cuda.CUDAGraph, torch.Tensor, torch.Tensor]] = {}
+        self._graph_warmup_done = False
+
+        self._fast_ready = True
+        logger.info(
+            "[FastCodePredictor] Initialized: layers=%d q_heads=%d kv_heads=%d "
+            "head_dim=%d hidden=%d max_seq=%d",
+            num_layers, num_q_heads, num_kv_heads, head_dim, cfg.hidden_size, max_seq,
+        )
+
+    @torch.inference_mode()
+    def _fast_layer_forward(
+        self, layer_idx: int, hidden: torch.Tensor, positions: torch.Tensor,
+        seq_len: int, tok_count: int,
+    ) -> torch.Tensor:
+        """Run one transformer layer using SDPA. hidden: [1, tok_count, H]."""
+        layer = self.model.layers[layer_idx]
+        eps = self._fast_eps
+        num_q = self._fast_num_q_heads
+        num_kv = self._fast_num_kv_heads
+        hd = self._fast_head_dim
+        q_size = self._fast_q_size
+        kv_size = self._fast_kv_size
+        inter = self._fast_intermediate
+
+        # Pre-attention norm
+        residual = hidden
+        hidden = _rms_norm(hidden, layer.input_layernorm.weight, eps)
+
+        # QKV projection (fused [q_size + 2*kv_size, hidden])
+        qkv = F.linear(hidden, layer.self_attn.qkv_proj.weight)
+        q = qkv[..., :q_size].reshape(1, tok_count, num_q, hd).transpose(1, 2)
+        k = qkv[..., q_size:q_size+kv_size].reshape(1, tok_count, num_kv, hd).transpose(1, 2)
+        v = qkv[..., q_size+kv_size:].reshape(1, tok_count, num_kv, hd).transpose(1, 2)
+
+        # QK norms (per-head RMS norm)
+        q = _rms_norm(q, layer.self_attn.q_norm.weight, eps)
+        k = _rms_norm(k, layer.self_attn.k_norm.weight, eps)
+
+        # RoPE
+        q = _apply_rope(q, self._fast_rope_cos, self._fast_rope_sin, positions)
+        k = _apply_rope(k, self._fast_rope_cos, self._fast_rope_sin, positions)
+
+        # Store new K, V into cache
+        start = seq_len - tok_count
+        self._fast_k_cache[layer_idx, 0, start:seq_len] = k[0].transpose(0, 1)
+        self._fast_v_cache[layer_idx, 0, start:seq_len] = v[0].transpose(0, 1)
+
+        # Attention over full cache [0:seq_len] with native GQA support
+        k_full = self._fast_k_cache[layer_idx, :1, :seq_len].transpose(1, 2)
+        v_full = self._fast_v_cache[layer_idx, :1, :seq_len].transpose(1, 2)
+
+        attn_out = F.scaled_dot_product_attention(
+            q, k_full, v_full, is_causal=(tok_count > 1), enable_gqa=True,
+        )
+        attn_out = attn_out.transpose(1, 2).reshape(1, tok_count, q_size)
+
+        # Output projection
+        attn_out = F.linear(attn_out, layer.self_attn.o_proj.weight)
+        hidden = residual + attn_out
+
+        # Post-attention norm + MLP
+        residual = hidden
+        hidden = _rms_norm(hidden, layer.post_attention_layernorm.weight, eps)
+
+        gate_up = F.linear(hidden, layer.mlp.gate_up_proj.weight)
+        gate = gate_up[..., :inter]
+        up = gate_up[..., inter:]
+        hidden = F.silu(gate) * up
+        hidden = F.linear(hidden, layer.mlp.down_proj.weight)
+        hidden = residual + hidden
+
+        return hidden
+
+    @torch.inference_mode()
+    def _fast_model_forward(self, inputs_embeds: torch.Tensor, positions: torch.Tensor, seq_len: int, tok_count: int) -> torch.Tensor:
+        """Run all layers + final norm. inputs_embeds: [1, tok_count, H]."""
+        hidden = inputs_embeds
+        for i in range(self._fast_num_layers):
+            hidden = self._fast_layer_forward(i, hidden, positions, seq_len, tok_count)
+        hidden = _rms_norm(hidden, self.model.norm.weight, self._fast_eps)
+        return hidden
+
+    def _capture_decode_graphs(self, device: torch.device) -> None:
+        """Capture a CUDA graph per decode step (step 1..Q-2). Each graph does:
+        projection → 5 layers → norm → lm_head[step].
+        """
+        if self._graph_warmup_done:
+            return
+        num_groups = int(self.config.num_code_groups)
+        h_pred = self._fast_hidden
+        vocab = self.config.vocab_size
+
+        logger.info("[FastCodePredictor] Capturing %d CUDA graphs...", num_groups - 2)
+
+        # Warmup: run each step eagerly a few times
+        for _ in range(3):
+            self._fast_k_cache.zero_()
+            self._fast_v_cache.zero_()
+            # Prefill warmup
+            dummy_pf = torch.zeros(1, 2, h_pred, dtype=torch.bfloat16, device=device)
+            self._fast_model_forward(dummy_pf, self._prefill_pos, seq_len=2, tok_count=2)
+            # Decode warmup
+            for step in range(1, num_groups - 1):
+                dummy_in = torch.zeros(1, 1, h_pred, dtype=torch.bfloat16, device=device)
+                self._pos_buf[0] = 1 + step
+                self._fast_model_forward(dummy_in, self._pos_buf, seq_len=2 + step, tok_count=1)
+
+        # Now capture a graph per decode step
+        for step in range(1, num_groups - 1):
+            # Reset KV cache and run prefill to populate positions [0:2]
+            self._fast_k_cache.zero_()
+            self._fast_v_cache.zero_()
+            dummy_pf = torch.zeros(1, 2, h_pred, dtype=torch.bfloat16, device=device)
+            self._fast_model_forward(dummy_pf, self._prefill_pos, seq_len=2, tok_count=2)
+            # Fill preceding decode positions in KV cache
+            for prev in range(1, step):
+                dummy_in = torch.zeros(1, 1, h_pred, dtype=torch.bfloat16, device=device)
+                self._pos_buf[0] = 1 + prev
+                self._fast_model_forward(dummy_in, self._pos_buf, seq_len=2 + prev, tok_count=1)
+
+            seq_len_for_step = 2 + step
+            static_in = torch.zeros(1, 1, h_pred, dtype=torch.bfloat16, device=device)
+            self._pos_buf[0] = seq_len_for_step - 1
+
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, pool=self._graph_pool):
+                hidden = self._fast_model_forward(static_in, self._pos_buf, seq_len=seq_len_for_step, tok_count=1)
+                static_out = self.lm_head[step](hidden[:, -1:, :]).squeeze(1)
+
+            self._decode_graphs[step] = (g, static_in, static_out)
+
+        self._graph_warmup_done = True
+        logger.info("[FastCodePredictor] Captured %d CUDA graphs", len(self._decode_graphs))
+
+    @torch.inference_mode()
+    def fast_forward(
+        self,
+        layer0_code: torch.Tensor,
+        layer0_embed: torch.Tensor,
+        last_talker_hidden: torch.Tensor,
+        do_sample: bool = True,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 1.0,
+    ) -> torch.Tensor:
+        """Fast SDPA-based prediction of residual codebooks 1..Q-1 with CUDA graph replay."""
+        device = layer0_code.device
+        self._init_fast_path(device)
+
+        num_groups = int(self.config.num_code_groups)
+        max_steps = num_groups - 1
+
+        if not hasattr(self, '_pos_buf'):
+            self._pos_buf = torch.zeros(1, dtype=torch.long, device=device)
+            self._prefill_pos = torch.arange(2, dtype=torch.long, device=device)
+            self._codes_buf = torch.zeros(1, num_groups, dtype=torch.long, device=device)
+
+        # Try to capture graphs on first real call
+        self._capture_decode_graphs(device)
+        use_graphs = self._graph_warmup_done and len(self._decode_graphs) > 0
+
+        # Zero KV cache
+        self._fast_k_cache.zero_()
+        self._fast_v_cache.zero_()
+
+        # Prefill
+        prefill_input = torch.cat([last_talker_hidden, layer0_embed], dim=1).to(torch.bfloat16)
+        prefill_input = self.small_to_mtp_projection(prefill_input)
+        hidden = self._fast_model_forward(prefill_input, self._prefill_pos, seq_len=2, tok_count=2)
+        logits = self.lm_head[0](hidden[:, -1:, :]).squeeze(1)
+
+        self._codes_buf[0, 0] = layer0_code.reshape(-1)[0]
+        seq_len = 2
+        embeddings = self.model.get_input_embeddings()
+        lm_heads = self.lm_head
+        projection = self.small_to_mtp_projection
+        inv_temp = 1.0 / temperature if do_sample and temperature > 0 else 0.0
+
+        for step in range(1, num_groups):
+            if inv_temp > 0:
+                scaled = logits * inv_temp
+                if top_k > 0:
+                    topk_vals, _ = scaled.topk(top_k, dim=-1)
+                    scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
+                probs = torch.softmax(scaled, dim=-1)
+                next_id = torch.multinomial(probs, num_samples=1)
+            else:
+                next_id = logits.argmax(dim=-1, keepdim=True)
+            self._codes_buf[0, step] = next_id.reshape(-1)[0]
+
+            if step < max_steps:
+                # Embed + project (outside graph since depends on sampled token)
+                tok_embed = embeddings[step - 1](next_id.long())
+                tok_embed = projection(tok_embed.to(torch.bfloat16))  # [1, 1, H_pred]
+
+                if use_graphs and step in self._decode_graphs:
+                    g, static_in, static_out = self._decode_graphs[step]
+                    static_in.copy_(tok_embed)
+                    g.replay()
+                    logits = static_out
+                else:
+                    self._pos_buf[0] = seq_len
+                    hidden = self._fast_model_forward(tok_embed, self._pos_buf, seq_len=seq_len + 1, tok_count=1)
+                    logits = lm_heads[step](hidden[:, -1:, :]).squeeze(1)
+                seq_len += 1
+
+        return self._codes_buf.clone()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Ensure all vLLM custom layers consult the predictor vllm_config
@@ -431,6 +728,9 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         logits = self.lm_head[generation_step](out)
         return logits
 
+    _fwd_call_count = 0
+    _fwd_total_ms = 0.0
+
     @torch.inference_mode()
     def forward(
         self,
@@ -442,48 +742,72 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         top_k: int = 50,
         top_p: float = 1.0,
     ) -> torch.Tensor:
-        """Full autoregressive prediction of residual codebooks 1..Q-1.
+        """Dispatches to fast SDPA path (bsz=1) or legacy vLLM-attention path."""
+        import time as _time
 
-        Args:
-            layer0_code: [B, 1] first-layer codec token ids.
-            layer0_embed: [B, 1, H] embedding of layer0_code.
-            last_talker_hidden: [B, 1, H] hidden state from the talker.
-            do_sample: whether to sample or take argmax.
-            temperature: sampling temperature.
-            top_k: top-k filtering.
-            top_p: top-p (nucleus) filtering.
+        bsz = int(layer0_code.shape[0])
+        if bsz == 1:
+            _t0 = _time.perf_counter()
+            result = self.fast_forward(
+                layer0_code, layer0_embed, last_talker_hidden,
+                do_sample, temperature, top_k, top_p,
+            )
+            _t1 = _time.perf_counter()
+            _ms = (_t1 - _t0) * 1000.0
 
-        Returns:
-            audio_codes: [B, Q] all codebook tokens (layer0 + residuals).
-        """
+            cls = Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
+            cls._fwd_call_count += 1
+            cls._fwd_total_ms += _ms
+            if cls._fwd_call_count % 5 == 1:
+                logger.info(
+                    "[FastCodePredictor] #%d  total=%.1fms  avg=%.1fms",
+                    cls._fwd_call_count, _ms,
+                    cls._fwd_total_ms / cls._fwd_call_count,
+                )
+            return result
+
+        # Fallback to legacy vLLM-attention path for bsz > 1
+        return self._legacy_forward(
+            layer0_code, layer0_embed, last_talker_hidden,
+            do_sample, temperature, top_k, top_p,
+        )
+
+    @torch.inference_mode()
+    def _legacy_forward(
+        self,
+        layer0_code: torch.Tensor,
+        layer0_embed: torch.Tensor,
+        last_talker_hidden: torch.Tensor,
+        do_sample: bool = True,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 1.0,
+    ) -> torch.Tensor:
+        """Legacy vLLM-attention-based prediction path."""
         bsz = int(layer0_code.shape[0])
         num_groups = int(self.config.num_code_groups)
         max_steps = num_groups - 1
 
-        # Reset KV cache for a fresh sequence.
         self.reset_cache()
 
-        # Prefill: feed [last_talker_hidden, layer0_embed] → logits for group 1.
-        prefill_input = torch.cat([last_talker_hidden, layer0_embed], dim=1)  # [B, 2, H]
-        logits = self.prefill_logits(prefill_input)  # [B, vocab]
+        prefill_input = torch.cat([last_talker_hidden, layer0_embed], dim=1)
+        logits = self.prefill_logits(prefill_input)
 
         all_codes = [layer0_code.reshape(bsz, 1)]
         past_seq_len = 2
 
         for step in range(1, num_groups):
-            # Sample or argmax from logits.
             if do_sample and temperature > 0:
                 scaled = logits / temperature
                 if top_k > 0:
                     topk_vals, _ = scaled.topk(top_k, dim=-1)
                     scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
                 probs = torch.softmax(scaled, dim=-1)
-                next_ids = torch.multinomial(probs, num_samples=1)  # [B, 1]
+                next_ids = torch.multinomial(probs, num_samples=1)
             else:
-                next_ids = logits.argmax(dim=-1, keepdim=True)  # [B, 1]
+                next_ids = logits.argmax(dim=-1, keepdim=True)
             all_codes.append(next_ids)
 
-            # If not the last step, decode one more token.
             if step < max_steps:
                 logits = self.decode_logits(
                     next_ids.reshape(bsz),
@@ -492,4 +816,4 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
                 )
                 past_seq_len += 1
 
-        return torch.cat(all_codes, dim=1)  # [B, Q]
+        return torch.cat(all_codes, dim=1)

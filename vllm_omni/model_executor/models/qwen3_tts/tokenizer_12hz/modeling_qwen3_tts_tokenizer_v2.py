@@ -853,7 +853,8 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
 
     def enable_cudagraph(
         self,
-        capture_sizes: list[int] | None = None,
+        exact_sizes: list[int] | None = None,
+        bucket_sizes: list[int] | None = None,
         device: torch.device | None = None,
     ):
         from ..cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
@@ -861,19 +862,22 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         if device is None:
             device = next(self.parameters()).device
         if device.type != "cuda":
-            logger.warning("Cannot enable CUDA Graph: decoder is not on a CUDA device (got %s)", device)
+            logger.warning(
+                "Cannot enable CUDA Graph: decoder is not on a CUDA device (got %s)",
+                device,
+            )
             return
 
-        default_sizes = [25, 50, 100, 150, 200, 250, 300]
         self._cudagraph_wrapper = CUDAGraphDecoderWrapper(
             decoder=self,
-            capture_sizes=capture_sizes or default_sizes,
+            exact_sizes=exact_sizes,
+            bucket_sizes=bucket_sizes,
             num_quantizers=self.config.num_quantizers,
             enabled=True,
         )
         self._cudagraph_wrapper.warmup(device, dtype=torch.long)
         self._cudagraph_enabled = True
-        logger.info("CUDA Graph enabled for decoder with sizes: %s", capture_sizes or default_sizes)
+        logger.info("CUDA Graph enabled for decoder")
 
     def disable_cudagraph(self):
         self._cudagraph_enabled = False

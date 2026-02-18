@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Iterable
 from typing import Any
 
@@ -40,6 +41,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._decode_upsample_rate: int | None = None
         self._output_sample_rate: int | None = None
         self._logged_codec_stats = False
+        self._decode_call_count = 0
 
     @staticmethod
     def _module_device(module: nn.Module) -> torch.device:
@@ -105,7 +107,35 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._num_quantizers = num_q
         self._decode_upsample_rate = upsample
         self._output_sample_rate = out_sr
+
+        self._enable_decoder_cudagraph(tok)
+
         return tok
+
+    def _enable_decoder_cudagraph(self, tok: Qwen3TTSTokenizer) -> None:
+        """Enable CUDA graph acceleration for the speech tokenizer decoder.
+
+        This is independent of vLLM's enforce_eager setting which controls
+        the AR model engine, not the codec decoder.
+        """
+        try:
+            decoder = tok.model.decoder
+            device = self._module_device(decoder)
+            if device.type != "cuda":
+                logger.info(
+                    "Decoder CUDA Graph skipped: device is %s", device,
+                )
+                return
+            if not hasattr(decoder, "enable_cudagraph"):
+                logger.info("Decoder does not support enable_cudagraph")
+                return
+            decoder.enable_cudagraph()
+            logger.info("CUDA Graph enabled for Code2Wav speech tokenizer decoder")
+        except Exception:
+            logger.warning(
+                "Failed to enable CUDA Graph for Code2Wav decoder",
+                exc_info=True,
+            )
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         # This stage ignores token embeddings. Keep a stable dummy embedding for vLLM runner.
@@ -192,7 +222,22 @@ class Qwen3TTSCode2Wav(nn.Module):
             except Exception:
                 pass
 
+        t_decode_start = time.perf_counter()
         wavs, sr = tok.decode({"audio_codes": codes_fq})
+        t_decode_end = time.perf_counter()
+
+        self._decode_call_count += 1
+        decode_ms = (t_decode_end - t_decode_start) * 1000
+        if self._decode_call_count <= 5 or self._decode_call_count % 20 == 0:
+            logger.info(
+                "[Code2Wav] chunk #%d: frames=%d ctx=%d  "
+                "decode=%.2fms",
+                self._decode_call_count,
+                total_frames,
+                ctx_frames,
+                decode_ms,
+            )
+
         if not wavs:
             raise ValueError("SpeechTokenizer code2wav produced empty waveform list.")
         audio_np = wavs[0].astype(np.float32, copy=False)

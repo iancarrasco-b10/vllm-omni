@@ -4,7 +4,7 @@ stage_args:
     stage_type: llm
     runtime:
       devices: "0"
-      max_batch_size: 4
+      max_batch_size: 1
     engine_args:
       model_stage: qwen3_tts
       model_arch: Qwen3TTSTalkerForConditionalGeneration
@@ -39,7 +39,7 @@ stage_args:
     stage_type: llm
     runtime:
       devices: "0"
-      max_batch_size: 4
+      max_batch_size: 1
     engine_args:
       model_stage: code2wav
       model_arch: Qwen3TTSCode2Wav
@@ -78,7 +78,7 @@ runtime:
   enabled: true
   defaults:
     window_size: -1
-    max_inflight: 4
+    max_inflight: 1
 
   connectors:
     connector_of_shared_memory:
@@ -88,7 +88,7 @@ runtime:
         # Frame-aligned codec streaming transport.
         codec_streaming: true
         # Connector polling / timeout (unit: loop count, sleep interval in seconds).
-        connector_get_sleep_s: 0.01
+        connector_get_sleep_s: 0.001
         connector_get_max_wait_first_chunk: 3000
         connector_get_max_wait: 300
         # Align with Omni: small chunks with sufficient context overlap.
