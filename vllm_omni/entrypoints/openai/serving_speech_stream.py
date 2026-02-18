@@ -170,10 +170,15 @@ class OmniStreamingSpeechHandler:
         sentence_text: str,
         sentence_index: int,
     ) -> None:
-        """Generate audio for a single sentence and send it over WebSocket."""
+        """Generate audio for a single sentence and stream it over WebSocket.
+
+        Audio is sent as a series of raw PCM binary frames as each codec chunk
+        is produced by the model, rather than waiting for the full sentence to
+        be generated.  The client assembles the frames into a final audio file
+        using the sample_rate and chunk_count fields on the audio.done message.
+        """
         response_format = config.response_format or "wav"
 
-        # Send audio.start
         await websocket.send_json(
             {
                 "type": "audio.start",
@@ -183,8 +188,10 @@ class OmniStreamingSpeechHandler:
             }
         )
 
+        sample_rate: int | None = None
+        chunk_count = 0
+
         try:
-            # Build a per-sentence request reusing session config
             request = OpenAICreateSpeechRequest(
                 input=sentence_text,
                 model=config.model,
@@ -200,10 +207,11 @@ class OmniStreamingSpeechHandler:
                 x_vector_only_mode=config.x_vector_only_mode,
             )
 
-            audio_bytes, _ = await self._speech_service._generate_audio_bytes(request)
-
-            # Send binary audio frame
-            await websocket.send_bytes(audio_bytes)
+            async for pcm_bytes, sr in self._speech_service._generate_audio_stream(request):
+                if sample_rate is None:
+                    sample_rate = sr
+                await websocket.send_bytes(pcm_bytes)
+                chunk_count += 1
 
         except Exception as e:
             logger.error("Generation failed for sentence %d: %s", sentence_index, e)
@@ -212,11 +220,14 @@ class OmniStreamingSpeechHandler:
                 f"Generation failed for sentence {sentence_index}: {e}",
             )
 
-        # Send audio.done (even on error, so client can track progress)
+        # audio.done carries sample_rate and chunk_count so the client can
+        # assemble the raw PCM frames into a properly-headed audio file.
         await websocket.send_json(
             {
                 "type": "audio.done",
                 "sentence_index": sentence_index,
+                "sample_rate": sample_rate or 24000,
+                "chunk_count": chunk_count,
             }
         )
 

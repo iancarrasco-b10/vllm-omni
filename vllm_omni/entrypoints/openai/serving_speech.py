@@ -418,6 +418,42 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         audio_response: AudioResponse = self.create_audio(audio_obj)
         return audio_response.audio_data, audio_response.media_type
 
+    async def _generate_audio_stream(
+        self,
+        request: OpenAICreateSpeechRequest,
+    ):
+        """Stream raw PCM audio chunks as they are produced by the model.
+
+        Yields (pcm_bytes, sample_rate) for each Code2Wav output chunk.
+        This is used by the streaming WebSocket handler so the first audio
+        frame can be sent after just the first codec chunk rather than waiting
+        for the entire sentence to be generated.
+
+        Raises:
+            ValueError: If validation fails.
+        """
+        if self.engine_client.errored:
+            raise self.engine_client.dead_error
+
+        generator = await self._prepare_tts_generator(request)
+        speed = request.speed or 1.0
+
+        async for res in generator:
+            audio_chunk = self._extract_audio_from_output(res)
+            if audio_chunk is None:
+                continue
+            audio_tensor, sample_rate = audio_chunk
+            audio_obj = CreateAudio(
+                audio_tensor=audio_tensor,
+                sample_rate=int(sample_rate),
+                response_format="pcm",
+                speed=speed,
+                stream_format="audio",
+                base64_encode=False,
+            )
+            audio_response: AudioResponse = self.create_audio(audio_obj)
+            yield audio_response.audio_data, int(sample_rate)
+
     async def create_speech(
         self,
         request: OpenAICreateSpeechRequest,

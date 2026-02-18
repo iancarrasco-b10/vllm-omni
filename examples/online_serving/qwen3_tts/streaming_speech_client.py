@@ -33,12 +33,23 @@ import argparse
 import asyncio
 import json
 import os
+import time
+import wave
 
 try:
     import websockets
 except ImportError:
     print("Please install websockets: pip install websockets")
     raise SystemExit(1)
+
+
+def _write_wav(path: str, pcm_data: bytes, sample_rate: int, channels: int) -> None:
+    """Write raw PCM-16LE bytes to a WAV file."""
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(2)  # 16-bit = 2 bytes per sample
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_data)
 
 
 async def stream_tts(
@@ -55,6 +66,7 @@ async def stream_tts(
     async with websockets.connect(url) as ws:
         # 1. Send session config
         config_msg = {"type": "session.config", **config}
+        t_request = time.perf_counter()
         await ws.send(json.dumps(config_msg))
         print(f"Sent session config: {config}")
 
@@ -94,32 +106,56 @@ async def stream_tts(
 
         response_format = config.get("response_format", "wav")
         sentence_count = 0
+        ttfa: float | None = None
+
+        # Accumulate raw PCM chunks per sentence index until audio.done.
+        # Each binary frame from the server is a raw PCM-16LE chunk.
+        current_sentence_idx: int | None = None
+        pcm_buffer: list[bytes] = []
 
         try:
             while True:
                 message = await ws.recv()
 
                 if isinstance(message, bytes):
-                    # Binary frame: audio data
-                    filename = os.path.join(
-                        output_dir,
-                        f"sentence_{sentence_count:03d}.{response_format}",
-                    )
-                    with open(filename, "wb") as f:
-                        f.write(message)
-                    print(f"  Saved audio: {filename} ({len(message)} bytes)")
-                    sentence_count += 1
+                    # Binary frame: raw PCM-16LE audio chunk for the current sentence.
+                    if ttfa is None:
+                        ttfa = time.perf_counter() - t_request
+                        print(f"  [TTFA] Time to first audio: {ttfa * 1000:.1f} ms")
+                    pcm_buffer.append(message)
                 else:
-                    # JSON frame
+                    # JSON control frame
                     msg = json.loads(message)
                     msg_type = msg.get("type")
 
                     if msg_type == "audio.start":
-                        print(f"  [sentence {msg['sentence_index']}] Generating: {msg['sentence_text']!r}")
+                        current_sentence_idx = msg["sentence_index"]
+                        pcm_buffer = []
+                        print(f"  [sentence {current_sentence_idx}] Generating: {msg['sentence_text']!r}")
+
                     elif msg_type == "audio.done":
-                        print(f"  [sentence {msg['sentence_index']}] Done")
+                        idx = msg["sentence_index"]
+                        sr = msg.get("sample_rate", 24000)
+                        n_chunks = msg.get("chunk_count", len(pcm_buffer))
+                        pcm_data = b"".join(pcm_buffer)
+                        filename = os.path.join(
+                            output_dir,
+                            f"sentence_{idx:03d}.wav",
+                        )
+                        _write_wav(filename, pcm_data, sample_rate=sr, channels=1)
+                        print(
+                            f"  [sentence {idx}] Done — saved {filename}"
+                            f" ({len(pcm_data)} PCM bytes, {n_chunks} chunk(s))"
+                        )
+                        pcm_buffer = []
+                        sentence_count += 1
+
                     elif msg_type == "session.done":
+                        t_total = time.perf_counter() - t_request
                         print(f"\nSession complete: {msg['total_sentences']} sentence(s) generated")
+                        if ttfa is not None:
+                            print(f"  TTFA:       {ttfa * 1000:.1f} ms")
+                        print(f"  Total time: {t_total * 1000:.1f} ms")
                         break
                     elif msg_type == "error":
                         print(f"  ERROR: {msg['message']}")
@@ -139,7 +175,7 @@ def main():
     parser = argparse.ArgumentParser(description="Streaming text-input TTS client")
     parser.add_argument(
         "--url",
-        default="ws://localhost:8000/v1/audio/speech/stream",
+        default="ws://localhost:8091/v1/audio/speech/stream",
         help="WebSocket endpoint URL",
     )
     parser.add_argument(

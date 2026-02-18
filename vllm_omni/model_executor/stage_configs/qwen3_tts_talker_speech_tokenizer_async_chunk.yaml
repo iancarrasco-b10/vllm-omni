@@ -47,7 +47,7 @@ stage_args:
       load_format: dummy
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
-      enforce_eager: true
+      enforce_eager: false
       trust_remote_code: true
       async_scheduling: false
       enable_prefix_caching: false
@@ -83,7 +83,7 @@ runtime:
         shm_threshold_bytes: 65536
         # Qwen3-TTS codec streaming (frame-aligned tokenized transport).
         codec_streaming: true
-        codec_chunk_frames: 25
+        codec_chunk_frames: 10
         codec_left_context_frames: 25
 
   edges:
