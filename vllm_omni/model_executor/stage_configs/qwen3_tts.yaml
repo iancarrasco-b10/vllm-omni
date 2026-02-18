@@ -4,7 +4,7 @@ stage_args:
     stage_type: llm
     runtime:
       devices: "0"
-      max_batch_size: 1
+      max_batch_size: 4
     engine_args:
       model_stage: qwen3_tts
       model_arch: Qwen3TTSTalkerForConditionalGeneration
@@ -39,7 +39,7 @@ stage_args:
     stage_type: llm
     runtime:
       devices: "0"
-      max_batch_size: 1
+      max_batch_size: 4
     engine_args:
       model_stage: code2wav
       model_arch: Qwen3TTSCode2Wav
@@ -48,7 +48,7 @@ stage_args:
         architectures: [Qwen3TTSCode2Wav]
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
-      enforce_eager: false
+      enforce_eager: true
       trust_remote_code: true
       async_scheduling: false
       enable_prefix_caching: false
@@ -78,7 +78,7 @@ runtime:
   enabled: true
   defaults:
     window_size: -1
-    max_inflight: 1
+    max_inflight: 4
 
   connectors:
     connector_of_shared_memory:
