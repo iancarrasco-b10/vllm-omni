@@ -146,49 +146,31 @@ class Qwen3TTSCode2Wav(nn.Module):
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: Any = None) -> None:
         return None
 
-    @torch.no_grad()
-    def forward(
+    def _decode_single_request(
         self,
-        input_ids: torch.Tensor | None = None,
-        positions: torch.Tensor | None = None,
-        intermediate_tensors: Any = None,
-        inputs_embeds: torch.Tensor | None = None,
-        **kwargs: Any,
+        ids: torch.Tensor,
+        tok: Qwen3TTSTokenizer,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Decode codec codes into audio waveform.
+        """Decode a single request's input_ids into audio.
 
-        input_ids layout: [codec_context_frames, *flat_codes]
-        where flat_codes is codebook-major [q*F].
+        ids layout: [codec_context_frames, *flat_codes]
         """
-        tok = self._ensure_speech_tokenizer_loaded()
-        assert self._num_quantizers is not None
-        assert self._output_sample_rate is not None
-
-        sr_val = self._output_sample_rate
-        empty_ret = (
-            torch.zeros((0,), dtype=torch.float32),
-            torch.tensor(sr_val, dtype=torch.int32),
-        )
-
-        if input_ids is None:
-            return empty_ret
-
         q = int(self._num_quantizers)
-        ids = input_ids.reshape(-1).to(dtype=torch.long)
+        sr_val = self._output_sample_rate
+        empty_audio = torch.zeros((0,), dtype=torch.float32)
+        empty_sr = torch.tensor(sr_val, dtype=torch.int32)
+
         n_tokens = ids.numel()
-
         if n_tokens == 0:
-            return empty_ret
+            return empty_audio, empty_sr
 
-        # input_ids[0] = codec_context_frames (prepended by stage_input_processor).
         ctx_frames = int(ids[0].item())
         ids = ids[1:]
         n_tokens = ids.numel()
 
         if n_tokens == 0:
-            return empty_ret
+            return empty_audio, empty_sr
 
-        # Warmup / dummy_run: not divisible by num_quantizers.
         if n_tokens % q != 0:
             logger.warning(
                 "Code2Wav input_ids length %d not divisible by num_quantizers %d, "
@@ -196,11 +178,9 @@ class Qwen3TTSCode2Wav(nn.Module):
                 n_tokens,
                 q,
             )
-            return empty_ret
+            return empty_audio, empty_sr
 
         total_frames = n_tokens // q
-
-        # Reshape codebook-major flat [q*F] -> [q, F] -> [F, q] for SpeechTokenizer.
         codes_fq = ids.reshape(q, total_frames).transpose(0, 1).contiguous()
 
         if not self._logged_codec_stats and total_frames > 1:
@@ -242,7 +222,6 @@ class Qwen3TTSCode2Wav(nn.Module):
             raise ValueError("SpeechTokenizer code2wav produced empty waveform list.")
         audio_np = wavs[0].astype(np.float32, copy=False)
 
-        # Trim left-context waveform samples (streaming sliding window).
         if ctx_frames > 0:
             upsample = self._decode_upsample_rate
             if upsample is None or upsample <= 0:
@@ -256,11 +235,87 @@ class Qwen3TTSCode2Wav(nn.Module):
                     cut,
                     audio_np.shape[0],
                 )
-                return empty_ret
+                return empty_audio, empty_sr
 
         audio_tensor = torch.from_numpy(audio_np).to(dtype=torch.float32).reshape(-1)
         sr_tensor = torch.tensor(int(sr), dtype=torch.int32)
         return audio_tensor, sr_tensor
+
+    @staticmethod
+    def _get_per_request_token_counts() -> list[int] | None:
+        """Extract per-request token counts from the forward context.
+
+        The generation model runner stores these in ubatch_slices as list[int]
+        when microbatching is disabled.
+        """
+        try:
+            from vllm.forward_context import get_forward_context
+            ctx = get_forward_context()
+            slices = ctx.ubatch_slices
+            if isinstance(slices, list) and slices and isinstance(slices[0], int):
+                return slices
+        except Exception:
+            pass
+        return None
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        intermediate_tensors: Any = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor] | OmniOutput:
+        """Decode codec codes into audio waveform.
+
+        input_ids layout (single request): [codec_context_frames, *flat_codes]
+        where flat_codes is codebook-major [q*F].
+
+        When batched, input_ids is a concatenation of multiple requests.
+        Per-request boundaries are obtained from the forward context.
+        """
+        tok = self._ensure_speech_tokenizer_loaded()
+        assert self._num_quantizers is not None
+        assert self._output_sample_rate is not None
+
+        sr_val = self._output_sample_rate
+        empty_ret = (
+            torch.zeros((0,), dtype=torch.float32),
+            torch.tensor(sr_val, dtype=torch.int32),
+        )
+
+        if input_ids is None:
+            return empty_ret
+
+        ids = input_ids.reshape(-1).to(dtype=torch.long)
+        if ids.numel() == 0:
+            return empty_ret
+
+        per_req_counts = self._get_per_request_token_counts()
+
+        if per_req_counts is not None and len(per_req_counts) > 1:
+            audio_list: list[torch.Tensor] = []
+            sr_list: list[torch.Tensor] = []
+            finished_list: list[torch.Tensor] = []
+            offset = 0
+            for count in per_req_counts:
+                req_ids = ids[offset:offset + count]
+                offset += count
+                audio, sr = self._decode_single_request(req_ids, tok)
+                audio_list.append(audio)
+                sr_list.append(sr)
+                finished_list.append(torch.tensor(False))
+            return OmniOutput(
+                text_hidden_states=None,
+                multimodal_outputs={
+                    "model_outputs": audio_list,
+                    "sr": sr_list,
+                    "finished": finished_list,
+                },
+            )
+
+        return self._decode_single_request(ids, tok)
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):

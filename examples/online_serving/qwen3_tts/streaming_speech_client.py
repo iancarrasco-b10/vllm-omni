@@ -1,7 +1,7 @@
 """WebSocket client for streaming text-input TTS.
 
 Connects to the /v1/audio/speech/stream endpoint, sends text incrementally
-(simulating real-time STT output), and saves per-sentence audio files.
+(simulating real-time STT output), and saves a single audio file per stream.
 
 Usage:
     # Send full text at once
@@ -56,12 +56,12 @@ async def stream_tts(
     url: str,
     text: str,
     config: dict,
-    output_dir: str,
+    output_file: str,
     simulate_stt: bool = False,
     stt_delay: float = 0.1,
 ) -> None:
     """Connect to the streaming TTS endpoint and process audio responses."""
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
 
     async with websockets.connect(url) as ws:
         # 1. Send session config
@@ -104,55 +104,41 @@ async def stream_tts(
         # Run sender and receiver concurrently
         sender_task = asyncio.create_task(send_text())
 
-        response_format = config.get("response_format", "wav")
         sentence_count = 0
         ttfa: float | None = None
+        sample_rate: int = 24000
 
-        # Accumulate raw PCM chunks per sentence index until audio.done.
-        # Each binary frame from the server is a raw PCM-16LE chunk.
-        current_sentence_idx: int | None = None
-        pcm_buffer: list[bytes] = []
+        # Accumulate all PCM chunks across all sentences into a single buffer.
+        all_pcm: list[bytes] = []
 
         try:
             while True:
                 message = await ws.recv()
 
                 if isinstance(message, bytes):
-                    # Binary frame: raw PCM-16LE audio chunk for the current sentence.
                     if ttfa is None:
                         ttfa = time.perf_counter() - t_request
                         print(f"  [TTFA] Time to first audio: {ttfa * 1000:.1f} ms")
-                    pcm_buffer.append(message)
+                    all_pcm.append(message)
                 else:
-                    # JSON control frame
                     msg = json.loads(message)
                     msg_type = msg.get("type")
 
                     if msg_type == "audio.start":
-                        current_sentence_idx = msg["sentence_index"]
-                        pcm_buffer = []
-                        print(f"  [sentence {current_sentence_idx}] Generating: {msg['sentence_text']!r}")
+                        print(f"  [sentence {msg['sentence_index']}] Generating: {msg['sentence_text']!r}")
 
                     elif msg_type == "audio.done":
                         idx = msg["sentence_index"]
-                        sr = msg.get("sample_rate", 24000)
-                        n_chunks = msg.get("chunk_count", len(pcm_buffer))
-                        pcm_data = b"".join(pcm_buffer)
-                        filename = os.path.join(
-                            output_dir,
-                            f"sentence_{idx:03d}.wav",
-                        )
-                        _write_wav(filename, pcm_data, sample_rate=sr, channels=1)
-                        print(
-                            f"  [sentence {idx}] Done — saved {filename}"
-                            f" ({len(pcm_data)} PCM bytes, {n_chunks} chunk(s))"
-                        )
-                        pcm_buffer = []
+                        sample_rate = msg.get("sample_rate", 24000)
+                        print(f"  [sentence {idx}] Done")
                         sentence_count += 1
 
                     elif msg_type == "session.done":
                         t_total = time.perf_counter() - t_request
+                        pcm_data = b"".join(all_pcm)
+                        _write_wav(output_file, pcm_data, sample_rate=sample_rate, channels=1)
                         print(f"\nSession complete: {msg['total_sentences']} sentence(s) generated")
+                        print(f"  Saved {output_file} ({len(pcm_data)} PCM bytes)")
                         if ttfa is not None:
                             print(f"  TTFA:       {ttfa * 1000:.1f} ms")
                         print(f"  Total time: {t_total * 1000:.1f} ms")
@@ -168,8 +154,6 @@ async def stream_tts(
             except asyncio.CancelledError:
                 pass
 
-    print(f"\nAudio files saved to: {output_dir}/")
-
 
 def main():
     parser = argparse.ArgumentParser(description="Streaming text-input TTS client")
@@ -184,9 +168,9 @@ def main():
         help="Text to synthesize",
     )
     parser.add_argument(
-        "--output-dir",
-        default="streaming_tts_output",
-        help="Directory to save audio files (default: streaming_tts_output)",
+        "--output",
+        default="streaming_tts_output.wav",
+        help="Output WAV file path (default: streaming_tts_output.wav)",
     )
 
     # Session config options
@@ -259,7 +243,7 @@ def main():
             url=args.url,
             text=args.text,
             config=config,
-            output_dir=args.output_dir,
+            output_file=args.output,
             simulate_stt=args.simulate_stt,
             stt_delay=args.stt_delay,
         )

@@ -374,6 +374,9 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         rope_theta = getattr(cfg, "rope_theta", 10000.0)
         eps = cfg.rms_norm_eps
 
+        max_fast_batch = int(getattr(self._vllm_config.scheduler_config, "max_num_seqs", 1) or 1)
+        max_fast_batch = max(1, min(max_fast_batch, 16))
+
         self._fast_num_layers = num_layers
         self._fast_num_q_heads = num_q_heads
         self._fast_num_kv_heads = num_kv_heads
@@ -385,18 +388,19 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         self._fast_max_seq = max_seq
         self._fast_hidden = cfg.hidden_size
         self._fast_intermediate = cfg.intermediate_size
+        self._fast_max_batch = max_fast_batch
 
         self._fast_rope_cos, self._fast_rope_sin = _build_rope_cache(
             head_dim, max_seq, rope_theta, device, torch.bfloat16
         )
 
-        # KV cache: [num_layers, 2(k,v), max_batch=1, max_seq, kv_heads, head_dim]
+        # KV cache: [num_layers, max_batch, max_seq, kv_heads, head_dim]
         self._fast_k_cache = torch.zeros(
-            num_layers, 1, max_seq, num_kv_heads, head_dim,
+            num_layers, max_fast_batch, max_seq, num_kv_heads, head_dim,
             dtype=torch.bfloat16, device=device,
         )
         self._fast_v_cache = torch.zeros(
-            num_layers, 1, max_seq, num_kv_heads, head_dim,
+            num_layers, max_fast_batch, max_seq, num_kv_heads, head_dim,
             dtype=torch.bfloat16, device=device,
         )
 
@@ -405,24 +409,24 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
             torch.ones(max_seq, max_seq, dtype=torch.bool, device=device)
         )
 
-        # CUDA graph infrastructure for decode steps
+        # CUDA graph infrastructure keyed by (decode_step, batch_size)
         self._graph_pool = torch.cuda.graph_pool_handle()
-        self._decode_graphs: dict[int, tuple[torch.cuda.CUDAGraph, torch.Tensor, torch.Tensor]] = {}
+        self._decode_graphs: dict[tuple[int, int], tuple[torch.cuda.CUDAGraph, torch.Tensor, torch.Tensor]] = {}
         self._graph_warmup_done = False
 
         self._fast_ready = True
         logger.info(
             "[FastCodePredictor] Initialized: layers=%d q_heads=%d kv_heads=%d "
-            "head_dim=%d hidden=%d max_seq=%d",
-            num_layers, num_q_heads, num_kv_heads, head_dim, cfg.hidden_size, max_seq,
+            "head_dim=%d hidden=%d max_seq=%d max_batch=%d",
+            num_layers, num_q_heads, num_kv_heads, head_dim, cfg.hidden_size, max_seq, max_fast_batch,
         )
 
     @torch.inference_mode()
     def _fast_layer_forward(
         self, layer_idx: int, hidden: torch.Tensor, positions: torch.Tensor,
-        seq_len: int, tok_count: int,
+        seq_len: int, tok_count: int, bsz: int,
     ) -> torch.Tensor:
-        """Run one transformer layer using SDPA. hidden: [1, tok_count, H]."""
+        """Run one transformer layer using SDPA. hidden: [bsz, tok_count, H]."""
         layer = self.model.layers[layer_idx]
         eps = self._fast_eps
         num_q = self._fast_num_q_heads
@@ -432,43 +436,35 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         kv_size = self._fast_kv_size
         inter = self._fast_intermediate
 
-        # Pre-attention norm
         residual = hidden
         hidden = _rms_norm(hidden, layer.input_layernorm.weight, eps)
 
-        # QKV projection (fused [q_size + 2*kv_size, hidden])
         qkv = F.linear(hidden, layer.self_attn.qkv_proj.weight)
-        q = qkv[..., :q_size].reshape(1, tok_count, num_q, hd).transpose(1, 2)
-        k = qkv[..., q_size:q_size+kv_size].reshape(1, tok_count, num_kv, hd).transpose(1, 2)
-        v = qkv[..., q_size+kv_size:].reshape(1, tok_count, num_kv, hd).transpose(1, 2)
+        q = qkv[..., :q_size].reshape(bsz, tok_count, num_q, hd).transpose(1, 2)
+        k = qkv[..., q_size:q_size+kv_size].reshape(bsz, tok_count, num_kv, hd).transpose(1, 2)
+        v = qkv[..., q_size+kv_size:].reshape(bsz, tok_count, num_kv, hd).transpose(1, 2)
 
-        # QK norms (per-head RMS norm)
         q = _rms_norm(q, layer.self_attn.q_norm.weight, eps)
         k = _rms_norm(k, layer.self_attn.k_norm.weight, eps)
 
-        # RoPE
         q = _apply_rope(q, self._fast_rope_cos, self._fast_rope_sin, positions)
         k = _apply_rope(k, self._fast_rope_cos, self._fast_rope_sin, positions)
 
-        # Store new K, V into cache
         start = seq_len - tok_count
-        self._fast_k_cache[layer_idx, 0, start:seq_len] = k[0].transpose(0, 1)
-        self._fast_v_cache[layer_idx, 0, start:seq_len] = v[0].transpose(0, 1)
+        self._fast_k_cache[layer_idx, :bsz, start:seq_len] = k.transpose(1, 2)
+        self._fast_v_cache[layer_idx, :bsz, start:seq_len] = v.transpose(1, 2)
 
-        # Attention over full cache [0:seq_len] with native GQA support
-        k_full = self._fast_k_cache[layer_idx, :1, :seq_len].transpose(1, 2)
-        v_full = self._fast_v_cache[layer_idx, :1, :seq_len].transpose(1, 2)
+        k_full = self._fast_k_cache[layer_idx, :bsz, :seq_len].transpose(1, 2)
+        v_full = self._fast_v_cache[layer_idx, :bsz, :seq_len].transpose(1, 2)
 
         attn_out = F.scaled_dot_product_attention(
             q, k_full, v_full, is_causal=(tok_count > 1), enable_gqa=True,
         )
-        attn_out = attn_out.transpose(1, 2).reshape(1, tok_count, q_size)
+        attn_out = attn_out.transpose(1, 2).reshape(bsz, tok_count, q_size)
 
-        # Output projection
         attn_out = F.linear(attn_out, layer.self_attn.o_proj.weight)
         hidden = residual + attn_out
 
-        # Post-attention norm + MLP
         residual = hidden
         hidden = _rms_norm(hidden, layer.post_attention_layernorm.weight, eps)
 
@@ -482,62 +478,67 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         return hidden
 
     @torch.inference_mode()
-    def _fast_model_forward(self, inputs_embeds: torch.Tensor, positions: torch.Tensor, seq_len: int, tok_count: int) -> torch.Tensor:
-        """Run all layers + final norm. inputs_embeds: [1, tok_count, H]."""
+    def _fast_model_forward(self, inputs_embeds: torch.Tensor, positions: torch.Tensor, seq_len: int, tok_count: int, bsz: int) -> torch.Tensor:
+        """Run all layers + final norm. inputs_embeds: [bsz, tok_count, H]."""
         hidden = inputs_embeds
         for i in range(self._fast_num_layers):
-            hidden = self._fast_layer_forward(i, hidden, positions, seq_len, tok_count)
+            hidden = self._fast_layer_forward(i, hidden, positions, seq_len, tok_count, bsz)
         hidden = _rms_norm(hidden, self.model.norm.weight, self._fast_eps)
         return hidden
 
     def _capture_decode_graphs(self, device: torch.device) -> None:
-        """Capture a CUDA graph per decode step (step 1..Q-2). Each graph does:
-        projection → 5 layers → norm → lm_head[step].
+        """Capture CUDA graphs for all (decode_step, batch_size) combinations.
+
+        Keys are (step, bsz) tuples. Each graph captures the model forward
+        + lm_head projection for one decode step at a specific batch size.
         """
         if self._graph_warmup_done:
             return
         num_groups = int(self.config.num_code_groups)
         h_pred = self._fast_hidden
-        vocab = self.config.vocab_size
+        max_fast_batch = self._fast_max_batch
+        num_decode_steps = num_groups - 2
+        total_graphs = num_decode_steps * max_fast_batch
 
-        logger.info("[FastCodePredictor] Capturing %d CUDA graphs...", num_groups - 2)
+        logger.info(
+            "[FastCodePredictor] Capturing %d CUDA graphs (%d steps × %d batch sizes)...",
+            total_graphs, num_decode_steps, max_fast_batch,
+        )
 
-        # Warmup: run each step eagerly a few times
-        for _ in range(3):
-            self._fast_k_cache.zero_()
-            self._fast_v_cache.zero_()
-            # Prefill warmup
-            dummy_pf = torch.zeros(1, 2, h_pred, dtype=torch.bfloat16, device=device)
-            self._fast_model_forward(dummy_pf, self._prefill_pos, seq_len=2, tok_count=2)
-            # Decode warmup
+        # Warmup: run each batch size through all steps eagerly
+        for bsz in range(1, max_fast_batch + 1):
+            for _ in range(3):
+                self._fast_k_cache[:, :bsz].zero_()
+                self._fast_v_cache[:, :bsz].zero_()
+                dummy_pf = torch.zeros(bsz, 2, h_pred, dtype=torch.bfloat16, device=device)
+                self._fast_model_forward(dummy_pf, self._prefill_pos, seq_len=2, tok_count=2, bsz=bsz)
+                for step in range(1, num_groups - 1):
+                    dummy_in = torch.zeros(bsz, 1, h_pred, dtype=torch.bfloat16, device=device)
+                    self._pos_buf[0] = 1 + step
+                    self._fast_model_forward(dummy_in, self._pos_buf, seq_len=2 + step, tok_count=1, bsz=bsz)
+
+        # Capture one graph per (step, bsz) pair
+        for bsz in range(1, max_fast_batch + 1):
             for step in range(1, num_groups - 1):
-                dummy_in = torch.zeros(1, 1, h_pred, dtype=torch.bfloat16, device=device)
-                self._pos_buf[0] = 1 + step
-                self._fast_model_forward(dummy_in, self._pos_buf, seq_len=2 + step, tok_count=1)
+                self._fast_k_cache[:, :bsz].zero_()
+                self._fast_v_cache[:, :bsz].zero_()
+                dummy_pf = torch.zeros(bsz, 2, h_pred, dtype=torch.bfloat16, device=device)
+                self._fast_model_forward(dummy_pf, self._prefill_pos, seq_len=2, tok_count=2, bsz=bsz)
+                for prev in range(1, step):
+                    dummy_in = torch.zeros(bsz, 1, h_pred, dtype=torch.bfloat16, device=device)
+                    self._pos_buf[0] = 1 + prev
+                    self._fast_model_forward(dummy_in, self._pos_buf, seq_len=2 + prev, tok_count=1, bsz=bsz)
 
-        # Now capture a graph per decode step
-        for step in range(1, num_groups - 1):
-            # Reset KV cache and run prefill to populate positions [0:2]
-            self._fast_k_cache.zero_()
-            self._fast_v_cache.zero_()
-            dummy_pf = torch.zeros(1, 2, h_pred, dtype=torch.bfloat16, device=device)
-            self._fast_model_forward(dummy_pf, self._prefill_pos, seq_len=2, tok_count=2)
-            # Fill preceding decode positions in KV cache
-            for prev in range(1, step):
-                dummy_in = torch.zeros(1, 1, h_pred, dtype=torch.bfloat16, device=device)
-                self._pos_buf[0] = 1 + prev
-                self._fast_model_forward(dummy_in, self._pos_buf, seq_len=2 + prev, tok_count=1)
+                seq_len_for_step = 2 + step
+                static_in = torch.zeros(bsz, 1, h_pred, dtype=torch.bfloat16, device=device)
+                self._pos_buf[0] = seq_len_for_step - 1
 
-            seq_len_for_step = 2 + step
-            static_in = torch.zeros(1, 1, h_pred, dtype=torch.bfloat16, device=device)
-            self._pos_buf[0] = seq_len_for_step - 1
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, pool=self._graph_pool):
+                    hidden = self._fast_model_forward(static_in, self._pos_buf, seq_len=seq_len_for_step, tok_count=1, bsz=bsz)
+                    static_out = self.lm_head[step](hidden[:, -1:, :]).squeeze(1)
 
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g, pool=self._graph_pool):
-                hidden = self._fast_model_forward(static_in, self._pos_buf, seq_len=seq_len_for_step, tok_count=1)
-                static_out = self.lm_head[step](hidden[:, -1:, :]).squeeze(1)
-
-            self._decode_graphs[step] = (g, static_in, static_out)
+                self._decode_graphs[(step, bsz)] = (g, static_in, static_out)
 
         self._graph_warmup_done = True
         logger.info("[FastCodePredictor] Captured %d CUDA graphs", len(self._decode_graphs))
@@ -553,8 +554,14 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         top_k: int = 50,
         top_p: float = 1.0,
     ) -> torch.Tensor:
-        """Fast SDPA-based prediction of residual codebooks 1..Q-1 with CUDA graph replay."""
+        """Fast SDPA-based prediction of residual codebooks 1..Q-1 with CUDA graph replay.
+
+        Supports any batch size up to _fast_max_batch. CUDA graphs are keyed
+        by (decode_step, batch_size) so the correct graph is replayed for the
+        current batch.
+        """
         device = layer0_code.device
+        bsz = int(layer0_code.shape[0])
         self._init_fast_path(device)
 
         num_groups = int(self.config.num_code_groups)
@@ -563,23 +570,21 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         if not hasattr(self, '_pos_buf'):
             self._pos_buf = torch.zeros(1, dtype=torch.long, device=device)
             self._prefill_pos = torch.arange(2, dtype=torch.long, device=device)
-            self._codes_buf = torch.zeros(1, num_groups, dtype=torch.long, device=device)
 
-        # Try to capture graphs on first real call
         self._capture_decode_graphs(device)
-        use_graphs = self._graph_warmup_done and len(self._decode_graphs) > 0
+        use_graphs = self._graph_warmup_done and bsz <= self._fast_max_batch
 
-        # Zero KV cache
-        self._fast_k_cache.zero_()
-        self._fast_v_cache.zero_()
+        self._fast_k_cache[:, :bsz].zero_()
+        self._fast_v_cache[:, :bsz].zero_()
 
-        # Prefill
+        # Prefill: [bsz, 2, H]
         prefill_input = torch.cat([last_talker_hidden, layer0_embed], dim=1).to(torch.bfloat16)
         prefill_input = self.small_to_mtp_projection(prefill_input)
-        hidden = self._fast_model_forward(prefill_input, self._prefill_pos, seq_len=2, tok_count=2)
-        logits = self.lm_head[0](hidden[:, -1:, :]).squeeze(1)
+        hidden = self._fast_model_forward(prefill_input, self._prefill_pos, seq_len=2, tok_count=2, bsz=bsz)
+        logits = self.lm_head[0](hidden[:, -1:, :]).squeeze(1)  # [bsz, vocab]
 
-        self._codes_buf[0, 0] = layer0_code.reshape(-1)[0]
+        codes_buf = torch.zeros(bsz, num_groups, dtype=torch.long, device=device)
+        codes_buf[:, 0] = layer0_code.reshape(bsz)
         seq_len = 2
         embeddings = self.model.get_input_embeddings()
         lm_heads = self.lm_head
@@ -593,28 +598,29 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
                     topk_vals, _ = scaled.topk(top_k, dim=-1)
                     scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
                 probs = torch.softmax(scaled, dim=-1)
-                next_id = torch.multinomial(probs, num_samples=1)
+                next_ids = torch.multinomial(probs, num_samples=1)
             else:
-                next_id = logits.argmax(dim=-1, keepdim=True)
-            self._codes_buf[0, step] = next_id.reshape(-1)[0]
+                next_ids = logits.argmax(dim=-1, keepdim=True)
+            codes_buf[:, step] = next_ids.reshape(bsz)
 
             if step < max_steps:
-                # Embed + project (outside graph since depends on sampled token)
-                tok_embed = embeddings[step - 1](next_id.long())
-                tok_embed = projection(tok_embed.to(torch.bfloat16))  # [1, 1, H_pred]
+                tok_embed = embeddings[step - 1](next_ids.long())
+                tok_embed = projection(tok_embed.to(torch.bfloat16))  # [bsz, 1, H_pred]
 
-                if use_graphs and step in self._decode_graphs:
-                    g, static_in, static_out = self._decode_graphs[step]
+                graph_key = (step, bsz)
+                if use_graphs and graph_key in self._decode_graphs:
+                    g, static_in, static_out = self._decode_graphs[graph_key]
                     static_in.copy_(tok_embed)
+                    self._pos_buf[0] = seq_len
                     g.replay()
                     logits = static_out
                 else:
                     self._pos_buf[0] = seq_len
-                    hidden = self._fast_model_forward(tok_embed, self._pos_buf, seq_len=seq_len + 1, tok_count=1)
+                    hidden = self._fast_model_forward(tok_embed, self._pos_buf, seq_len=seq_len + 1, tok_count=1, bsz=bsz)
                     logits = lm_heads[step](hidden[:, -1:, :]).squeeze(1)
                 seq_len += 1
 
-        return self._codes_buf.clone()
+        return codes_buf
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Ensure all vLLM custom layers consult the predictor vllm_config
@@ -742,35 +748,36 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         top_k: int = 50,
         top_p: float = 1.0,
     ) -> torch.Tensor:
-        """Dispatches to fast SDPA path (bsz=1) or legacy vLLM-attention path."""
+        """Dispatches to fast SDPA path (any bsz) or legacy fallback."""
         import time as _time
 
         bsz = int(layer0_code.shape[0])
-        if bsz == 1:
-            _t0 = _time.perf_counter()
-            result = self.fast_forward(
+        self._init_fast_path(layer0_code.device)
+
+        if bsz > self._fast_max_batch:
+            return self._legacy_forward(
                 layer0_code, layer0_embed, last_talker_hidden,
                 do_sample, temperature, top_k, top_p,
             )
-            _t1 = _time.perf_counter()
-            _ms = (_t1 - _t0) * 1000.0
 
-            cls = Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
-            cls._fwd_call_count += 1
-            cls._fwd_total_ms += _ms
-            if cls._fwd_call_count % 5 == 1:
-                logger.info(
-                    "[FastCodePredictor] #%d  total=%.1fms  avg=%.1fms",
-                    cls._fwd_call_count, _ms,
-                    cls._fwd_total_ms / cls._fwd_call_count,
-                )
-            return result
-
-        # Fallback to legacy vLLM-attention path for bsz > 1
-        return self._legacy_forward(
+        _t0 = _time.perf_counter()
+        result = self.fast_forward(
             layer0_code, layer0_embed, last_talker_hidden,
             do_sample, temperature, top_k, top_p,
         )
+        _t1 = _time.perf_counter()
+        _ms = (_t1 - _t0) * 1000.0
+
+        cls = Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
+        cls._fwd_call_count += 1
+        cls._fwd_total_ms += _ms
+        if cls._fwd_call_count % 5 == 1:
+            logger.info(
+                "[FastCodePredictor] #%d  bsz=%d  total=%.1fms  avg=%.1fms",
+                cls._fwd_call_count, bsz, _ms,
+                cls._fwd_total_ms / cls._fwd_call_count,
+            )
+        return result
 
     @torch.inference_mode()
     def _legacy_forward(
