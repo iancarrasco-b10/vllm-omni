@@ -883,19 +883,24 @@ async def upload_voice(
     audio_sample: UploadFile = File(...),
     consent: str = Form(...),
     name: str = Form(...),
+    ref_text: str | None = Form(None),
 ):
     """Upload a new voice sample for voice cloning.
 
     Uploads an audio file that can be used as a reference for voice cloning
     in Base task TTS requests. The voice can then be referenced by name
     in subsequent TTS requests.
+
+    When ref_text (transcript of the audio sample) is provided, ICL mode
+    is used (x_vector_only_mode=False) for higher-quality cloning.
+    Without ref_text, x_vector_only_mode=True is used.
     """
     handler = Omnispeech(raw_request)
     if handler is None:
         return base(raw_request).create_error_response(message="The model does not support Speech API")
 
     try:
-        result = await handler.upload_voice(audio_sample, consent, name)
+        result = await handler.upload_voice(audio_sample, consent, name, ref_text=ref_text)
         return JSONResponse(content={"success": True, "voice": result})
 
     except ValueError as e:

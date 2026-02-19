@@ -115,11 +115,12 @@ class MetadataManager:
 
             return self._update_with_file_lock(_create) is not None
 
-    def update_cache_info(self, speaker_key: str, cache_file_path: Path, status: str = "ready") -> bool:
+    def update_cache_info(self, speaker_key: str, cache_file_path: Path, status: str = "ready", **extra: Any) -> bool:
         updates = {
             "cache_status": status,
             "cache_file": str(cache_file_path),
             "cache_generated_at": time.time(),
+            **extra,
         }
         return self.update_speaker(speaker_key, updates)
 

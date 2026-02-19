@@ -31,6 +31,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSSpeakerEncoderConfig, Qwen3TTSTalkerConfig
 from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
 from .qwen3_tts_tokenizer import Qwen3TTSTokenizer
+from .voice_cache_manager import VoiceCacheManager
 
 logger = init_logger(__name__)
 
@@ -398,6 +399,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self._tokenizer = None
         self._speech_tokenizer: Qwen3TTSTokenizer | None = None
 
+        # Lazy-initialized voice cache manager for loading pre-computed prompts.
+        self._voice_cache_manager: VoiceCacheManager | None = None
+
     # -------------------- vLLM required hooks --------------------
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
@@ -524,6 +528,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             codec_streaming = task_type == "Base"
 
         if span_len > 1:
+            import time as _pp_time
+            _pp_t0 = _pp_time.perf_counter()
+
             # Prefill (prompt embeddings)
             prompt_embeds_cpu = info_dict.get("talker_prompt_embeds")
             tts_pad_embed_cpu = info_dict.get("tts_pad_embed")
@@ -589,6 +596,16 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 dtype=torch.long,
             )
             info_update["audio_codes"] = zeros
+
+            torch.cuda.synchronize()
+            _pp_ms = (_pp_time.perf_counter() - _pp_t0) * 1000
+            _task = info_dict.get("task_type", ["?"])
+            _task = _task[0] if isinstance(_task, list) else _task
+            logger.info(
+                "[preprocess] prefill chunk: first=%s  task=%s  span_len=%d  prompt_len=%d  elapsed=%.1fms",
+                is_first_prefill, _task, span_len, int(prompt_embeds.shape[0]), _pp_ms,
+            )
+
             return input_ids_out, prompt_embeds, info_update
 
         # Decode: span_len == 1
@@ -1073,6 +1090,60 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         spk = self.speaker_encoder(mels.to(dev, dtype=torch.bfloat16))[0]
         return spk.to(dtype=torch.bfloat16)
 
+    def _save_voice_cache_async(
+        self,
+        speaker_name: str,
+        ref_code: torch.Tensor | None,
+        speaker_embed: torch.Tensor,
+        icl_mode: bool,
+        ref_text: str | None = None,
+    ) -> None:
+        """Persist computed voice clone data so subsequent requests skip codec encoding."""
+        from .voice_cache_manager import VoiceClonePromptItem
+
+        if self._voice_cache_manager is None:
+            self._voice_cache_manager = VoiceCacheManager()
+        audio_path = self._voice_cache_manager.get_speaker_audio_path(speaker_name)
+        if audio_path is None:
+            logger.warning("[Base prefill] cannot save voice cache: audio_path not found for '%s'", speaker_name)
+            return
+        item = VoiceClonePromptItem(
+            ref_code=ref_code.detach().cpu() if ref_code is not None else None,
+            ref_spk_embedding=speaker_embed.detach().cpu().view(-1),
+            x_vector_only_mode=not icl_mode,
+            icl_mode=icl_mode,
+            ref_text=ref_text,
+        )
+        try:
+            ok = self._voice_cache_manager.save_voice_cache(speaker_name, audio_path, [item])
+            if ok:
+                logger.info("[Base prefill] saved voice cache for '%s'", speaker_name)
+            else:
+                logger.warning("[Base prefill] save_voice_cache returned False for '%s'", speaker_name)
+        except Exception as e:
+            logger.warning("[Base prefill] failed to save cache for '%s': %s", speaker_name, e)
+
+    def _load_voice_cache(self, speaker_name: str) -> dict[str, Any] | None:
+        """Load pre-computed voice clone prompt from the safetensors cache.
+
+        Returns a dict with keys compatible with ``voice_clone_prompt``
+        (ref_code, ref_spk_embedding, icl_mode, …) or *None* when no cache
+        is available.
+        """
+        if self._voice_cache_manager is None:
+            self._voice_cache_manager = VoiceCacheManager()
+        items = self._voice_cache_manager.load_cached_voice_prompt(speaker_name, device="cpu")
+        if not items:
+            return None
+        item = items[0]
+        return {
+            "ref_code": item.ref_code,
+            "ref_spk_embedding": item.ref_spk_embedding,
+            "icl_mode": item.icl_mode,
+            "x_vector_only_mode": item.x_vector_only_mode,
+            "ref_text": item.ref_text,
+        }
+
     def _ensure_speech_tokenizer_loaded(self) -> Qwen3TTSTokenizer:
         if self._speech_tokenizer is not None:
             return self._speech_tokenizer
@@ -1290,10 +1361,30 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             return None
 
         if task_type == "Base":
+            import time as _time
+            _t_base_start = _time.perf_counter()
+
             # Base supports voice clone prompt with in-context mode.
             xvec_only = bool((info_dict.get("x_vector_only_mode") or [False])[0])
             in_context_mode = not xvec_only
             voice_clone_prompt = _normalize_voice_clone_prompt(info_dict.get("voice_clone_prompt"))
+
+            # Engine path: preprocess() doesn't go through generate_voice_clone(),
+            # so VoiceCacheManager is not consulted.  Load the cache here if the
+            # serving layer indicated a cached speaker but didn't inline the data.
+            if voice_clone_prompt is None and "ref_audio" not in info_dict:
+                speaker_name = _as_singleton(info_dict.get("speaker"))
+                if isinstance(speaker_name, str) and speaker_name.strip():
+                    _t_cache = _time.perf_counter()
+                    cached = self._load_voice_cache(speaker_name)
+                    _cache_ms = (_time.perf_counter() - _t_cache) * 1000
+                    if cached is not None:
+                        voice_clone_prompt = cached
+                        logger.info(
+                            "[Base prefill] loaded voice cache for '%s' in %.1fms",
+                            speaker_name, _cache_ms,
+                        )
+
             # Official implementation may pass `voice_clone_prompt.icl_mode`.
             if voice_clone_prompt is not None and "icl_mode" in voice_clone_prompt:
                 icl_flag = _as_singleton(voice_clone_prompt.get("icl_mode"))
@@ -1314,13 +1405,17 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 ref_code_t = ref_code_t.to(device=input_ids.device, dtype=torch.long)
                 ref_code_len = int(ref_code_t.shape[0])
             elif in_context_mode:
-                # Compute ref_code from ref_audio if not provided.
+                _t_enc = _time.perf_counter()
                 ref_audio_list = info_dict.get("ref_audio")
                 if not isinstance(ref_audio_list, list) or not ref_audio_list:
                     raise ValueError("Base requires `ref_audio`.")
                 wav_np, sr = self._normalize_ref_audio(ref_audio_list[0])
                 ref_code_t = self._encode_ref_audio_to_code(wav_np, sr).to(device=input_ids.device)
                 ref_code_len = int(ref_code_t.shape[0])
+                logger.info(
+                    "[Base prefill] _encode_ref_audio_to_code: %.0fms (ref_code_len=%d)",
+                    (_time.perf_counter() - _t_enc) * 1000, ref_code_len,
+                )
 
             # Speaker embedding: use prompt embed if provided; otherwise extract from audio.
             spk = None
@@ -1329,11 +1424,27 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             if isinstance(spk, torch.Tensor):
                 speaker_embed = spk.to(device=input_ids.device, dtype=torch.bfloat16).view(1, 1, -1)
             else:
+                _t_spk = _time.perf_counter()
                 ref_audio_list = info_dict.get("ref_audio")
                 if not isinstance(ref_audio_list, list) or not ref_audio_list:
                     raise ValueError("Base requires `ref_audio`.")
                 wav_np, sr = self._normalize_ref_audio(ref_audio_list[0])
                 speaker_embed = self._extract_speaker_embedding(wav_np, sr).view(1, 1, -1)
+                logger.info(
+                    "[Base prefill] _extract_speaker_embedding: %.0fms",
+                    (_time.perf_counter() - _t_spk) * 1000,
+                )
+
+            # Save cache in background if we just computed ref_code / speaker_embed
+            # from raw audio (cache cold path).  This avoids re-encoding on the
+            # next request for the same speaker.
+            if voice_clone_prompt is None:
+                speaker_name = _as_singleton(info_dict.get("speaker"))
+                if isinstance(speaker_name, str) and speaker_name.strip():
+                    self._save_voice_cache_async(
+                        speaker_name, ref_code_t, speaker_embed, in_context_mode,
+                        ref_text=_as_singleton(info_dict.get("ref_text")),
+                    )
 
             codec_input = torch.cat([codec_input_0, speaker_embed, codec_input_1], dim=1)
 
@@ -1503,6 +1614,15 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         if instruct_embed is not None:
             talker_prompt = torch.cat([instruct_embed, talker_prompt], dim=1)
+
+        if task_type == "Base":
+            torch.cuda.synchronize()
+            _base_ms = (_time.perf_counter() - _t_base_start) * 1000
+            logger.info(
+                "[Base prefill] _build_prompt_embeds total: %.0fms  prompt_len=%d  ref_code_len=%s  icl=%s",
+                _base_ms, int(talker_prompt.shape[-2]),
+                ref_code_len, in_context_mode,
+            )
 
         return (
             talker_prompt.squeeze(0),  # [prompt_len, H]

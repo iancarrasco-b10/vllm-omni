@@ -18,7 +18,7 @@ stage_args:
       async_scheduling: false
       enable_prefix_caching: false
       engine_output_type: latent
-      gpu_memory_utilization: 0.3
+      gpu_memory_utilization: 0.5
       distributed_executor_backend: "mp"
       max_num_batched_tokens: 4096
       max_model_len: 4096

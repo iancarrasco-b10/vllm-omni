@@ -146,7 +146,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return set()
 
     def _get_uploaded_audio_data(self, voice_name: str) -> str | None:
-        """Get base64 encoded audio data for uploaded voice."""
+        """Get base64 encoded audio data for uploaded voice.
+
+        Non-WAV formats (m4a, mp3, aac, etc.) are converted to WAV on the fly
+        using torchaudio so that downstream code (soundfile) can always read them.
+        """
         voice_name_lower = voice_name.lower()
         if voice_name_lower not in self.uploaded_speakers:
             return None
@@ -159,17 +163,34 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return None
 
         try:
-            with open(file_path, "rb") as f:
-                audio_bytes = f.read()
+            mime_type = speaker_info.get("mime_type", "audio/wav")
+            needs_conversion = mime_type not in ("audio/wav", "audio/x-wav", "audio/flac", "audio/ogg")
+
+            if needs_conversion:
+                from pydub import AudioSegment
+
+                audio_seg = AudioSegment.from_file(str(file_path))
+                buf = io.BytesIO()
+                audio_seg.export(buf, format="wav")
+                audio_bytes = buf.getvalue()
+                mime_type = "audio/wav"
+            else:
+                with open(file_path, "rb") as f:
+                    audio_bytes = f.read()
 
             audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-            mime_type = speaker_info.get("mime_type", "audio/wav")
             return f"data:{mime_type};base64,{audio_b64}"
         except Exception as e:
             logger.error(f"Could not read audio file for voice {voice_name}: {e}")
             return None
 
-    async def upload_voice(self, audio_file: UploadFile, consent: str, name: str) -> dict:
+    async def upload_voice(
+        self,
+        audio_file: UploadFile,
+        consent: str,
+        name: str,
+        ref_text: str | None = None,
+    ) -> dict:
         """Upload a new voice sample."""
         MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
         audio_file.file.seek(0, 2)
@@ -250,6 +271,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "mime_type": mime_type,
             "original_filename": audio_file.filename,
             "file_size": file_size,
+            "ref_text": ref_text,
             "cache_status": "pending",
             "cache_file": None,
             "cache_generated_at": None,
@@ -274,6 +296,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "created_at": timestamp,
             "mime_type": mime_type,
             "file_size": file_size,
+            "ref_text": ref_text,
         }
 
     async def delete_voice(self, name: str) -> bool:
@@ -316,12 +339,34 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             hf_config = self.engine_client.model_config.hf_config
             talker_config = hf_config.talker_config
             task_type = (tts_params.get("task_type") or ["CustomVoice"])[0]
+
+            codec_rate = getattr(talker_config, "codec_rate", 12)
+
+            cached_len = tts_params.get("_cached_ref_code_len")
+            if isinstance(cached_len, list) and cached_len:
+                cached_len = cached_len[0]
+
+            def _estimate_ref_code_len(ref_audio_data: Any) -> int | None:
+                """Estimate codec frame count from resolved ref_audio or cache metadata."""
+                if isinstance(cached_len, int):
+                    return cached_len
+                if not isinstance(ref_audio_data, list) or not ref_audio_data:
+                    return None
+                val = ref_audio_data[0]
+                if isinstance(val, list) and len(val) == 2:
+                    wav_samples, sr = val
+                    if sr > 0:
+                        duration = len(wav_samples) / sr
+                        return int(duration * codec_rate)
+                return None
+
             return Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
                 additional_information=tts_params,
                 task_type=task_type,
                 tokenize_prompt=lambda t: self._tts_tokenizer(t, padding=False)["input_ids"],
                 codec_language_id=getattr(talker_config, "codec_language_id", None),
                 spk_is_dialect=getattr(talker_config, "spk_is_dialect", None),
+                estimate_ref_code_len=_estimate_ref_code_len,
             )
         except Exception as e:
             logger.warning("Failed to estimate TTS prompt length, using fallback 2048: %s", e)
@@ -521,13 +566,45 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
             # If voice is an uploaded speaker and no ref_audio provided, auto-set it
             if request.voice.lower() in self.uploaded_speakers and request.ref_audio is None:
-                audio_data = self._get_uploaded_audio_data(request.voice)
-                if audio_data:
-                    params["ref_audio"] = [audio_data]
-                    params["x_vector_only_mode"] = [True]
-                    logger.info(f"Auto-set ref_audio for uploaded voice: {request.voice}")
+                speaker_info = self.uploaded_speakers[request.voice.lower()]
+
+                # Re-read metadata if cache may have been warmed by the model since upload
+                if speaker_info.get("cache_status") != "ready":
+                    self._refresh_uploaded_speakers_cache()
+                    speaker_info = self.uploaded_speakers.get(request.voice.lower(), speaker_info)
+
+                cache_ready = speaker_info.get("cache_status") == "ready"
+
+                stored_ref_text = speaker_info.get("ref_text")
+                if stored_ref_text and request.ref_text is None:
+                    params["ref_text"] = [stored_ref_text]
+                    params["x_vector_only_mode"] = [False]
                 else:
-                    raise ValueError(f"Audio file for uploaded voice '{request.voice}' is missing or corrupted")
+                    params["x_vector_only_mode"] = [True]
+
+                if cache_ready:
+                    # Cache warm: skip audio file I/O entirely.
+                    # The model will load pre-computed ref_code + speaker
+                    # embedding from safetensors via VoiceCacheManager.
+                    cached_ref_code_len = speaker_info.get("ref_code_len")
+                    if cached_ref_code_len is not None:
+                        params["_cached_ref_code_len"] = [int(cached_ref_code_len)]
+                    icl = params.get("x_vector_only_mode", [True])[0] is False
+                    mode = "ICL" if icl else "x_vector_only"
+                    logger.info(
+                        "Using cached voice for '%s' (%s mode, ref_code_len=%s) — skipping audio I/O",
+                        request.voice, mode, cached_ref_code_len,
+                    )
+                else:
+                    # Cache cold: fall through to audio file read
+                    audio_data = self._get_uploaded_audio_data(request.voice)
+                    if audio_data:
+                        params["ref_audio"] = [audio_data]
+                        icl = params.get("x_vector_only_mode", [True])[0] is False
+                        mode = "ICL" if icl else "x_vector_only"
+                        logger.info(f"Auto-set ref_audio ({mode} mode) for uploaded voice: {request.voice}")
+                    else:
+                        raise ValueError(f"Audio file for uploaded voice '{request.voice}' is missing or corrupted")
 
         elif params["task_type"][0] == "CustomVoice":
             params["speaker"] = ["Vivian"]  # Default for CustomVoice
@@ -555,34 +632,75 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     async def _prepare_tts_generator(
         self,
         request: OpenAICreateSpeechRequest,
-    ):
+    ) -> tuple:
         """Validate request, build prompt, and return the async generator.
 
         Shared by both _generate_audio_bytes() and the streaming output path
         in create_speech().
 
         Returns:
-            The async generator from engine_client.generate().
+            Tuple of (async_generator, icl_trim_info) where icl_trim_info
+            is a dict with ref_audio_duration and ref_text/target_text lengths
+            for ICL voice-clone trimming, or None when not applicable.
 
         Raises:
             ValueError: If validation fails.
         """
+        icl_trim_info: dict | None = None
+
         if self._is_tts_model():
             validation_error = self._validate_tts_request(request)
             if validation_error:
                 raise ValueError(validation_error)
 
-            # Must use prompt_token_ids (not text prompt): the AR Talker
-            # operates on codec tokens; text token IDs exceed codec vocab.
-            # model.preprocess replaces all embeddings, so placeholder value
-            # is irrelevant -- but length must match to avoid excess padding.
             tts_params = self._build_tts_params(request)
 
             if request.ref_audio is not None:
                 wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
                 tts_params["ref_audio"] = [[wav_list, sr]]
+            elif "ref_audio" in tts_params:
+                ref_val = tts_params["ref_audio"]
+                if isinstance(ref_val, list) and ref_val and isinstance(ref_val[0], str):
+                    wav_list, sr = await self._resolve_ref_audio(ref_val[0])
+                    tts_params["ref_audio"] = [[wav_list, sr]]
+
+            # Collect ICL trim metadata: in ICL mode the model generates audio
+            # that overlaps with the tail of the reference text.  We estimate
+            # the overlap from the speaker's rate and trim it after generation.
+            is_icl = (
+                tts_params.get("task_type", [""])[0] == "Base"
+                and tts_params.get("x_vector_only_mode", [True])[0] is False
+            )
+            if is_icl:
+                ref_audio_val = tts_params.get("ref_audio")
+                ref_text_val = tts_params.get("ref_text", [None])[0]
+                if ref_text_val:
+                    ref_duration: float | None = None
+                    if isinstance(ref_audio_val, list) and ref_audio_val:
+                        inner = ref_audio_val[0]
+                        if isinstance(inner, list) and len(inner) == 2:
+                            wav_samples, wav_sr = inner
+                            if wav_sr > 0:
+                                ref_duration = len(wav_samples) / wav_sr
+                    if ref_duration is None:
+                        # Cache-warm path: estimate duration from cached ref_code_len
+                        cached_rcl = tts_params.get("_cached_ref_code_len")
+                        if isinstance(cached_rcl, list) and cached_rcl:
+                            hf_config = self.engine_client.model_config.hf_config
+                            codec_rate = getattr(hf_config.talker_config, "codec_rate", 12)
+                            ref_duration = int(cached_rcl[0]) / codec_rate
+                    if ref_duration is not None:
+                        icl_trim_info = {
+                            "ref_duration": ref_duration,
+                            "ref_text_len": len(ref_text_val),
+                            "target_text_len": len(request.input),
+                        }
 
             ph_len = self._estimate_prompt_len(tts_params)
+
+            # Strip private estimation hints before sending to engine
+            tts_params.pop("_cached_ref_code_len", None)
+
             prompt = {
                 "prompt_token_ids": [1] * ph_len,
                 "additional_information": tts_params,
@@ -609,7 +727,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             output_modalities=["audio"],
         )
 
-        return generator
+        return generator, icl_trim_info
 
     async def _generate_audio_bytes(
         self,
@@ -632,20 +750,52 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
-        generator = await self._prepare_tts_generator(request)
+        generator, icl_trim_info = await self._prepare_tts_generator(request)
 
+        audio_chunks: list[tuple[np.ndarray, int]] = []
         final_output: OmniRequestOutput | None = None
         async for res in generator:
             final_output = res
+            chunk = self._extract_audio_from_output(res)
+            if chunk is not None:
+                audio_chunks.append(chunk)
 
         if final_output is None:
             raise ValueError("No output generated from the model.")
 
-        audio_chunk = self._extract_audio_from_output(final_output)
-        if audio_chunk is None:
+        if not audio_chunks:
             raise ValueError("TTS model did not produce audio output.")
 
-        audio_tensor, sample_rate = audio_chunk
+        sample_rate = audio_chunks[0][1]
+        if len(audio_chunks) == 1:
+            audio_tensor = audio_chunks[0][0]
+        else:
+            audio_tensor = np.concatenate([c[0] for c in audio_chunks])
+
+        # ICL voice-clone trim: the model generates audio that overlaps with
+        # the tail of the reference text.  Estimate the target-text portion
+        # from the reference speaker's rate and keep only that.
+        if icl_trim_info and audio_tensor.size > 0:
+            ref_dur = icl_trim_info["ref_duration"]
+            ref_len = icl_trim_info["ref_text_len"]
+            tgt_len = icl_trim_info["target_text_len"]
+            if ref_dur > 0 and ref_len > 0 and tgt_len > 0:
+                chars_per_sec = ref_len / ref_dur
+                target_duration = tgt_len / chars_per_sec
+                # 15% buffer so we don't clip the trailing syllable
+                target_samples = int(target_duration * 1.15 * sample_rate)
+                total_samples = audio_tensor.size
+                trim_samples = max(0, total_samples - target_samples)
+                if 0 < trim_samples < total_samples:
+                    logger.info(
+                        "ICL trim: speaker_rate=%.1f chars/s  "
+                        "target_dur=%.2fs  trim=%.2fs  keep=%.2fs",
+                        chars_per_sec,
+                        target_duration,
+                        trim_samples / sample_rate,
+                        target_samples / sample_rate,
+                    )
+                    audio_tensor = audio_tensor[trim_samples:]
 
         audio_obj = CreateAudio(
             audio_tensor=audio_tensor,
@@ -676,7 +826,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
-        generator = await self._prepare_tts_generator(request)
+        generator, _icl_trim_info = await self._prepare_tts_generator(request)
         speed = request.speed or 1.0
 
         async for res in generator:
@@ -731,7 +881,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if self.engine_client.errored:
                     raise self.engine_client.dead_error
 
-                generator = await self._prepare_tts_generator(request)
+                generator, _icl_trim_info = await self._prepare_tts_generator(request)
 
                 response_format = request.response_format or "wav"
                 speed = request.speed or 1.0

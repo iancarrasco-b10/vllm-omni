@@ -809,12 +809,13 @@ class Qwen3TTSModel:
 
         self._validate_languages(languages)
 
-        # Cache logic: if speaker parameter is provided, try to load from cache
+        # Cache logic: if speaker parameter is provided and no pre-built
+        # voice_clone_prompt was supplied, try to load from the on-disk cache.
         cache_loaded = False
         cache_speaker = None
         cache_audio_path = None
 
-        if speaker:
+        if speaker and voice_clone_prompt is None:
             cached_items = self.voice_cache_manager.load_cached_voice_prompt(speaker, device=str(self.device))
             if cached_items is not None:
                 voice_clone_prompt = cached_items

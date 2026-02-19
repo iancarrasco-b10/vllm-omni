@@ -76,11 +76,11 @@ class VoiceCacheManager:
             logger.warning(f"Failed to load uploaded speakers from metadata: {e}")
             return None
 
-    def update_metadata_cache_info(self, speaker: str, cache_file_path: Path, status: str = "ready") -> bool:
+    def update_metadata_cache_info(self, speaker: str, cache_file_path: Path, status: str = "ready", **extra: Any) -> bool:
         try:
             speaker_key = speaker.lower()
             return self.metadata_manager.update_cache_info(
-                speaker_key=speaker_key, cache_file_path=cache_file_path, status=status
+                speaker_key=speaker_key, cache_file_path=cache_file_path, status=status, **extra
             )
         except Exception as e:
             logger.error(f"Failed to update metadata cache info: {e}")
@@ -104,13 +104,13 @@ class VoiceCacheManager:
             for i, item in enumerate(prompt_items):
                 prefix = f"item_{i}_"
 
-                tensors[prefix + "ref_spk_embedding"] = item.ref_spk_embedding.detach().cpu()
+                tensors[prefix + "ref_spk_embedding"] = item.ref_spk_embedding.detach().cpu().contiguous()
 
                 has_ref_code = item.ref_code is not None
                 tensors[prefix + "has_ref_code"] = torch.tensor(int(has_ref_code), dtype=torch.int8)
 
                 if has_ref_code:
-                    tensors[prefix + "ref_code"] = item.ref_code.detach().cpu()
+                    tensors[prefix + "ref_code"] = item.ref_code.detach().cpu().contiguous()
 
                 tensors[prefix + "x_vector_only_mode"] = torch.tensor(int(item.x_vector_only_mode), dtype=torch.int8)
                 tensors[prefix + "icl_mode"] = torch.tensor(int(item.icl_mode), dtype=torch.int8)
@@ -120,10 +120,15 @@ class VoiceCacheManager:
 
             save_file(tensors, str(cache_file_path), metadata=metadata)
 
+            extra: dict[str, int | None] = {}
+            if prompt_items and prompt_items[0].ref_code is not None:
+                extra["ref_code_len"] = int(prompt_items[0].ref_code.shape[0])
+
             return self.update_metadata_cache_info(
                 speaker=speaker,
                 cache_file_path=cache_file_path,
                 status="ready",
+                **extra,
             )
 
         except Exception as e:
