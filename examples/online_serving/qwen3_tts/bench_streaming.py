@@ -10,16 +10,28 @@ Usage:
     # 4 concurrent streams, 3 rounds each
     python bench_streaming.py --concurrency 4 --rounds 3
 
-    # Custom text
+    # Custom text (same for all sessions)
     python bench_streaming.py --concurrency 2 \
-        --text "The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs."
+        --text "The quick brown fox jumps over the lazy dog."
+
+    # Different prompts per concurrent stream (round-robin assignment)
+    python bench_streaming.py --concurrency 3 \
+        --text "First prompt." --text "Second prompt." --text "Third prompt."
+
+    # Load prompts from a file (one per line)
+    python bench_streaming.py --concurrency 4 --text-file prompts.txt
+
+    # Save output audio for each stream
+    python bench_streaming.py --concurrency 4 --output-dir ./bench_output
 """
 
 import argparse
 import asyncio
 import json
+import os
 import statistics
 import time
+import wave
 
 try:
     import websockets
@@ -28,11 +40,22 @@ except ImportError:
     raise SystemExit(1)
 
 
+def _write_wav(path: str, pcm_data: bytes, sample_rate: int) -> None:
+    """Write raw PCM-16LE bytes to a WAV file."""
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_data)
+
+
 async def run_one_session(
     url: str,
     text: str,
     config: dict,
     session_id: int,
+    round_num: int = 0,
+    output_dir: str | None = None,
 ) -> dict:
     """Run a single streaming TTS session, return timing metrics."""
     async with websockets.connect(url) as ws:
@@ -46,6 +69,8 @@ async def run_one_session(
         sentence_count = 0
         total_pcm_bytes = 0
         chunk_count = 0
+        sample_rate = 24000
+        all_pcm: list[bytes] = []
 
         while True:
             message = await ws.recv()
@@ -54,9 +79,11 @@ async def run_one_session(
                     ttfa = time.perf_counter() - t0
                 total_pcm_bytes += len(message)
                 chunk_count += 1
+                all_pcm.append(message)
             else:
                 msg = json.loads(message)
                 if msg.get("type") == "audio.done":
+                    sample_rate = msg.get("sample_rate", 24000)
                     sentence_count += 1
                 elif msg.get("type") == "session.done":
                     break
@@ -67,7 +94,13 @@ async def run_one_session(
                     }
 
         t_total = time.perf_counter() - t0
-        duration_s = total_pcm_bytes / (24000 * 2) if total_pcm_bytes else 0
+        duration_s = total_pcm_bytes / (sample_rate * 2) if total_pcm_bytes else 0
+
+        if output_dir and all_pcm:
+            os.makedirs(output_dir, exist_ok=True)
+            path = os.path.join(output_dir, f"round{round_num}_session{session_id}.wav")
+            _write_wav(path, b"".join(all_pcm), sample_rate)
+
         return {
             "session_id": session_id,
             "ttfa_ms": ttfa * 1000 if ttfa else None,
@@ -82,13 +115,14 @@ async def run_one_session(
 
 async def run_round(
     url: str,
-    text: str,
+    texts: list[str],
     config: dict,
     concurrency: int,
     round_num: int,
+    output_dir: str | None = None,
 ) -> list[dict]:
     tasks = [
-        run_one_session(url, text, config, session_id=i)
+        run_one_session(url, texts[i % len(texts)], config, session_id=i, round_num=round_num, output_dir=output_dir)
         for i in range(concurrency)
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -140,6 +174,19 @@ def print_results(all_results: list[dict], concurrency: int):
     print(f"  Throughput: {total_audio:.1f}s audio in {wall_clock:.1f}s wall = {total_audio/wall_clock:.2f}x realtime")
 
 
+def _resolve_texts(args) -> list[str]:
+    """Build the list of prompts from --text and/or --text-file."""
+    texts: list[str] = []
+    if args.text_file:
+        with open(args.text_file) as f:
+            texts.extend(line.strip() for line in f if line.strip())
+    if args.text:
+        texts.extend(args.text)
+    if not texts:
+        texts.append("Hello world. How are you today? I am doing very well, thank you for asking.")
+    return texts
+
+
 async def main_async(args):
     config = {
         "voice": args.voice,
@@ -149,16 +196,25 @@ async def main_async(args):
         "speed": 1.0,
     }
 
+    texts = _resolve_texts(args)
+
     print(f"Target: {args.url}")
-    print(f"Text: {args.text!r}")
+    print(f"Prompts: {len(texts)}")
+    for i, t in enumerate(texts):
+        label = f"  [{i}] "
+        preview = t if len(t) <= 80 else t[:77] + "..."
+        print(f"{label}{preview!r}")
     print(f"Concurrency: {args.concurrency}  |  Rounds: {args.rounds}")
+    if args.output_dir:
+        print(f"Output: {args.output_dir}/")
     print("=" * 60)
 
     all_results = []
     for rnd in range(args.rounds):
         print(f"\n--- Round {rnd + 1}/{args.rounds} ---")
         results = await run_round(
-            args.url, args.text, config, args.concurrency, rnd
+            args.url, texts, config, args.concurrency, rnd,
+            output_dir=args.output_dir,
         )
         for r in results:
             if "error" not in r:
@@ -183,11 +239,23 @@ def main():
     parser = argparse.ArgumentParser(description="Benchmark streaming TTS")
     parser.add_argument("--url", default="ws://localhost:8091/v1/audio/speech/stream")
     parser.add_argument(
-        "--text",
-        default="Hello world. How are you today? I am doing very well, thank you for asking.",
+        "--text", action="append", default=None,
+        help="Text prompt. Can be specified multiple times for different prompts "
+             "per session (assigned round-robin). Falls back to a default if omitted.",
+    )
+    parser.add_argument(
+        "--text-file", default=None,
+        help="Path to a file with one prompt per line. "
+             "Combined with any --text prompts.",
     )
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Directory to save WAV files. Files are named round<R>_session<S>.wav. "
+             "If not set, audio is not saved.",
+    )
     parser.add_argument("--voice", default="Vivian")
     parser.add_argument("--task-type", default="CustomVoice")
     args = parser.parse_args()
