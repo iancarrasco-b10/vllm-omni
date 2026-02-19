@@ -23,10 +23,18 @@ Usage:
 
     # Save output audio for each stream
     python bench_streaming.py --concurrency 4 --output-dir ./bench_output
+
+    # Voice cloning (Base task) with a reference audio file
+    python bench_streaming.py --concurrency 2 \
+        --task-type Base \
+        --ref-audio /path/to/reference.wav \
+        --ref-text "Transcript of reference audio" \
+        --text "Clone my voice saying this."
 """
 
 import argparse
 import asyncio
+import base64
 import json
 import os
 import statistics
@@ -38,6 +46,29 @@ try:
 except ImportError:
     print("pip install websockets")
     raise SystemExit(1)
+
+
+_MIME_TYPES = {
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".mpeg": "audio/mpeg",
+    ".flac": "audio/flac",
+    ".ogg": "audio/ogg",
+    ".m4a": "audio/mp4",
+    ".aac": "audio/aac",
+    ".wma": "audio/x-ms-wma",
+}
+
+
+def _encode_audio(path: str) -> str:
+    """Encode a local audio file to a base64 data-URL, or pass through URLs."""
+    if path.startswith(("http://", "https://", "data:")):
+        return path
+    ext = os.path.splitext(path)[1].lower()
+    mime = _MIME_TYPES.get(ext, "audio/wav")
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    return f"data:{mime};base64,{b64}"
 
 
 def _write_wav(path: str, pcm_data: bytes, sample_rate: int) -> None:
@@ -188,17 +219,28 @@ def _resolve_texts(args) -> list[str]:
 
 
 async def main_async(args):
-    config = {
+    config: dict = {
         "voice": args.voice,
         "task_type": args.task_type,
         "language": "Auto",
         "response_format": "wav",
         "speed": 1.0,
     }
+    if args.ref_audio:
+        config["ref_audio"] = _encode_audio(args.ref_audio)
+    if args.ref_text:
+        config["ref_text"] = args.ref_text
+    if args.instructions:
+        config["instructions"] = args.instructions
 
     texts = _resolve_texts(args)
 
     print(f"Target: {args.url}")
+    print(f"Task: {args.task_type}")
+    if args.ref_audio:
+        print(f"Ref audio: {args.ref_audio}")
+    if args.ref_text:
+        print(f"Ref text: {args.ref_text!r}")
     print(f"Prompts: {len(texts)}")
     for i, t in enumerate(texts):
         label = f"  [{i}] "
@@ -256,8 +298,25 @@ def main():
         help="Directory to save WAV files. Files are named round<R>_session<S>.wav. "
              "If not set, audio is not saved.",
     )
-    parser.add_argument("--voice", default="Vivian")
-    parser.add_argument("--task-type", default="CustomVoice")
+    parser.add_argument("--voice", default="Vivian", help="Speaker voice name")
+    parser.add_argument(
+        "--task-type", default="CustomVoice",
+        choices=["CustomVoice", "VoiceDesign", "Base"],
+        help="TTS task type (use Base for voice cloning)",
+    )
+    parser.add_argument(
+        "--ref-audio", default=None,
+        help="Reference audio for voice cloning (local path or URL). "
+             "Requires --task-type Base.",
+    )
+    parser.add_argument(
+        "--ref-text", default=None,
+        help="Transcript of the reference audio for voice cloning.",
+    )
+    parser.add_argument(
+        "--instructions", default=None,
+        help="Voice style instructions (for VoiceDesign / CustomVoice).",
+    )
     args = parser.parse_args()
     asyncio.run(main_async(args))
 
