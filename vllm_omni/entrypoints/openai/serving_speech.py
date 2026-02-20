@@ -820,6 +820,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         frame can be sent after just the first codec chunk rather than waiting
         for the entire sentence to be generated.
 
+        ICL trim is NOT applied here — the streaming handler already avoids
+        per-sentence splitting for Base/ICL mode, so the model generates the
+        full text as one continuous sequence with natural prosody.  The
+        non-streaming ``_generate_audio_bytes`` path still applies ICL trim.
+
         Raises:
             ValueError: If validation fails.
         """

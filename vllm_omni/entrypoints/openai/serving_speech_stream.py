@@ -71,8 +71,16 @@ class OmniStreamingSpeechHandler:
             if config is None:
                 return  # Error already sent, connection closing
 
+            # For Base/ICL voice cloning, generate the full text as a single
+            # request so the reference-overlap only happens once and the model
+            # produces natural prosody across sentence boundaries.  Per-sentence
+            # splitting causes the model to hit EOS too early, clipping the end
+            # of each sentence.
+            icl_mode = (config.task_type or "").lower() == "base"
+
             splitter = SentenceSplitter()
             sentence_index = 0
+            text_buffer: list[str] = []  # only used when icl_mode is True
 
             # 2. Receive text chunks until input.done
             while True:
@@ -95,17 +103,27 @@ class OmniStreamingSpeechHandler:
 
                 if msg_type == "input.text":
                     text = msg.get("text", "")
-                    sentences = splitter.add_text(text)
-                    for sentence in sentences:
-                        await self._generate_and_send(websocket, config, sentence, sentence_index)
-                        sentence_index += 1
+                    if icl_mode:
+                        text_buffer.append(text)
+                    else:
+                        sentences = splitter.add_text(text)
+                        for sentence in sentences:
+                            await self._generate_and_send(websocket, config, sentence, sentence_index)
+                            sentence_index += 1
 
                 elif msg_type == "input.done":
-                    # Flush remaining buffer
-                    remaining = splitter.flush()
-                    if remaining:
-                        await self._generate_and_send(websocket, config, remaining, sentence_index)
-                        sentence_index += 1
+                    if icl_mode:
+                        full_text = "".join(text_buffer).strip()
+                        if full_text:
+                            await self._generate_and_send(
+                                websocket, config, full_text, sentence_index,
+                            )
+                            sentence_index += 1
+                    else:
+                        remaining = splitter.flush()
+                        if remaining:
+                            await self._generate_and_send(websocket, config, remaining, sentence_index)
+                            sentence_index += 1
 
                     # Send session.done
                     await websocket.send_json(
