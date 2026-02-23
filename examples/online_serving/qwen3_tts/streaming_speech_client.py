@@ -89,6 +89,20 @@ def _encode_audio_file(path: str) -> str:
     return f"data:{mime_type};base64,{b64}"
 
 
+async def _delete_voice(url: str, voice_name: str) -> None:
+    """Connect to the WebSocket endpoint and send a voice.delete command."""
+    async with websockets.connect(url) as ws:
+        await ws.send(json.dumps({"type": "voice.delete", "voice_name": voice_name}))
+        raw = await ws.recv()
+        msg = json.loads(raw)
+        if msg.get("type") == "voice.deleted":
+            print(f"Voice '{voice_name}' deleted successfully.")
+        elif msg.get("type") == "error":
+            print(f"Error: {msg.get('message')}")
+        else:
+            print(f"Unexpected response: {msg}")
+
+
 async def stream_tts(
     url: str,
     text: str,
@@ -260,6 +274,12 @@ def main():
         default=False,
         help="Speaker embedding only mode (no ICL)",
     )
+    parser.add_argument(
+        "--delete-voice",
+        default=None,
+        metavar="NAME",
+        help="Delete a cached voice clone by name and exit.",
+    )
 
     # STT simulation
     parser.add_argument(
@@ -275,6 +295,11 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Handle --delete-voice as a one-shot command
+    if args.delete_voice:
+        asyncio.run(_delete_voice(args.url, args.delete_voice))
+        return
 
     # If ref-text looks like a file path, read its contents
     if args.ref_text and os.path.isfile(args.ref_text):

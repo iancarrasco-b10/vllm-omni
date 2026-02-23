@@ -247,6 +247,28 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         logger.info("Registered voice clone '%s' (%d bytes, %s)", voice_name, len(audio_bytes), mime_type)
         return speaker_data
 
+    def delete_voice_clone(self, voice_name: str) -> bool:
+        """Delete a cached voice clone and its associated files.
+
+        Removes the audio file, safetensors cache, and metadata entry.
+        Returns True if the voice was found and deleted.
+        """
+        voice_key = voice_name.lower()
+
+        if voice_key not in self.uploaded_speakers:
+            return False
+
+        deleted_info = self.metadata_manager.delete_speaker(voice_key)
+        if deleted_info is None:
+            logger.warning("Voice '%s' not found in metadata", voice_name)
+            return False
+
+        self.uploaded_speakers.pop(voice_key, None)
+        self.supported_speakers.discard(voice_key)
+
+        logger.info("Deleted voice clone '%s' and associated files", voice_name)
+        return True
+
     def _estimate_prompt_len(self, tts_params: dict[str, Any]) -> int:
         """Estimate prompt length so the placeholder matches model-side embeddings."""
         try:

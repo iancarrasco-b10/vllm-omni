@@ -15,8 +15,11 @@ Protocol:
         {"type": "session.config", ...}   # Session config (sent once first)
         {"type": "input.text", "text": "..."} # Text chunks
         {"type": "input.done"}            # End of input
+        {"type": "voice.delete", "voice_name": "..."}  # Delete a cached voice
 
     Server -> Client:
+        {"type": "voice.registered", "voice_name": "...", "cached": true}
+        {"type": "voice.deleted", "voice_name": "..."}
         {"type": "audio.start", "sentence_index": 0, "sentence_text": "...", "format": "wav"}
         <binary frame: audio bytes>
         {"type": "audio.done", "sentence_index": 0}
@@ -73,10 +76,10 @@ class OmniStreamingSpeechHandler:
         await websocket.accept()
 
         try:
-            # 1. Wait for session.config
+            # 1. Wait for session.config (or a voice.delete command)
             config = await self._receive_config(websocket)
             if config is None:
-                return  # Error already sent, connection closing
+                return  # Error already sent, or voice.delete handled
 
             # 1b. Handle voice clone registration / cache lookup when
             # voice_name is provided in session.config.
@@ -197,7 +200,12 @@ class OmniStreamingSpeechHandler:
                 pass
 
     async def _receive_config(self, websocket: WebSocket) -> StreamingSpeechSessionConfig | None:
-        """Wait for and validate the session.config message."""
+        """Wait for and validate the session.config message.
+
+        Also handles ``voice.delete`` as a one-shot command: deletes the
+        cached voice, sends a response, and returns None so the session
+        closes cleanly.
+        """
         try:
             raw = await asyncio.wait_for(
                 websocket.receive_text(),
@@ -213,10 +221,28 @@ class OmniStreamingSpeechHandler:
             await self._send_error(websocket, "Invalid JSON in session.config")
             return None
 
+        # Handle voice.delete as a one-shot command
+        if msg.get("type") == "voice.delete":
+            voice_name = msg.get("voice_name", "")
+            if not voice_name:
+                await self._send_error(websocket, "voice.delete requires 'voice_name'")
+                return None
+            deleted = self._speech_service.delete_voice_clone(voice_name)
+            if deleted:
+                await websocket.send_json(
+                    {"type": "voice.deleted", "voice_name": voice_name}
+                )
+            else:
+                await self._send_error(
+                    websocket,
+                    f"Voice '{voice_name}' not found in cache",
+                )
+            return None
+
         if msg.get("type") != "session.config":
             await self._send_error(
                 websocket,
-                f"Expected session.config, got: {msg.get('type')}",
+                f"Expected session.config or voice.delete, got: {msg.get('type')}",
             )
             return None
 
