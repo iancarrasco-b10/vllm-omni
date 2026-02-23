@@ -242,7 +242,12 @@ def main():
         default=None,
         help="Path to local reference audio file for voice cloning",
     )
-    parser.add_argument("--ref-text", default=None, help="Transcript of reference audio (enables ICL mode)")
+    parser.add_argument(
+        "--ref-text",
+        default=None,
+        help="Transcript of reference audio (enables ICL mode). "
+        "Can be inline text or a path to a .txt file.",
+    )
     parser.add_argument(
         "--voice-name",
         default=None,

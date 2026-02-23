@@ -78,8 +78,8 @@ class OmniStreamingSpeechHandler:
             if config is None:
                 return  # Error already sent, connection closing
 
-            # 1b. Handle voice clone registration when voice_name + ref_audio
-            # are provided inline in the session config.
+            # 1b. Handle voice clone registration / cache lookup when
+            # voice_name is provided in session.config.
             if config.voice_name and config.ref_audio:
                 try:
                     self._speech_service.register_voice_clone(
@@ -87,10 +87,6 @@ class OmniStreamingSpeechHandler:
                         audio_data_uri=config.ref_audio,
                         ref_text=config.ref_text,
                     )
-                    # Use voice_name as the voice for generation; the serving
-                    # layer will look up the cached audio/embeddings from disk.
-                    config.voice = config.voice_name
-                    config.ref_audio = None
                     await websocket.send_json(
                         {
                             "type": "voice.registered",
@@ -102,18 +98,30 @@ class OmniStreamingSpeechHandler:
                     logger.error("Voice clone registration failed: %s", e)
                     await self._send_error(websocket, f"Voice clone registration failed: {e}")
                     return
-            elif config.voice_name and not config.ref_audio:
-                # Reuse a previously cached voice clone
+
+                # Point generation at the cached voice; the serving layer
+                # will pull ref_audio / ref_text from disk automatically.
+                config.voice = config.voice_name
+                config.task_type = "Base"
+                config.ref_audio = None
+                config.ref_text = None
+
+            elif config.voice_name:
+                # Reuse a previously cached voice clone — only voice_name
+                # is needed; no ref_audio or task_type required.
                 voice_key = config.voice_name.lower()
-                if voice_key in self._speech_service.uploaded_speakers:
-                    config.voice = config.voice_name
-                else:
+                if voice_key not in self._speech_service.uploaded_speakers:
                     await self._send_error(
                         websocket,
                         f"Voice '{config.voice_name}' not found in cache. "
                         "Provide ref_audio on first use.",
                     )
                     return
+
+                config.voice = config.voice_name
+                config.task_type = "Base"
+                config.ref_audio = None
+                config.ref_text = None
 
             # For Base/ICL voice cloning, generate the full text as a single
             # request so the reference overlap only happens once and the model
