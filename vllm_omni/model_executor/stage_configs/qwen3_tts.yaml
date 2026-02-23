@@ -4,7 +4,7 @@ stage_args:
     stage_type: llm
     runtime:
       devices: "0"
-      max_batch_size: 16
+      max_batch_size: 32
     engine_args:
       model_stage: qwen3_tts
       model_arch: Qwen3TTSTalkerForConditionalGeneration
@@ -18,9 +18,9 @@ stage_args:
       async_scheduling: false
       enable_prefix_caching: false
       engine_output_type: latent
-      gpu_memory_utilization: 0.3
+      gpu_memory_utilization: 0.45
       distributed_executor_backend: "mp"
-      max_num_batched_tokens: 4096
+      max_num_batched_tokens: 8192
       max_model_len: 4096
       custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav_async_chunk
     # Use named connector to apply runtime.connectors.extra.
@@ -39,7 +39,7 @@ stage_args:
     stage_type: llm
     runtime:
       devices: "0"
-      max_batch_size: 16
+      max_batch_size: 32
     engine_args:
       model_stage: code2wav
       model_arch: Qwen3TTSCode2Wav
@@ -53,7 +53,7 @@ stage_args:
       async_scheduling: false
       enable_prefix_caching: false
       engine_output_type: audio
-      gpu_memory_utilization: 0.2
+      gpu_memory_utilization: 0.3
       distributed_executor_backend: "mp"
       # Must be divisible by num_code_groups and cover (left_context + chunk).
       max_num_batched_tokens: 65536
@@ -78,7 +78,7 @@ runtime:
   enabled: true
   defaults:
     window_size: -1
-    max_inflight: 1
+    max_inflight: 32
 
   connectors:
     connector_of_shared_memory:

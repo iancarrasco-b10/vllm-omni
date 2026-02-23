@@ -158,6 +158,7 @@ async def stream_tts(
         sentence_count = 0
         ttfa: float | None = None
         sample_rate: int = 24000
+        interrupted = False
 
         # Accumulate all PCM chunks across all sentences into a single buffer.
         all_pcm: list[bytes] = []
@@ -204,12 +205,31 @@ async def stream_tts(
                         print(f"  ERROR: {msg['message']}")
                     else:
                         print(f"  Unknown message: {msg}")
+
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            interrupted = True
+
         finally:
             sender_task.cancel()
             try:
                 await sender_task
             except asyncio.CancelledError:
                 pass
+
+            if interrupted:
+                t_total = time.perf_counter() - t_request
+                print(f"\nInterrupted after {t_total * 1000:.0f} ms")
+                pcm_data = b"".join(all_pcm)
+                if pcm_data:
+                    _write_wav(output_file, pcm_data, sample_rate=sample_rate, channels=1)
+                    audio_duration = len(pcm_data) / (sample_rate * 2)
+                    print(f"  Saved partial audio: {output_file} "
+                          f"({len(pcm_data)} PCM bytes, {audio_duration:.2f}s)")
+                else:
+                    print("  No audio received yet.")
+                # Close the WebSocket with a normal close code so the server
+                # can detect the clean disconnect and abort the request.
+                await ws.close(code=1000, reason="Client interrupted")
 
 
 def main():
@@ -343,16 +363,19 @@ def main():
     if args.x_vector_only_mode:
         config["x_vector_only_mode"] = True
 
-    asyncio.run(
-        stream_tts(
-            url=args.url,
-            text=args.text,
-            config=config,
-            output_file=args.output,
-            simulate_stt=args.simulate_stt,
-            stt_delay=args.stt_delay,
+    try:
+        asyncio.run(
+            stream_tts(
+                url=args.url,
+                text=args.text,
+                config=config,
+                output_file=args.output,
+                simulate_stt=args.simulate_stt,
+                stt_delay=args.stt_delay,
+            )
         )
-    )
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
