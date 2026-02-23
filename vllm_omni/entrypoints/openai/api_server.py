@@ -851,7 +851,21 @@ async def list_voices(raw_request: Request):
         return base(raw_request).create_error_response(message="The model does not support Speech API")
 
     speakers = sorted(handler.supported_speakers) if handler.supported_speakers else []
-    return JSONResponse(content={"voices": speakers})
+
+    uploaded_voices = []
+    if hasattr(handler, "uploaded_speakers"):
+        for voice_name, info in handler.uploaded_speakers.items():
+            uploaded_voices.append(
+                {
+                    "name": info.get("name", voice_name),
+                    "created_at": info.get("created_at", 0),
+                    "file_size": info.get("file_size", 0),
+                    "mime_type": info.get("mime_type", ""),
+                    "cache_status": info.get("cache_status", "pending"),
+                }
+            )
+
+    return JSONResponse(content={"voices": speakers, "uploaded_voices": uploaded_voices})
 
 
 @router.websocket("/v1/audio/speech/stream")

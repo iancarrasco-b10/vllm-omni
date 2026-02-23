@@ -79,7 +79,13 @@ class AudioResponse(BaseModel):
 
 
 class StreamingSpeechSessionConfig(BaseModel):
-    """Configuration sent as the first WebSocket message for streaming TTS."""
+    """Configuration sent as the first WebSocket message for streaming TTS.
+
+    For voice cloning (task_type="Base"), you can provide ref_audio (base64
+    data URI) and ref_text inline.  When voice_name is also set, the server
+    caches the voice clone in /tmp so subsequent sessions with the same
+    voice_name skip the expensive embedding extraction.
+    """
 
     model: str | None = None
     voice: str | None = None
@@ -92,3 +98,9 @@ class StreamingSpeechSessionConfig(BaseModel):
     ref_audio: str | None = None
     ref_text: str | None = None
     x_vector_only_mode: bool | None = None
+    voice_name: str | None = Field(
+        default=None,
+        description="Name for caching the voice clone. On first use, provide "
+        "ref_audio too; subsequent sessions with the same voice_name "
+        "reuse the cached embeddings without needing ref_audio.",
+    )

@@ -1,0 +1,149 @@
+"""Metadata manager for voice samples and cache information.
+
+Provides a concurrency-safe interface for managing metadata.json with
+file-level locking for multi-process safety and thread locks for
+in-process safety.
+"""
+
+import fcntl
+import json
+import logging
+import os
+import threading
+import time
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+class MetadataManager:
+    """Manages metadata for uploaded speakers and cache information."""
+
+    def __init__(self, metadata_file: Path):
+        self.metadata_file = metadata_file
+        self._lock = threading.Lock()
+        self._metadata = self._load_from_disk()
+        self.lock_file = metadata_file.with_suffix(".lock")
+        self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+
+    def _load_from_disk(self) -> dict[str, Any]:
+        if not self.metadata_file.exists():
+            return {"uploaded_speakers": {}}
+        try:
+            with open(self.metadata_file) as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error("Failed to load metadata from %s: %s", self.metadata_file, e)
+            return {"uploaded_speakers": {}}
+
+    def _save_to_disk(self, metadata: dict[str, Any]) -> bool:
+        try:
+            self.metadata_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.metadata_file.with_suffix(".tmp")
+            with open(tmp, "w") as f:
+                json.dump(metadata, f, indent=2)
+            tmp.replace(self.metadata_file)
+            return True
+        except Exception as e:
+            logger.error("Failed to save metadata to %s: %s", self.metadata_file, e)
+            return False
+
+    def _update_with_file_lock(
+        self, update_fn: Callable[[dict[str, Any]], dict[str, Any] | None]
+    ) -> dict[str, Any] | None:
+        lock_fd = os.open(self.lock_file, os.O_CREAT | os.O_RDWR)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            metadata = self._load_from_disk()
+            result = update_fn(metadata)
+            if result is None:
+                return None
+            if not self._save_to_disk(metadata):
+                return None
+            self._metadata = metadata
+            return result
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+    def get_uploaded_speakers(self) -> dict[str, dict[str, Any]]:
+        metadata = self._load_from_disk()
+        return metadata.get("uploaded_speakers", {}).copy()
+
+    def get_speaker(self, speaker_key: str) -> dict[str, Any] | None:
+        metadata = self._load_from_disk()
+        speakers = metadata.get("uploaded_speakers", {})
+        return speakers.get(speaker_key, {}).copy() if speaker_key in speakers else None
+
+    def update_speaker(self, speaker_key: str, updates: dict[str, Any]) -> bool:
+        with self._lock:
+
+            def _update(metadata: dict[str, Any]):
+                speakers = metadata.setdefault("uploaded_speakers", {})
+                entry = speakers.get(speaker_key, {})
+                entry.update(updates)
+                speakers[speaker_key] = entry
+                return True
+
+            return self._update_with_file_lock(_update) is not None
+
+    def create_speaker(self, speaker_key: str, speaker_data: dict[str, Any]) -> bool:
+        with self._lock:
+
+            def _create(metadata: dict[str, Any]):
+                speakers = metadata.setdefault("uploaded_speakers", {})
+                if speaker_key in speakers:
+                    logger.warning("Speaker %s already exists, overwriting", speaker_key)
+                speakers[speaker_key] = speaker_data
+                return True
+
+            return self._update_with_file_lock(_create) is not None
+
+    def update_cache_info(
+        self, speaker_key: str, cache_file_path: Path, status: str = "ready", **extra: Any
+    ) -> bool:
+        updates = {
+            "cache_status": status,
+            "cache_file": str(cache_file_path),
+            "cache_generated_at": time.time(),
+            **extra,
+        }
+        return self.update_speaker(speaker_key, updates)
+
+    def delete_speaker(self, speaker_key: str) -> dict[str, Any] | None:
+        with self._lock:
+
+            def _delete(metadata: dict[str, Any]):
+                speakers = metadata.get("uploaded_speakers", {})
+                if speaker_key not in speakers:
+                    return None
+                speaker_info = speakers.pop(speaker_key)
+                self._cleanup_speaker_files(speaker_info)
+                return speaker_info
+
+            return self._update_with_file_lock(_delete)
+
+    @staticmethod
+    def _cleanup_speaker_files(speaker_info: dict[str, Any]) -> None:
+        for key in ("file_path", "cache_file"):
+            file_path_str = speaker_info.get(key)
+            if not file_path_str:
+                continue
+            try:
+                p = Path(file_path_str)
+                if p.exists():
+                    p.unlink()
+                    logger.info("Deleted %s: %s", key, p)
+            except Exception as e:
+                logger.error("Failed to delete %s %s: %s", key, file_path_str, e)
+
+    def reload_from_disk(self) -> bool:
+        with self._lock:
+            try:
+                self._metadata = self._load_from_disk()
+                return True
+            except Exception as e:
+                logger.error("Failed to reload metadata from disk: %s", e)
+                return False

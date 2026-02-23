@@ -1,7 +1,12 @@
-"""WebSocket client for streaming text-input TTS.
+"""WebSocket client for streaming text-input TTS with voice cloning support.
 
 Connects to the /v1/audio/speech/stream endpoint, sends text incrementally
 (simulating real-time STT output), and saves a single audio file per stream.
+
+Voice cloning:
+    Provide --ref-audio (local file) and optionally --ref-text to clone a
+    voice.  Set --voice-name to cache the clone server-side so subsequent
+    sessions skip the expensive embedding extraction.
 
 Usage:
     # Send full text at once
@@ -18,12 +23,19 @@ Usage:
         --task-type VoiceDesign \
         --instructions "A cheerful young female voice"
 
-    # Base task (voice cloning)
+    # Voice cloning (first time: uploads + caches)
     python streaming_speech_client.py \
         --text "Hello world. How are you?" \
         --task-type Base \
         --ref-audio /path/to/reference.wav \
-        --ref-text "Transcript of reference audio"
+        --ref-text "Transcript of the reference audio." \
+        --voice-name my_voice
+
+    # Voice cloning (subsequent: uses cached voice, no ref-audio needed)
+    python streaming_speech_client.py \
+        --text "Hello world. How are you?" \
+        --task-type Base \
+        --voice-name my_voice
 
 Requirements:
     pip install websockets
@@ -31,7 +43,9 @@ Requirements:
 
 import argparse
 import asyncio
+import base64
 import json
+import mimetypes
 import os
 import time
 import wave
@@ -52,6 +66,29 @@ def _write_wav(path: str, pcm_data: bytes, sample_rate: int, channels: int) -> N
         wf.writeframes(pcm_data)
 
 
+def _encode_audio_file(path: str) -> str:
+    """Read a local audio file and return a base64 data URI."""
+    mime_type, _ = mimetypes.guess_type(path)
+    if mime_type is None:
+        ext = os.path.splitext(path)[1].lower()
+        mime_map = {
+            ".wav": "audio/wav",
+            ".mp3": "audio/mpeg",
+            ".m4a": "audio/mp4",
+            ".flac": "audio/flac",
+            ".ogg": "audio/ogg",
+            ".aac": "audio/aac",
+            ".webm": "audio/webm",
+        }
+        mime_type = mime_map.get(ext, "audio/wav")
+
+    with open(path, "rb") as f:
+        audio_bytes = f.read()
+
+    b64 = base64.b64encode(audio_bytes).decode("utf-8")
+    return f"data:{mime_type};base64,{b64}"
+
+
 async def stream_tts(
     url: str,
     text: str,
@@ -68,7 +105,7 @@ async def stream_tts(
         config_msg = {"type": "session.config", **config}
         t_request = time.perf_counter()
         await ws.send(json.dumps(config_msg))
-        print(f"Sent session config: {config}")
+        print(f"Sent session config: { {k: (v[:60] + '...' if isinstance(v, str) and len(v) > 60 else v) for k, v in config.items()} }")
 
         # 2. Send text (either all at once or word-by-word)
         async def send_text():
@@ -124,7 +161,10 @@ async def stream_tts(
                     msg = json.loads(message)
                     msg_type = msg.get("type")
 
-                    if msg_type == "audio.start":
+                    if msg_type == "voice.registered":
+                        print(f"  Voice '{msg.get('voice_name')}' registered (cached={msg.get('cached')})")
+
+                    elif msg_type == "audio.start":
                         print(f"  [sentence {msg['sentence_index']}] Generating: {msg['sentence_text']!r}")
 
                     elif msg_type == "audio.done":
@@ -137,11 +177,14 @@ async def stream_tts(
                         t_total = time.perf_counter() - t_request
                         pcm_data = b"".join(all_pcm)
                         _write_wav(output_file, pcm_data, sample_rate=sample_rate, channels=1)
+                        audio_duration = len(pcm_data) / (sample_rate * 2) if pcm_data else 0
                         print(f"\nSession complete: {msg['total_sentences']} sentence(s) generated")
-                        print(f"  Saved {output_file} ({len(pcm_data)} PCM bytes)")
+                        print(f"  Saved {output_file} ({len(pcm_data)} PCM bytes, {audio_duration:.2f}s)")
                         if ttfa is not None:
                             print(f"  TTFA:       {ttfa * 1000:.1f} ms")
                         print(f"  Total time: {t_total * 1000:.1f} ms")
+                        if audio_duration > 0:
+                            print(f"  RTF:        {t_total / audio_duration:.2f}x")
                         break
                     elif msg_type == "error":
                         print(f"  ERROR: {msg['message']}")
@@ -193,14 +236,24 @@ def main():
     parser.add_argument("--speed", type=float, default=1.0, help="Playback speed (0.25-4.0)")
     parser.add_argument("--max-new-tokens", type=int, default=None, help="Max tokens")
 
-    # Base task options
-    parser.add_argument("--ref-audio", default=None, help="Reference audio")
-    parser.add_argument("--ref-text", default=None, help="Reference text")
+    # Voice cloning options
+    parser.add_argument(
+        "--ref-audio",
+        default=None,
+        help="Path to local reference audio file for voice cloning",
+    )
+    parser.add_argument("--ref-text", default=None, help="Transcript of reference audio (enables ICL mode)")
+    parser.add_argument(
+        "--voice-name",
+        default=None,
+        help="Name for caching the voice clone server-side. "
+        "On first use provide --ref-audio too; subsequent calls reuse the cache.",
+    )
     parser.add_argument(
         "--x-vector-only-mode",
         action="store_true",
         default=False,
-        help="Speaker embedding only mode",
+        help="Speaker embedding only mode (no ICL)",
     )
 
     # STT simulation
@@ -218,8 +271,24 @@ def main():
 
     args = parser.parse_args()
 
+    # If ref-text looks like a file path, read its contents
+    if args.ref_text and os.path.isfile(args.ref_text):
+        with open(args.ref_text) as f:
+            args.ref_text = f.read().strip()
+        print(f"Read ref_text from file: {args.ref_text[:80]}{'...' if len(args.ref_text) > 80 else ''}")
+
+    # Encode local reference audio as base64 data URI
+    ref_audio_data_uri = None
+    if args.ref_audio:
+        if not os.path.isfile(args.ref_audio):
+            print(f"Error: reference audio file not found: {args.ref_audio}")
+            raise SystemExit(1)
+        ref_audio_data_uri = _encode_audio_file(args.ref_audio)
+        size_kb = os.path.getsize(args.ref_audio) / 1024
+        print(f"Encoded reference audio: {args.ref_audio} ({size_kb:.1f} KB)")
+
     # Build session config (only include non-None values)
-    config = {}
+    config: dict = {}
     for key in [
         "model",
         "voice",
@@ -229,12 +298,16 @@ def main():
         "response_format",
         "speed",
         "max_new_tokens",
-        "ref_audio",
         "ref_text",
+        "voice_name",
     ]:
         val = getattr(args, key.replace("-", "_"), None)
         if val is not None:
             config[key] = val
+
+    if ref_audio_data_uri is not None:
+        config["ref_audio"] = ref_audio_data_uri
+
     if args.x_vector_only_mode:
         config["x_vector_only_mode"] = True
 

@@ -3,6 +3,13 @@
 Accepts text incrementally via WebSocket, buffers and splits at sentence
 boundaries, and generates audio per sentence using the existing TTS pipeline.
 
+Voice cloning:
+    The session.config message supports inline voice cloning.  Provide
+    ``task_type: "Base"`` with ``ref_audio`` (base64 data URI) and
+    optionally ``ref_text`` (transcript).  Set ``voice_name`` to cache
+    the voice clone in /tmp so subsequent sessions with the same name
+    skip the expensive embedding extraction.
+
 Protocol:
     Client -> Server:
         {"type": "session.config", ...}   # Session config (sent once first)
@@ -71,8 +78,51 @@ class OmniStreamingSpeechHandler:
             if config is None:
                 return  # Error already sent, connection closing
 
+            # 1b. Handle voice clone registration when voice_name + ref_audio
+            # are provided inline in the session config.
+            if config.voice_name and config.ref_audio:
+                try:
+                    self._speech_service.register_voice_clone(
+                        voice_name=config.voice_name,
+                        audio_data_uri=config.ref_audio,
+                        ref_text=config.ref_text,
+                    )
+                    # Use voice_name as the voice for generation; the serving
+                    # layer will look up the cached audio/embeddings from disk.
+                    config.voice = config.voice_name
+                    config.ref_audio = None
+                    await websocket.send_json(
+                        {
+                            "type": "voice.registered",
+                            "voice_name": config.voice_name,
+                            "cached": True,
+                        }
+                    )
+                except Exception as e:
+                    logger.error("Voice clone registration failed: %s", e)
+                    await self._send_error(websocket, f"Voice clone registration failed: {e}")
+                    return
+            elif config.voice_name and not config.ref_audio:
+                # Reuse a previously cached voice clone
+                voice_key = config.voice_name.lower()
+                if voice_key in self._speech_service.uploaded_speakers:
+                    config.voice = config.voice_name
+                else:
+                    await self._send_error(
+                        websocket,
+                        f"Voice '{config.voice_name}' not found in cache. "
+                        "Provide ref_audio on first use.",
+                    )
+                    return
+
+            # For Base/ICL voice cloning, generate the full text as a single
+            # request so the reference overlap only happens once and the model
+            # produces natural prosody across sentence boundaries.
+            icl_mode = (config.task_type or "").lower() == "base"
+
             splitter = SentenceSplitter()
             sentence_index = 0
+            text_buffer: list[str] = []
 
             # 2. Receive text chunks until input.done
             while True:
@@ -95,19 +145,26 @@ class OmniStreamingSpeechHandler:
 
                 if msg_type == "input.text":
                     text = msg.get("text", "")
-                    sentences = splitter.add_text(text)
-                    for sentence in sentences:
-                        await self._generate_and_send(websocket, config, sentence, sentence_index)
-                        sentence_index += 1
+                    if icl_mode:
+                        text_buffer.append(text)
+                    else:
+                        sentences = splitter.add_text(text)
+                        for sentence in sentences:
+                            await self._generate_and_send(websocket, config, sentence, sentence_index)
+                            sentence_index += 1
 
                 elif msg_type == "input.done":
-                    # Flush remaining buffer
-                    remaining = splitter.flush()
-                    if remaining:
-                        await self._generate_and_send(websocket, config, remaining, sentence_index)
-                        sentence_index += 1
+                    if icl_mode:
+                        full_text = "".join(text_buffer).strip()
+                        if full_text:
+                            await self._generate_and_send(websocket, config, full_text, sentence_index)
+                            sentence_index += 1
+                    else:
+                        remaining = splitter.flush()
+                        if remaining:
+                            await self._generate_and_send(websocket, config, remaining, sentence_index)
+                            sentence_index += 1
 
-                    # Send session.done
                     await websocket.send_json(
                         {
                             "type": "session.done",
