@@ -774,6 +774,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     ref_code_len = estimate_ref_code_len(info.get("ref_audio"))
 
                 if ref_code_len is None:
+                    cached_len = _first(info.get("_cached_ref_code_len"), None)
+                    if isinstance(cached_len, (int, float)):
+                        ref_code_len = int(cached_len)
+
+                if ref_code_len is None:
                     raise ValueError(
                         "Base in-context voice cloning requires either `voice_clone_prompt.ref_code` "
                         "or a readable `ref_audio` that can be mapped to a codec frame length."

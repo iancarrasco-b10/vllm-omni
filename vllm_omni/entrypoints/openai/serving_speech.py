@@ -288,12 +288,30 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             hf_config = self.engine_client.model_config.hf_config
             talker_config = hf_config.talker_config
             task_type = (tts_params.get("task_type") or ["CustomVoice"])[0]
+
+            codec_fps = getattr(hf_config, "codec_frame_rate_hz", None)
+            if codec_fps is None:
+                codec_fps = float(getattr(talker_config, "position_id_per_seconds", 12))
+
+            def _estimate_ref_code_len(ref_audio_raw: object) -> int | None:
+                """Derive codec frame count from resolved [wav_samples, sr] pairs."""
+                if not isinstance(ref_audio_raw, list) or not ref_audio_raw:
+                    return None
+                item = ref_audio_raw[0]
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    wav, sr = item
+                    n_samples = len(wav) if isinstance(wav, (list, np.ndarray)) else 0
+                    if n_samples > 0 and sr > 0:
+                        return int(n_samples / sr * codec_fps)
+                return None
+
             return Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
                 additional_information=tts_params,
                 task_type=task_type,
                 tokenize_prompt=lambda t: self._tts_tokenizer(t, padding=False)["input_ids"],
                 codec_language_id=getattr(talker_config, "codec_language_id", None),
                 spk_is_dialect=getattr(talker_config, "spk_is_dialect", None),
+                estimate_ref_code_len=_estimate_ref_code_len,
             )
         except Exception as e:
             logger.warning("Failed to estimate TTS prompt length, using fallback 2048: %s", e)
