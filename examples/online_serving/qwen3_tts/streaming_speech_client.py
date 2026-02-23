@@ -221,7 +221,7 @@ def main():
     )
     parser.add_argument(
         "--text",
-        required=True,
+        required=False,
         help="Text to synthesize",
     )
     parser.add_argument(
