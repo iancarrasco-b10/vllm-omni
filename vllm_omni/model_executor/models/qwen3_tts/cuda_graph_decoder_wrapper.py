@@ -3,9 +3,10 @@
 """
 CUDA Graph wrapper for Qwen3TTSTokenizerV2Decoder.
 
-Captures the decoder forward pass at fine-grained exact sizes (T=1..50)
-for streaming and coarser bucket sizes for larger inputs.  Graph replay
-eliminates kernel-launch overhead during inference.
+Captures the decoder forward pass at fine-grained exact sizes for streaming
+and coarser bucket sizes for larger inputs.  Graph replay eliminates
+kernel-launch overhead during inference.  Default exact range covers
+chunk_frames=5 + left_context=25 with headroom (T=1..35).
 
 Inspired by https://github.com/tsdocode/nano-qwen3tts-vllm which captures
 one graph per exact decode length for zero-padding-overhead streaming.
@@ -20,15 +21,27 @@ logger = init_logger(__name__)
 
 _STATS_LOG_INTERVAL = 20  # log a summary every N decode calls
 
-_DEFAULT_EXACT_SIZES = list(range(1, 51))
-_DEFAULT_BUCKET_SIZES = [64, 100, 150, 200, 250, 300, 400, 500]
+_DEFAULT_EXACT_SIZES = list(range(1, 36))
+_DEFAULT_BUCKET_SIZES = [48, 64, 100, 150, 200, 250, 300, 400, 500]
+
+
+def compute_exact_sizes(chunk_frames: int, left_context_frames: int) -> list[int]:
+    """Derive exact CUDA graph capture sizes from the streaming config.
+
+    Covers all decode sizes the stage input processor will produce:
+    chunk 1 = chunk_frames, then grows by chunk_frames each step up to
+    left_context_frames + chunk_frames.  A small headroom is added.
+    """
+    max_decode = left_context_frames + chunk_frames
+    headroom = max(5, chunk_frames)
+    return list(range(1, max_decode + headroom + 1))
 
 
 class CUDAGraphDecoderWrapper:
     """CUDA Graph wrapper with fine-grained exact-match and bucket-padded decode.
 
     For streaming TTS the decoder is called repeatedly with small, predictable
-    input sizes (e.g. 10, 20, 30, 35 frames).  Capturing a graph for each
+    input sizes (e.g. 5, 10, 15, 20, 25, 30 frames).  Capturing a graph for each
     exact size lets us replay without any zero-padding overhead.  Larger inputs
     fall back to the smallest captured bucket that fits, with padding.
 

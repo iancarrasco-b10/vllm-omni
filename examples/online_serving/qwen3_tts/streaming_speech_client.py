@@ -272,7 +272,9 @@ def main():
         "--x-vector-only-mode",
         action="store_true",
         default=False,
-        help="Speaker embedding only mode (no ICL)",
+        help="Speaker embedding only mode (no ICL). Enables per-sentence "
+        "streaming for cached voices, giving much lower TTFA at the cost "
+        "of slightly reduced voice similarity.",
     )
     parser.add_argument(
         "--delete-voice",

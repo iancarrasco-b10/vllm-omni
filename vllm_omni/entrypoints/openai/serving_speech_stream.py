@@ -10,6 +10,12 @@ Voice cloning:
     the voice clone in /tmp so subsequent sessions with the same name
     skip the expensive embedding extraction.
 
+    When ``ref_text`` is provided, text is buffered and generated as a
+    single request using in-context learning (ICL) for higher voice
+    fidelity.  Set ``x_vector_only_mode: true`` to skip ICL and enable
+    per-sentence streaming, which gives much lower TTFA at the cost of
+    slightly reduced voice similarity.
+
 Protocol:
     Client -> Server:
         {"type": "session.config", ...}   # Session config (sent once first)
@@ -126,10 +132,21 @@ class OmniStreamingSpeechHandler:
                 config.ref_audio = None
                 config.ref_text = None
 
-            # For Base/ICL voice cloning, generate the full text as a single
-            # request so the reference overlap only happens once and the model
-            # produces natural prosody across sentence boundaries.
-            icl_mode = (config.task_type or "").lower() == "base"
+            # Determine text buffering strategy.
+            # ICL mode interleaves ref_code with text in the prompt, so it
+            # requires all text upfront.  x_vector_only mode only uses the
+            # speaker embedding (like CustomVoice) and can generate sentences
+            # independently — enabling per-sentence streaming with lower TTFA.
+            icl_mode = False
+            if (config.task_type or "").lower() == "base":
+                if config.x_vector_only_mode:
+                    icl_mode = False
+                elif config.voice_name:
+                    voice_key = config.voice_name.lower()
+                    speaker_info = self._speech_service.uploaded_speakers.get(voice_key, {})
+                    icl_mode = bool(speaker_info.get("ref_text"))
+                else:
+                    icl_mode = config.ref_text is not None
 
             splitter = SentenceSplitter()
             sentence_index = 0

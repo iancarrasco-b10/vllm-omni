@@ -83,7 +83,7 @@ runtime:
         shm_threshold_bytes: 65536
         # Qwen3-TTS codec streaming (frame-aligned tokenized transport).
         codec_streaming: true
-        codec_chunk_frames: 10
+        codec_chunk_frames: 5
         codec_left_context_frames: 25
 
   edges:

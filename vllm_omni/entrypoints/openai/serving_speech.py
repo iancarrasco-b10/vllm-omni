@@ -515,7 +515,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 cache_ready = speaker_info.get("cache_status") == "ready"
 
                 stored_ref_text = speaker_info.get("ref_text")
-                if stored_ref_text and request.ref_text is None:
+                if request.x_vector_only_mode is True:
+                    params["x_vector_only_mode"] = [True]
+                elif stored_ref_text and request.ref_text is None:
                     params["ref_text"] = [stored_ref_text]
                     params["x_vector_only_mode"] = [False]
                 else:

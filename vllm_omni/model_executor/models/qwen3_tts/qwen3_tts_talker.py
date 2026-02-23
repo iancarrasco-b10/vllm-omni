@@ -1362,7 +1362,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                         voice_clone_prompt = cached
                         logger.info("[Base prefill] loaded voice cache for '%s'", speaker_name)
 
-            if voice_clone_prompt is not None and "icl_mode" in voice_clone_prompt:
+            # The cached voice_clone_prompt may store an icl_mode flag from
+            # when the voice was first registered.  Only use it as a fallback;
+            # an explicit x_vector_only_mode on the request takes precedence
+            # so callers can opt out of ICL for lower TTFA.
+            explicit_xvec = (info_dict.get("x_vector_only_mode") or [None])[0]
+            if voice_clone_prompt is not None and "icl_mode" in voice_clone_prompt and explicit_xvec is None:
                 icl_flag = _as_singleton(voice_clone_prompt.get("icl_mode"))
                 if isinstance(icl_flag, bool):
                     in_context_mode = icl_flag
