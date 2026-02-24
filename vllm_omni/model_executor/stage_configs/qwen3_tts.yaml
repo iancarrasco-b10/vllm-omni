@@ -18,10 +18,10 @@ stage_args:
       async_scheduling: false
       enable_prefix_caching: false
       engine_output_type: latent
-      gpu_memory_utilization: 0.45
+      gpu_memory_utilization: 0.7
       distributed_executor_backend: "mp"
       max_num_batched_tokens: 8192
-      max_model_len: 4096
+      max_model_len: 2048
       custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav_async_chunk
     # Use named connector to apply runtime.connectors.extra.
     output_connectors:
@@ -53,7 +53,7 @@ stage_args:
       async_scheduling: false
       enable_prefix_caching: false
       engine_output_type: audio
-      gpu_memory_utilization: 0.3
+      gpu_memory_utilization: 0.2
       distributed_executor_backend: "mp"
       # Must be divisible by num_code_groups and cover (left_context + chunk).
       max_num_batched_tokens: 65536
@@ -91,9 +91,9 @@ runtime:
         connector_get_sleep_s: 0.001
         connector_get_max_wait_first_chunk: 3000
         connector_get_max_wait: 300
-        # Smaller chunks → lower TTFA; first audio emits after just 5 codec
-        # frames (~417ms at 12Hz) instead of 10 (~833ms).
-        codec_chunk_frames: 5
+        # Emit audio after every single codec frame (~83ms at 12Hz) for
+        # the lowest possible TTFA.
+        codec_chunk_frames: 1
         codec_left_context_frames: 25
 
   edges:

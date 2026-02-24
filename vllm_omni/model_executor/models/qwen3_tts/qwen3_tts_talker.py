@@ -4,6 +4,7 @@ import base64
 import dataclasses
 import io
 import os
+from pathlib import Path
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
@@ -796,7 +797,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     # text_embed = ref_ids + text_ids + eos.
                     ref_ids = _first(info.get("ref_ids"), None)
                     if isinstance(voice_clone_prompt, dict) and ref_ids is None:
-                        ref_ids = _first(voice_clone_prompt.get("ref_ids") or voice_clone_prompt.get("ref_id"), None)
+                        _cached_ref = voice_clone_prompt.get("ref_ids")
+                        if _cached_ref is None:
+                            _cached_ref = voice_clone_prompt.get("ref_id")
+                        ref_ids = _first(_cached_ref, None)
 
                     if ref_ids is None:
                         ref_text = _first(info.get("ref_text"), "")
@@ -959,8 +963,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                                 return
                     except Exception:
                         pass
-                wav_obj = obj.get("array") or obj.get("wav") or obj.get("audio")
-                sr_obj = obj.get("sampling_rate") or obj.get("sr") or obj.get("sample_rate")
+                wav_obj = next((v for k in ("array", "wav", "audio") if (v := obj.get(k)) is not None), None)
+                sr_obj = next((v for k in ("sampling_rate", "sr", "sample_rate") if (v := obj.get(k)) is not None), None)
                 if wav_obj is not None:
                     _scan(wav_obj, depth + 1)
                 if sr_obj is not None:
@@ -1154,13 +1158,30 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             logger.info("[Voice GPU cache] pre-populated '%s' after save", speaker_name)
 
     def _load_voice_cache(self, speaker_name: str) -> dict[str, Any] | None:
-        """Load pre-computed voice clone prompt, with GPU-resident LRU cache."""
+        """Load pre-computed voice clone prompt, with GPU-resident LRU cache.
+
+        Validates that cached embedding dimensions match the current model's
+        hidden size.  A mismatch (e.g. cache created by a 1.7B model loaded
+        into a 0.6B model) is treated as a cache miss and the stale
+        safetensors file is deleted so it can be re-generated.
+        """
         key = speaker_name.lower()
+        expected_dim = int(self.talker_config.hidden_size)
 
         # Fast path: already on GPU
         if key in self._voice_gpu_cache:
+            entry = self._voice_gpu_cache[key]
+            spk = entry.get("ref_spk_embedding")
+            if isinstance(spk, torch.Tensor) and spk.numel() > 0 and spk.shape[-1] != expected_dim:
+                logger.warning(
+                    "[Voice GPU cache] stale entry for '%s': embedding dim %d != model dim %d, evicting",
+                    speaker_name, spk.shape[-1], expected_dim,
+                )
+                del self._voice_gpu_cache[key]
+                self._invalidate_voice_cache_on_disk(speaker_name)
+                return None
             self._voice_gpu_cache.move_to_end(key)
-            return self._voice_gpu_cache[key]
+            return entry
 
         # Cold path: load from safetensors on disk
         if self._voice_cache_manager is None:
@@ -1169,6 +1190,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         if not items:
             return None
         item = items[0]
+
+        if item.ref_spk_embedding.numel() > 0 and item.ref_spk_embedding.shape[-1] != expected_dim:
+            logger.warning(
+                "[Voice cache] stale cache for '%s': embedding dim %d != model dim %d, invalidating",
+                speaker_name, item.ref_spk_embedding.shape[-1], expected_dim,
+            )
+            self._invalidate_voice_cache_on_disk(speaker_name)
+            return None
 
         dev = next(self.parameters()).device
         entry: dict[str, Any] = {
@@ -1190,6 +1219,29 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         logger.info("[Voice GPU cache] loaded '%s' to %s (%d/%d)",
                      speaker_name, dev, len(self._voice_gpu_cache), self._voice_gpu_cache_max)
         return entry
+
+    def _invalidate_voice_cache_on_disk(self, speaker_name: str) -> None:
+        """Delete a stale safetensors cache and reset metadata to 'pending'."""
+        if self._voice_cache_manager is None:
+            self._voice_cache_manager = VoiceCacheManager()
+        try:
+            audio_path = self._voice_cache_manager.get_speaker_audio_path(speaker_name)
+            if audio_path is not None:
+                cache_file = audio_path.with_suffix(".safetensors")
+                if cache_file.exists():
+                    cache_file.unlink()
+                    logger.info("[Voice cache] deleted stale cache file: %s", cache_file)
+            self._voice_cache_manager.update_metadata_cache_info(
+                speaker_name, Path(""), status="pending",
+            )
+        except Exception as e:
+            logger.warning("[Voice cache] failed to invalidate cache for '%s': %s", speaker_name, e)
+
+    def _get_speaker_audio_path(self, speaker_name: str) -> Path | None:
+        """Return the raw audio file for a speaker, if it exists on disk."""
+        if self._voice_cache_manager is None:
+            self._voice_cache_manager = VoiceCacheManager()
+        return self._voice_cache_manager.get_speaker_audio_path(speaker_name)
 
     def _ensure_speech_tokenizer_loaded(self) -> Qwen3TTSTokenizer:
         if self._speech_tokenizer is not None:
@@ -1423,6 +1475,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     if cached is not None:
                         voice_clone_prompt = cached
                         logger.info("[Base prefill] loaded voice cache for '%s'", speaker_name)
+                    else:
+                        audio_path = self._get_speaker_audio_path(speaker_name)
+                        if audio_path is not None:
+                            info_dict["ref_audio"] = [str(audio_path)]
+                            logger.info(
+                                "[Base prefill] cache miss for '%s', falling back to raw audio: %s",
+                                speaker_name, audio_path,
+                            )
 
             # The cached voice_clone_prompt may store an icl_mode flag from
             # when the voice was first registered.  Only use it as a fallback;
@@ -1494,9 +1554,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 # Prefer explicit tokenized `ref_ids` if provided (matches official signature).
                 ref_ids = _to_long_tensor(info_dict.get("ref_ids"), device=input_ids.device)
                 if ref_ids is None and voice_clone_prompt is not None:
-                    ref_ids = _to_long_tensor(
-                        voice_clone_prompt.get("ref_ids") or voice_clone_prompt.get("ref_id"), device=input_ids.device
-                    )
+                    _cached_ref = voice_clone_prompt.get("ref_ids")
+                    if _cached_ref is None:
+                        _cached_ref = voice_clone_prompt.get("ref_id")
+                    ref_ids = _to_long_tensor(_cached_ref, device=input_ids.device)
                 if ref_ids is None:
                     ref_text = _as_singleton(info_dict.get("ref_text"))
                     if not isinstance(ref_text, str) or not ref_text.strip():

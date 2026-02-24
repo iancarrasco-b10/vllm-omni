@@ -6,7 +6,7 @@ CUDA Graph wrapper for Qwen3TTSTokenizerV2Decoder.
 Captures the decoder forward pass at fine-grained exact sizes for streaming
 and coarser bucket sizes for larger inputs.  Graph replay eliminates
 kernel-launch overhead during inference.  Default exact range covers
-chunk_frames=5 + left_context=25 with headroom (T=1..35).
+chunk_frames=1 + left_context=15 with headroom (T=1..21).
 
 Inspired by https://github.com/tsdocode/nano-qwen3tts-vllm which captures
 one graph per exact decode length for zero-padding-overhead streaming.
@@ -41,7 +41,7 @@ class CUDAGraphDecoderWrapper:
     """CUDA Graph wrapper with fine-grained exact-match and bucket-padded decode.
 
     For streaming TTS the decoder is called repeatedly with small, predictable
-    input sizes (e.g. 5, 10, 15, 20, 25, 30 frames).  Capturing a graph for each
+    input sizes (e.g. 1, 2, 3, ... 16 frames).  Capturing a graph for each
     exact size lets us replay without any zero-padding overhead.  Larger inputs
     fall back to the smallest captured bucket that fits, with padding.
 

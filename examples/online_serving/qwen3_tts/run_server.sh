@@ -19,7 +19,7 @@ case "$TASK_TYPE" in
         MODEL="Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
         ;;
     Base)
-        MODEL="Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+        MODEL="Qwen/Qwen3-TTS-12Hz-0.6B-Base"
         ;;
     *)
         echo "Unknown task type: $TASK_TYPE"
