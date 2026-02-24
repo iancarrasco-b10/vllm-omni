@@ -31,6 +31,9 @@ class OmniTransferAdapterBase:
         # Requests that have successfully saved data
         self._finished_save_reqs = set()
 
+        # Requests that have been aborted — skip in recv_loop.
+        self._aborted_reqs: set[str] = set()
+
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
 
@@ -47,11 +50,15 @@ class OmniTransferAdapterBase:
     def recv_loop(self):
         """Loop to poll for incoming data."""
         while not self.stop_event.is_set():
-            # Iterate over a snapshot of pending requests
             with self.lock:
-                pending_reqs_ids = list(self._pending_load_reqs.keys())
+                pending_reqs_ids = [
+                    rid for rid in self._pending_load_reqs
+                    if rid not in self._aborted_reqs
+                ]
 
             for req_id in pending_reqs_ids:
+                if req_id in self._aborted_reqs:
+                    continue
                 try:
                     self._poll_single_request(req_id)
                 except Exception as e:
@@ -105,6 +112,17 @@ class OmniTransferAdapterBase:
     def save(self, *args, **kwargs):
         """Save data to connector synchronously. To be implemented by subclasses."""
         raise NotImplementedError
+
+    def abort_request(self, request_id: str) -> None:
+        """Abort a pending request so recv_loop stops polling for it.
+
+        This prevents the SHM connector from blocking for 3+ seconds
+        trying to read a shared-memory segment that will never arrive.
+        """
+        with self.lock:
+            self._aborted_reqs.add(request_id)
+            self._pending_load_reqs.pop(request_id, None)
+            self._pending_save_reqs.pop(request_id, None)
 
     def get_finished_requests(self):
         """Get finished loaded or saved requests"""

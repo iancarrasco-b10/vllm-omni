@@ -1,5 +1,6 @@
 import time
 from collections import defaultdict
+from collections.abc import Iterable as IterableABC
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_events import KVEventBatch
@@ -29,6 +30,23 @@ class OmniGenerationScheduler(VLLMScheduler):
         self.chunk_transfer_adapter = None
         if getattr(model_config, "async_chunk", False):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
+
+    def finish_requests(
+        self,
+        request_ids: str | IterableABC[str],
+        finished_status: RequestStatus,
+    ) -> None:
+        """Extends the base scheduler to also abort chunk adapter polling."""
+        if isinstance(request_ids, str):
+            ids = [request_ids]
+        else:
+            ids = list(request_ids)
+
+        if self.chunk_transfer_adapter and RequestStatus.is_finished(finished_status):
+            for rid in ids:
+                self.chunk_transfer_adapter.abort_request(rid)
+
+        super().finish_requests(ids, finished_status)
 
     def schedule(self) -> SchedulerOutput:
         """Diffusion fast path:

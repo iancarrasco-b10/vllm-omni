@@ -272,6 +272,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def _estimate_prompt_len(self, tts_params: dict[str, Any]) -> int:
         """Estimate prompt length so the placeholder matches model-side embeddings."""
         try:
+            task_type = (tts_params.get("task_type") or ["CustomVoice"])[0]
+            hf_config = self.engine_client.model_config.hf_config
+            talker_config = hf_config.talker_config
+
+            # Fast path for streaming Base tasks with a warm cache.
+            # The streaming formula doesn't depend on tokenized text length,
+            # so we can skip the tokenizer entirely (~2-5 ms saved per request).
+            cached_ref_code_len = (tts_params.get("_cached_ref_code_len") or [None])[0]
+            if task_type == "Base" and isinstance(cached_ref_code_len, (int, float)):
+                return self._fast_estimate_base_streaming(
+                    tts_params, int(cached_ref_code_len), hf_config, talker_config
+                )
+
             from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
                 Qwen3TTSTalkerForConditionalGeneration,
             )
@@ -285,9 +298,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     trust_remote_code=True,
                     padding_side="left",
                 )
-            hf_config = self.engine_client.model_config.hf_config
-            talker_config = hf_config.talker_config
-            task_type = (tts_params.get("task_type") or ["CustomVoice"])[0]
 
             codec_fps = getattr(hf_config, "codec_frame_rate_hz", None)
             if codec_fps is None:
@@ -316,6 +326,56 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except Exception as e:
             logger.warning("Failed to estimate TTS prompt length, using fallback 2048: %s", e)
             return 2048
+
+    def _fast_estimate_base_streaming(
+        self,
+        tts_params: dict[str, Any],
+        ref_code_len: int,
+        hf_config: Any,
+        talker_config: Any,
+    ) -> int:
+        """Tokenizer-free prompt length for streaming Base tasks with warm cache.
+
+        For streaming (non_streaming_mode=False), the prompt is:
+            role(3) + codec_prefix + {codec_lens if ICL else 1}
+        None of these depend on the tokenized text, so we skip the tokenizer.
+        """
+        language = (tts_params.get("language") or ["Auto"])[0]
+        if not isinstance(language, str):
+            language = "Auto"
+
+        codec_language_id = getattr(talker_config, "codec_language_id", None)
+        spk_is_dialect = getattr(talker_config, "spk_is_dialect", None)
+        speaker = (tts_params.get("speaker") or [""])[0]
+
+        language_id = None
+        if language.lower() != "auto" and codec_language_id:
+            language_id = codec_language_id.get(language.lower())
+        if (
+            language_id is None
+            and codec_language_id
+            and spk_is_dialect
+            and isinstance(language, str)
+            and language.lower() in ("chinese", "auto")
+            and isinstance(speaker, str)
+            and speaker.strip()
+        ):
+            dialect = spk_is_dialect.get(speaker.lower())
+            if isinstance(dialect, str) and dialect:
+                language_id = codec_language_id.get(dialect)
+
+        prefill_len = 3 if language_id is None else 4
+        codec_prefix_len = prefill_len + 1 + 2 - 1  # +speaker +[pad,bos] -1
+
+        xvec_only = bool((tts_params.get("x_vector_only_mode") or [False])[0])
+        role_len = 3
+        if xvec_only:
+            prompt_len = role_len + codec_prefix_len + 1
+        else:
+            codec_lens = 1 + ref_code_len
+            prompt_len = role_len + codec_prefix_len + codec_lens
+
+        return max(2, int(prompt_len))
 
     def _is_tts_model(self) -> bool:
         """Check if the current model is a supported TTS model."""
@@ -693,6 +753,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         frame can be sent after just the first codec chunk rather than waiting
         for the entire sentence to be generated.
 
+        The engine generator is explicitly closed in a finally block so that
+        ``GeneratorExit`` propagates into ``async_omni.generate()``, which
+        calls ``abort()`` on all pipeline stages.  Without this, a client
+        disconnect can leave Stage-1 stuck in an SHM retry loop.
+
         Raises:
             ValueError: If validation fails.
         """
@@ -702,21 +767,24 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         generator = await self._prepare_tts_generator(request)
         speed = request.speed or 1.0
 
-        async for res in generator:
-            audio_chunk = self._extract_audio_from_output(res)
-            if audio_chunk is None:
-                continue
-            audio_tensor, sample_rate = audio_chunk
-            audio_obj = CreateAudio(
-                audio_tensor=audio_tensor,
-                sample_rate=int(sample_rate),
-                response_format="pcm",
-                speed=speed,
-                stream_format="audio",
-                base64_encode=False,
-            )
-            audio_response: AudioResponse = self.create_audio(audio_obj)
-            yield audio_response.audio_data, int(sample_rate)
+        try:
+            async for res in generator:
+                audio_chunk = self._extract_audio_from_output(res)
+                if audio_chunk is None:
+                    continue
+                audio_tensor, sample_rate = audio_chunk
+                audio_obj = CreateAudio(
+                    audio_tensor=audio_tensor,
+                    sample_rate=int(sample_rate),
+                    response_format="pcm",
+                    speed=speed,
+                    stream_format="audio",
+                    base64_encode=False,
+                )
+                audio_response: AudioResponse = self.create_audio(audio_obj)
+                yield audio_response.audio_data, int(sample_rate)
+        finally:
+            await generator.aclose()
 
     async def create_speech(
         self,
@@ -770,21 +838,24 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 media_type = media_type_map.get(response_format, "audio/wav")
 
                 async def audio_stream_generator():
-                    async for res in generator:
-                        audio_chunk = self._extract_audio_from_output(res)
-                        if audio_chunk is None:
-                            continue
-                        audio_tensor, sample_rate = audio_chunk
-                        audio_obj = CreateAudio(
-                            audio_tensor=audio_tensor,
-                            sample_rate=int(sample_rate),
-                            response_format=response_format,
-                            speed=speed,
-                            stream_format=request.stream_format,
-                            base64_encode=False,
-                        )
-                        audio_response: AudioResponse = self.create_audio(audio_obj)
-                        yield audio_response.audio_data
+                    try:
+                        async for res in generator:
+                            audio_chunk = self._extract_audio_from_output(res)
+                            if audio_chunk is None:
+                                continue
+                            audio_tensor, sample_rate = audio_chunk
+                            audio_obj = CreateAudio(
+                                audio_tensor=audio_tensor,
+                                sample_rate=int(sample_rate),
+                                response_format=response_format,
+                                speed=speed,
+                                stream_format=request.stream_format,
+                                base64_encode=False,
+                            )
+                            audio_response: AudioResponse = self.create_audio(audio_obj)
+                            yield audio_response.audio_data
+                    finally:
+                        await generator.aclose()
 
                 return StreamingResponse(
                     audio_stream_generator(),

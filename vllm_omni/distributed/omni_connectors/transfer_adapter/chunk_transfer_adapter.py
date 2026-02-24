@@ -76,6 +76,27 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
         return OmniConnectorFactory.create_connector(connector_specs)
 
+    def abort_request(self, request_id: str) -> None:
+        """Abort a pending request: stop polling SHM and clean up state."""
+        super().abort_request(request_id)
+        self.finished_requests.add(request_id)
+        self.get_req_chunk.pop(request_id, None)
+        self.put_req_chunk.pop(request_id, None)
+        self.request_payload.pop(request_id, None)
+        self.request_ids_mapping.pop(request_id, None)
+        # Remove from waiting-for-chunk queues so the scheduler doesn't
+        # keep trying to restore them.
+        self.waiting_for_chunk_waiting_requests = deque(
+            r for r in self.waiting_for_chunk_waiting_requests
+            if r.request_id != request_id
+        )
+        self.waiting_for_chunk_running_requests = deque(
+            r for r in self.waiting_for_chunk_running_requests
+            if r.request_id != request_id
+        )
+        self.requests_with_ready_chunks.discard(request_id)
+        logger.info(f"[Stage-{self.connector.stage_id}] Aborted request {request_id} in chunk adapter")
+
     def load_async(self, request: Request):
         """Register a request for asynchronous chunk retrieval.
 
@@ -148,13 +169,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self._pending_save_reqs[request_id].append(task)
 
     def _poll_single_request(self, req_id: str):
+        if req_id in self._aborted_reqs:
+            return
         stage_id = self.connector.stage_id
         target_stage_id = stage_id - 1
         chunk_id = self.get_req_chunk[req_id]
         external_req_id = self.request_ids_mapping.get(req_id, req_id)
         connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
 
-        # Use timeout=0 for non-blocking poll
         result = self.connector.get(
             str(target_stage_id),
             str(stage_id),

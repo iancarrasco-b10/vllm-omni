@@ -35,6 +35,7 @@ class VoiceClonePromptItem:
     x_vector_only_mode: bool
     icl_mode: bool
     ref_text: str | None = None
+    ref_ids: torch.Tensor | None = None  # pre-tokenized ref_text (1, L)
 
 
 class VoiceCacheManager:
@@ -105,6 +106,8 @@ class VoiceCacheManager:
                 tensors[prefix + "icl_mode"] = torch.tensor(int(item.icl_mode), dtype=torch.int8)
                 if item.ref_text is not None:
                     metadata[prefix + "ref_text"] = item.ref_text
+                if item.ref_ids is not None:
+                    tensors[prefix + "ref_ids"] = item.ref_ids.detach().cpu().contiguous()
 
             save_file(tensors, str(cache_file_path), metadata=metadata)
 
@@ -168,6 +171,13 @@ class VoiceCacheManager:
                     icl_mode = bool(f.get_tensor(prefix + "icl_mode").item())
                     ref_text = meta.get(prefix + "ref_text")
 
+                    ref_ids = None
+                    ref_ids_key = prefix + "ref_ids"
+                    try:
+                        ref_ids = f.get_tensor(ref_ids_key).to(device)
+                    except Exception:
+                        pass
+
                     result.append(
                         VoiceClonePromptItem(
                             ref_code=ref_code,
@@ -175,6 +185,7 @@ class VoiceCacheManager:
                             x_vector_only_mode=x_vector_only_mode,
                             icl_mode=icl_mode,
                             ref_text=ref_text,
+                            ref_ids=ref_ids,
                         )
                     )
 

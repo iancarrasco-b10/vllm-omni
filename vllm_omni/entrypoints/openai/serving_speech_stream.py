@@ -208,13 +208,16 @@ class OmniStreamingSpeechHandler:
                     )
 
         except WebSocketDisconnect:
-            logger.info("Streaming speech: client disconnected")
+            logger.info("Streaming speech: client disconnected — in-flight requests aborted")
         except Exception as e:
-            logger.exception("Streaming speech session error: %s", e)
-            try:
-                await self._send_error(websocket, f"Internal error: {e}")
-            except Exception:
-                pass
+            if "close message has been sent" in str(e):
+                logger.info("Streaming speech: client disconnected (close already sent)")
+            else:
+                logger.exception("Streaming speech session error: %s", e)
+                try:
+                    await self._send_error(websocket, f"Internal error: {e}")
+                except Exception:
+                    pass
 
     async def _receive_config(self, websocket: WebSocket) -> StreamingSpeechSessionConfig | None:
         """Wait for and validate the session.config message.
@@ -284,6 +287,9 @@ class OmniStreamingSpeechHandler:
         is produced by the model, rather than waiting for the full sentence to
         be generated.  The client assembles the frames into a final audio file
         using the sample_rate and chunk_count fields on the audio.done message.
+
+        On client disconnect, the audio generator is explicitly closed so that
+        the engine abort propagates immediately to all pipeline stages.
         """
         response_format = config.response_format or "wav"
 
@@ -298,6 +304,8 @@ class OmniStreamingSpeechHandler:
 
         sample_rate: int | None = None
         chunk_count = 0
+        disconnected = False
+        audio_gen = None
 
         try:
             request = OpenAICreateSpeechRequest(
@@ -315,21 +323,32 @@ class OmniStreamingSpeechHandler:
                 x_vector_only_mode=config.x_vector_only_mode,
             )
 
-            async for pcm_bytes, sr in self._speech_service._generate_audio_stream(request):
+            audio_gen = self._speech_service._generate_audio_stream(request)
+            async for pcm_bytes, sr in audio_gen:
                 if sample_rate is None:
                     sample_rate = sr
-                await websocket.send_bytes(pcm_bytes)
+                try:
+                    await websocket.send_bytes(pcm_bytes)
+                except (WebSocketDisconnect, RuntimeError):
+                    disconnected = True
+                    break
                 chunk_count += 1
 
+        except WebSocketDisconnect:
+            disconnected = True
         except Exception as e:
             logger.error("Generation failed for sentence %d: %s", sentence_index, e)
             await self._send_error(
                 websocket,
                 f"Generation failed for sentence {sentence_index}: {e}",
             )
+        finally:
+            if audio_gen is not None:
+                await audio_gen.aclose()
 
-        # audio.done carries sample_rate and chunk_count so the client can
-        # assemble the raw PCM frames into a properly-headed audio file.
+        if disconnected:
+            raise WebSocketDisconnect()
+
         await websocket.send_json(
             {
                 "type": "audio.done",

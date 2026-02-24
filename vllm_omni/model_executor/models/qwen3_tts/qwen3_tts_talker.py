@@ -4,6 +4,7 @@ import base64
 import dataclasses
 import io
 import os
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 from urllib.parse import urlparse
@@ -399,6 +400,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self._tokenizer = None
         self._speech_tokenizer: Qwen3TTSTokenizer | None = None
         self._voice_cache_manager: VoiceCacheManager | None = None
+
+        # GPU-resident LRU cache for hot voice clone embeddings.
+        _max = int(os.environ.get("VOICE_GPU_CACHE_SIZE", "16"))
+        self._voice_gpu_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._voice_gpu_cache_max = _max
 
     # -------------------- vLLM required hooks --------------------
 
@@ -1097,12 +1103,27 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         if audio_path is None:
             logger.warning("[Base prefill] cannot save voice cache: audio_path not found for '%s'", speaker_name)
             return
+
+        # Pre-tokenize ref_text so subsequent ICL requests skip the tokenizer.
+        ref_ids: torch.Tensor | None = None
+        if ref_text and ref_text.strip():
+            try:
+                tok = self._get_tokenizer()
+                ref_ids = tok(
+                    self._build_ref_text(ref_text),
+                    return_tensors="pt",
+                    padding=False,
+                )["input_ids"].cpu()
+            except Exception as e:
+                logger.warning("[Base prefill] failed to tokenize ref_text for cache: %s", e)
+
         item = VoiceClonePromptItem(
             ref_code=ref_code.detach().cpu() if ref_code is not None else None,
             ref_spk_embedding=speaker_embed.detach().cpu().view(-1),
             x_vector_only_mode=not icl_mode,
             icl_mode=icl_mode,
             ref_text=ref_text,
+            ref_ids=ref_ids,
         )
         try:
             ok = self._voice_cache_manager.save_voice_cache(speaker_name, audio_path, [item])
@@ -1113,21 +1134,62 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         except Exception as e:
             logger.warning("[Base prefill] failed to save cache for '%s': %s", speaker_name, e)
 
+        # Populate the GPU LRU cache immediately so the next request
+        # doesn't need disk I/O at all.
+        key = speaker_name.lower()
+        if key not in self._voice_gpu_cache:
+            dev = next(self.parameters()).device
+            entry: dict[str, Any] = {
+                "ref_code": ref_code.to(dev) if ref_code is not None else None,
+                "ref_spk_embedding": speaker_embed.to(dev).view(-1),
+                "icl_mode": icl_mode,
+                "x_vector_only_mode": not icl_mode,
+                "ref_text": ref_text,
+                "ref_ids": ref_ids.to(dev) if ref_ids is not None else None,
+            }
+            while len(self._voice_gpu_cache) >= self._voice_gpu_cache_max:
+                evicted_k, _ = self._voice_gpu_cache.popitem(last=False)
+                logger.info("[Voice GPU cache] evicted '%s'", evicted_k)
+            self._voice_gpu_cache[key] = entry
+            logger.info("[Voice GPU cache] pre-populated '%s' after save", speaker_name)
+
     def _load_voice_cache(self, speaker_name: str) -> dict[str, Any] | None:
-        """Load pre-computed voice clone prompt from the safetensors cache."""
+        """Load pre-computed voice clone prompt, with GPU-resident LRU cache."""
+        key = speaker_name.lower()
+
+        # Fast path: already on GPU
+        if key in self._voice_gpu_cache:
+            self._voice_gpu_cache.move_to_end(key)
+            return self._voice_gpu_cache[key]
+
+        # Cold path: load from safetensors on disk
         if self._voice_cache_manager is None:
             self._voice_cache_manager = VoiceCacheManager()
         items = self._voice_cache_manager.load_cached_voice_prompt(speaker_name, device="cpu")
         if not items:
             return None
         item = items[0]
-        return {
-            "ref_code": item.ref_code,
-            "ref_spk_embedding": item.ref_spk_embedding,
+
+        dev = next(self.parameters()).device
+        entry: dict[str, Any] = {
+            "ref_code": item.ref_code.to(dev) if item.ref_code is not None else None,
+            "ref_spk_embedding": item.ref_spk_embedding.to(dev),
             "icl_mode": item.icl_mode,
             "x_vector_only_mode": item.x_vector_only_mode,
             "ref_text": item.ref_text,
+            "ref_ids": item.ref_ids.to(dev) if getattr(item, "ref_ids", None) is not None else None,
         }
+
+        # Evict LRU if over capacity
+        while len(self._voice_gpu_cache) >= self._voice_gpu_cache_max:
+            evicted_key, evicted = self._voice_gpu_cache.popitem(last=False)
+            logger.info("[Voice GPU cache] evicted '%s'", evicted_key)
+            del evicted
+
+        self._voice_gpu_cache[key] = entry
+        logger.info("[Voice GPU cache] loaded '%s' to %s (%d/%d)",
+                     speaker_name, dev, len(self._voice_gpu_cache), self._voice_gpu_cache_max)
+        return entry
 
     def _ensure_speech_tokenizer_loaded(self) -> Qwen3TTSTokenizer:
         if self._speech_tokenizer is not None:
