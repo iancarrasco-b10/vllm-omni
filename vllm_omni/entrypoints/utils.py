@@ -236,6 +236,69 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
     return stage_args
 
 
+def auto_assign_stage_devices(stage_configs: list) -> list:
+    """Spread stages across available GPUs when all stages target the same device.
+
+    If multiple CUDA devices are available and every stage in the config
+    uses the same single GPU, reassign them round-robin (stage 0 → GPU 0,
+    stage 1 → GPU 1, etc.) and bump ``gpu_memory_utilization`` since each
+    stage now has a dedicated GPU.
+
+    This is a no-op when:
+    - Only one GPU is available
+    - Stages already use different devices
+    - CUDA is not available
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return stage_configs
+        num_gpus = torch.cuda.device_count()
+        if num_gpus < 2:
+            return stage_configs
+    except ImportError:
+        return stage_configs
+
+    # Check if all stages target the same single device.
+    devices = []
+    for cfg in stage_configs:
+        rt = getattr(cfg, "runtime", None)
+        if rt is None:
+            return stage_configs
+        dev = str(rt.get("devices", "0"))
+        devices.append(dev)
+
+    if len(set(devices)) != 1:
+        return stage_configs
+
+    num_stages = len(stage_configs)
+    if num_stages <= 1:
+        return stage_configs
+
+    logger.info(
+        "Auto-assigning %d stages across %d GPUs (was all on device %s).",
+        num_stages, min(num_gpus, num_stages), devices[0],
+    )
+
+    for i, cfg in enumerate(stage_configs):
+        gpu_id = i % num_gpus
+        cfg.runtime.devices = str(gpu_id)
+
+        ea = getattr(cfg, "engine_args", None)
+        if ea is not None and hasattr(ea, "gpu_memory_utilization"):
+            old_util = float(ea.gpu_memory_utilization)
+            new_util = min(0.9, old_util + 0.15)
+            ea.gpu_memory_utilization = new_util
+
+        logger.info(
+            "  Stage %d → GPU %d (gpu_memory_utilization=%.2f)",
+            i, gpu_id,
+            float(getattr(ea, "gpu_memory_utilization", 0)) if ea else 0,
+        )
+
+    return stage_configs
+
+
 def get_final_stage_id_for_e2e(
     output_modalities: list[str] | None, default_modalities: list[str], stage_list: list
 ) -> int:

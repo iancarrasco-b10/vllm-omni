@@ -15,7 +15,7 @@ stage_args:
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       enforce_eager: false
       trust_remote_code: true
-      async_scheduling: false
+      async_scheduling: true
       enable_prefix_caching: false
       engine_output_type: latent
       gpu_memory_utilization: 0.7
@@ -32,7 +32,7 @@ stage_args:
       max_tokens: 4096
       seed: 42
       detokenize: false
-      repetition_penalty: 1.05
+      repetition_penalty: 1.0
       stop_token_ids: [2150]
 
   - stage_id: 1
@@ -88,7 +88,7 @@ runtime:
         # Frame-aligned codec streaming transport.
         codec_streaming: true
         # Connector polling / timeout (unit: loop count, sleep interval in seconds).
-        connector_get_sleep_s: 0.001
+        connector_get_sleep_s: 0.0005
         connector_get_max_wait_first_chunk: 3000
         connector_get_max_wait: 300
         # Emit audio after every single codec frame (~83ms at 12Hz) for

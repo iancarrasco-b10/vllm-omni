@@ -78,9 +78,10 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.talker_mtp = talker_mtp  # type: ignore[assignment]
             cudagraph_mode = self.compilation_config.cudagraph_mode
             assert cudagraph_mode is not None
-            # Only wrap talker_mtp in CUDAGraphWrapper for Omni models that
-            # have a separate .talker sub-module.  TTS models' code predictor
-            # has internal AR loops / torch.multinomial — not graph-safe.
+            # Omni models have a separate .talker sub-module whose talker_mtp is
+            # a pure tensor-in/tensor-out function suitable for FULL CUDA graphs.
+            # TTS models' code predictor has internal AR loops with dynamic shapes
+            # and torch.multinomial — not graph-safe — so it runs eagerly.
             has_separate_talker = getattr(self.model, "talker", None) is not None
             if cudagraph_mode.has_full_cudagraphs() and has_separate_talker:
                 self.talker_mtp = CUDAGraphWrapper(talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
@@ -95,6 +96,18 @@ class OmniGPUModelRunner(GPUModelRunner):
             )
             self.last_talker_hidden = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
             self.text_step = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
+            # Set up CUDA graph for TTS code predictor.
+            # TTS models expose .code_predictor directly; Omni nests it under .talker.
+            code_predictor = getattr(self.model, "code_predictor", None)
+            if code_predictor is not None and cudagraph_mode.has_full_cudagraphs():
+                import math
+
+                bs_cap = min(max(self.max_num_reqs, 1), 32)
+                n = int(math.log2(bs_cap)) + 1
+                batch_sizes_set = {2**i for i in range(n)}
+                batch_sizes_set.add(bs_cap)  # cover non-power-of-two caps
+                batch_sizes = tuple(sorted(batch_sizes_set))
+                code_predictor.setup_graph(batch_sizes=batch_sizes)
 
     def _init_mrope_positions(self, req_state: CachedRequestState):
         """Initialize M-RoPE positions for multimodal inputs.
@@ -1107,12 +1120,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             ec_connector_output,
         )
 
-    _mtp_call_count = 0
-    _mtp_total_ms = 0.0
-    _mtp_copy_total_ms = 0.0
-
     def _talker_mtp_forward(self, decode_req_ids: list[str], inputs_embeds: torch.Tensor) -> None:
-        import time as _time
         decode_batch_size = len(decode_req_ids)
         if decode_batch_size == 0:
             return
@@ -1131,31 +1139,11 @@ class OmniGPUModelRunner(GPUModelRunner):
         req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]
         last_talker_hidden = self.last_talker_hidden.gpu[:num_tokens_padded]
         text_step = self.text_step.gpu[:num_tokens_padded]
-
-        _t0 = _time.perf_counter()
         with set_forward_context(
             None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
         ):
             req_embeds, code_predictor_codes = self.talker_mtp(req_input_ids, req_embeds, last_talker_hidden, text_step)
-
-        # update the inputs_embeds and code_predictor_codes
         code_predictor_codes_cpu = code_predictor_codes.detach().to("cpu").contiguous()
-        _t1 = _time.perf_counter()
-
-        _mtp_ms = (_t1 - _t0) * 1000.0
-        _copy_ms = 0.0
-        OmniGPUModelRunner._mtp_call_count += 1
-        OmniGPUModelRunner._mtp_total_ms += _mtp_ms
-        OmniGPUModelRunner._mtp_copy_total_ms += _copy_ms
-        if OmniGPUModelRunner._mtp_call_count % 5 == 1:
-            _avg = OmniGPUModelRunner._mtp_total_ms / OmniGPUModelRunner._mtp_call_count
-            logger.info(
-                "[Stage-0 MTP] #%d  code_predictor=%.1fms  cpu_copy=%.1fms  "
-                "cudagraph=%s  avg_mtp=%.1fms",
-                OmniGPUModelRunner._mtp_call_count, _mtp_ms, _copy_ms,
-                _cudagraph_mode, _avg,
-            )
-
         out_key = getattr(self.model, "talker_mtp_output_key", "code_predictor_codes")
         for idx, req_id in enumerate(decode_req_ids):
             req_index = self.input_batch.req_ids.index(req_id)

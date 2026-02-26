@@ -33,6 +33,7 @@ from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
+    auto_assign_stage_devices,
     get_final_stage_id_for_e2e,
     inject_omni_kv_config,
     load_stage_configs_from_model,
@@ -232,6 +233,9 @@ class OmniBase:
         else:
             self.config_path = stage_configs_path
             self.stage_configs = load_stage_configs_from_yaml(stage_configs_path, base_engine_args=base_engine_args)
+
+        # Auto-spread stages across GPUs when multiple are available.
+        self.stage_configs = auto_assign_stage_devices(self.stage_configs)
 
         # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.
         for cfg in self.stage_configs:
