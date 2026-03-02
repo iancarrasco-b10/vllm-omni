@@ -375,7 +375,7 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         eps = cfg.rms_norm_eps
 
         max_fast_batch = int(getattr(self._vllm_config.scheduler_config, "max_num_seqs", 1) or 1)
-        max_fast_batch = max(1, min(max_fast_batch, 16))
+        max_fast_batch = max(1, min(max_fast_batch, 32))
 
         self._fast_num_layers = num_layers
         self._fast_num_q_heads = num_q_heads
