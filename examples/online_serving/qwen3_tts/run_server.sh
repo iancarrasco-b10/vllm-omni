@@ -36,4 +36,5 @@ vllm-omni serve "$MODEL" \
     --port 8091 \
     --gpu-memory-utilization 0.9 \
     --trust-remote-code \
+    --chat-template "{% for m in messages %}{{ m['content'] }}{% endfor %}" \
     --omni

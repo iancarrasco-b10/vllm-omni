@@ -414,6 +414,14 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         self._decode_graphs: dict[tuple[int, int], tuple[torch.cuda.CUDAGraph, torch.Tensor, torch.Tensor]] = {}
         self._graph_warmup_done = False
 
+        # Whole-loop graph: captures entire AR loop as single CUDA graph
+        self._whole_loop_graphs: dict[int, dict] = {}
+        self._whole_loop_captured = False
+        self._whole_loop_top_k = 50
+
+        # Pre-allocate per-step position tensors for whole-loop graph
+        self._step_positions = torch.arange(max_seq, dtype=torch.long, device=device)
+
         self._fast_ready = True
         logger.info(
             "[FastCodePredictor] Initialized: layers=%d q_heads=%d kv_heads=%d "
@@ -543,6 +551,171 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         self._graph_warmup_done = True
         logger.info("[FastCodePredictor] Captured %d CUDA graphs", len(self._decode_graphs))
 
+    def _whole_loop_body(
+        self,
+        prefill_input: torch.Tensor,
+        layer0_code: torch.Tensor,
+        gumbel_noise: torch.Tensor,
+        inv_temp: torch.Tensor,
+        bsz: int,
+        top_k: int,
+    ) -> torch.Tensor:
+        """Execute the full AR loop — ONLY for graph warmup / capture.
+
+        NOT a general-purpose forward; zeros the KV cache at the start so each
+        call is self-contained (required for CUDA graph capture).  The runtime
+        eager fallback uses the incremental per-step path in fast_forward().
+
+        All operations are CUDA-graph-safe: no data-dependent control flow,
+        no torch.multinomial.  Sampling uses the Gumbel-max trick.
+        """
+        device = prefill_input.device
+        num_groups = int(self.config.num_code_groups)
+        embeddings = self.model.get_input_embeddings()
+        projection = self.small_to_mtp_projection
+        positions = self._step_positions
+
+        self._fast_k_cache[:, :bsz].zero_()
+        self._fast_v_cache[:, :bsz].zero_()
+
+        hidden = self._fast_model_forward(
+            prefill_input, positions[:2], seq_len=2, tok_count=2, bsz=bsz,
+        )
+        logits = self.lm_head[0](hidden[:, -1:, :]).squeeze(1)
+
+        codes_buf = torch.zeros(bsz, num_groups, dtype=torch.long, device=device)
+        codes_buf[:, 0] = layer0_code
+
+        for step in range(1, num_groups):
+            scaled = logits.float() * inv_temp
+            topk_vals, _ = scaled.topk(top_k, dim=-1)
+            scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
+            next_ids = (scaled + gumbel_noise[step - 1]).argmax(dim=-1, keepdim=True)
+            codes_buf[:, step] = next_ids.reshape(bsz)
+
+            if step < num_groups - 1:
+                tok_embed = embeddings[step - 1](next_ids.long())
+                tok_embed = projection(tok_embed.to(torch.bfloat16))
+                pos = positions[step + 1 : step + 2]
+                hidden = self._fast_model_forward(
+                    tok_embed, pos, seq_len=step + 2, tok_count=1, bsz=bsz,
+                )
+                logits = self.lm_head[step](hidden[:, -1:, :]).squeeze(1)
+
+        return codes_buf
+
+    def _capture_whole_loop_graphs(self, device: torch.device) -> None:
+        """Capture one CUDA graph per batch size containing the full AR loop.
+
+        On failure (OOM, unsupported op, etc.), logs a warning and leaves
+        ``_whole_loop_captured`` False so fast_forward() falls through to the
+        incremental per-step path without any regression.
+        """
+        if self._whole_loop_captured:
+            return
+
+        num_groups = int(self.config.num_code_groups)
+        h_pred = self._fast_hidden
+        vocab = int(self.config.vocab_size)
+        max_bsz = self._fast_max_batch
+        top_k = self._whole_loop_top_k
+
+        logger.info(
+            "[WholeLoopGraph] Capturing %d graphs (bsz 1..%d, "
+            "%d AR steps, top_k=%d, vocab=%d)...",
+            max_bsz, max_bsz, num_groups - 1, top_k, vocab,
+        )
+        t0 = __import__("time").perf_counter()
+
+        try:
+            for bsz in range(1, max_bsz + 1):
+                static_prefill = torch.zeros(
+                    bsz, 2, h_pred, dtype=torch.bfloat16, device=device,
+                )
+                static_layer0_code = torch.zeros(bsz, dtype=torch.long, device=device)
+                static_gumbel = torch.zeros(
+                    num_groups - 1, bsz, vocab, dtype=torch.float32, device=device,
+                )
+                static_inv_temp = torch.ones(1, dtype=torch.float32, device=device)
+
+                for _ in range(3):
+                    self._whole_loop_body(
+                        static_prefill, static_layer0_code,
+                        static_gumbel, static_inv_temp, bsz, top_k,
+                    )
+
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, pool=self._graph_pool):
+                    static_codes = self._whole_loop_body(
+                        static_prefill, static_layer0_code,
+                        static_gumbel, static_inv_temp, bsz, top_k,
+                    )
+
+                self._whole_loop_graphs[bsz] = {
+                    "graph": g,
+                    "prefill": static_prefill,
+                    "layer0_code": static_layer0_code,
+                    "gumbel": static_gumbel,
+                    "inv_temp": static_inv_temp,
+                    "codes": static_codes,
+                }
+        except Exception as e:
+            logger.warning(
+                "[WholeLoopGraph] Capture failed at bsz=%d: %s  "
+                "— falling back to incremental per-step path",
+                bsz, e,
+            )
+            self._whole_loop_graphs.clear()
+            self._whole_loop_captured = True  # don't retry
+            return
+
+        elapsed = (__import__("time").perf_counter() - t0) * 1000
+        self._whole_loop_captured = True
+        logger.info(
+            "[WholeLoopGraph] Captured %d graphs in %.0f ms", max_bsz, elapsed,
+        )
+
+    @torch.inference_mode()
+    def _whole_loop_forward(
+        self,
+        layer0_code: torch.Tensor,
+        layer0_embed: torch.Tensor,
+        last_talker_hidden: torch.Tensor,
+        do_sample: bool = True,
+        temperature: float = 1.0,
+        top_k: int = 50,
+    ) -> torch.Tensor | None:
+        """Try to run via whole-loop CUDA graph. Returns None if not available."""
+        bsz = int(layer0_code.shape[0])
+        if not self._whole_loop_captured or bsz not in self._whole_loop_graphs:
+            return None
+        if top_k != self._whole_loop_top_k:
+            return None
+
+        entry = self._whole_loop_graphs[bsz]
+        device = layer0_code.device
+
+        prefill_input = torch.cat(
+            [last_talker_hidden, layer0_embed], dim=1,
+        ).to(torch.bfloat16)
+        prefill_input = self.small_to_mtp_projection(prefill_input)
+
+        entry["prefill"].copy_(prefill_input)
+        entry["layer0_code"].copy_(layer0_code.reshape(bsz))
+
+        if do_sample and temperature > 0:
+            inv_temp = 1.0 / temperature
+            uniform = torch.rand_like(entry["gumbel"])
+            uniform.clamp_(1e-10, 1.0 - 1e-7)
+            entry["gumbel"].copy_(-torch.log(-torch.log(uniform)))
+            entry["inv_temp"].fill_(inv_temp)
+        else:
+            entry["gumbel"].zero_()
+            entry["inv_temp"].fill_(1.0)
+
+        entry["graph"].replay()
+        return entry["codes"].clone()
+
     @torch.inference_mode()
     def fast_forward(
         self,
@@ -554,16 +727,56 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         top_k: int = 50,
         top_p: float = 1.0,
     ) -> torch.Tensor:
-        """Fast SDPA-based prediction of residual codebooks 1..Q-1 with CUDA graph replay.
+        """Fast SDPA-based prediction of residual codebooks 1..Q-1.
 
-        Supports any batch size up to _fast_max_batch. CUDA graphs are keyed
-        by (decode_step, batch_size) so the correct graph is replayed for the
-        current batch.
+        Tries (in order):
+        1. Whole-loop CUDA graph  — single replay for the entire AR loop
+        2. Incremental per-step   — one decode step at a time with growing
+           KV cache; uses per-step CUDA graphs when available, otherwise
+           eager PyTorch.  This is the same path as before the whole-loop
+           optimisation, so there is no fallback regression.
         """
         device = layer0_code.device
         bsz = int(layer0_code.shape[0])
         self._init_fast_path(device)
 
+        # --- path 1: whole-loop graph (single replay) ---
+        self._capture_whole_loop_graphs(device)
+        result = self._whole_loop_forward(
+            layer0_code, layer0_embed, last_talker_hidden,
+            do_sample, temperature, top_k,
+        )
+        if result is not None:
+            return result
+
+        # --- path 2: incremental per-step decode (unchanged from pre-PR) ---
+        # Each step writes one KV entry and reads the full accumulated cache,
+        # exactly as before. Per-step CUDA graphs accelerate individual
+        # model_forward calls; pure eager is the final fallback.
+        return self._incremental_per_step_forward(
+            layer0_code, layer0_embed, last_talker_hidden,
+            do_sample, temperature, top_k, top_p,
+        )
+
+    @torch.inference_mode()
+    def _incremental_per_step_forward(
+        self,
+        layer0_code: torch.Tensor,
+        layer0_embed: torch.Tensor,
+        last_talker_hidden: torch.Tensor,
+        do_sample: bool = True,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 1.0,
+    ) -> torch.Tensor:
+        """Incremental KV-cached decode, one step at a time.
+
+        Identical to the pre-whole-loop-graph code path: prefill populates
+        2 KV entries, then each decode step appends 1 entry and attends over
+        the full history.  Per-step CUDA graphs are used when captured.
+        """
+        device = layer0_code.device
+        bsz = int(layer0_code.shape[0])
         num_groups = int(self.config.num_code_groups)
         max_steps = num_groups - 1
 
@@ -577,11 +790,10 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         self._fast_k_cache[:, :bsz].zero_()
         self._fast_v_cache[:, :bsz].zero_()
 
-        # Prefill: [bsz, 2, H]
         prefill_input = torch.cat([last_talker_hidden, layer0_embed], dim=1).to(torch.bfloat16)
         prefill_input = self.small_to_mtp_projection(prefill_input)
         hidden = self._fast_model_forward(prefill_input, self._prefill_pos, seq_len=2, tok_count=2, bsz=bsz)
-        logits = self.lm_head[0](hidden[:, -1:, :]).squeeze(1)  # [bsz, vocab]
+        logits = self.lm_head[0](hidden[:, -1:, :]).squeeze(1)
 
         codes_buf = torch.zeros(bsz, num_groups, dtype=torch.long, device=device)
         codes_buf[:, 0] = layer0_code.reshape(bsz)
@@ -605,7 +817,7 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
 
             if step < max_steps:
                 tok_embed = embeddings[step - 1](next_ids.long())
-                tok_embed = projection(tok_embed.to(torch.bfloat16))  # [bsz, 1, H_pred]
+                tok_embed = projection(tok_embed.to(torch.bfloat16))
 
                 graph_key = (step, bsz)
                 if use_graphs and graph_key in self._decode_graphs:
