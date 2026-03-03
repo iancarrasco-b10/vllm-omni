@@ -147,7 +147,9 @@ class Qwen3TTSCode2Wav(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Decode a single request's input_ids into audio.
 
-        ids layout: [codec_context_frames, *flat_codes]
+        ids layout: [ctx_frames, *flat_codes]
+        where ctx_frames is the number of left-context frames (in-band header)
+        and flat_codes is codebook-major [q*F].
 
         Calls decoder.chunked_decode() directly, staying entirely on GPU
         and bypassing the HF Qwen3TTSTokenizer wrapper overhead.
@@ -257,11 +259,12 @@ class Qwen3TTSCode2Wav(nn.Module):
         intermediate_tensors: Any = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor] | OmniOutput:
+    ) -> OmniOutput:
         """Decode codec codes into audio waveform.
 
-        input_ids layout (single request): [codec_context_frames, *flat_codes]
-        where flat_codes is codebook-major [q*F].
+        input_ids layout per request: [ctx_frames, *flat_codes]
+        where ctx_frames is the left-context frame count and
+        flat_codes is codebook-major [q*F].
 
         When batched, input_ids is a concatenation of multiple requests.
         Per-request boundaries are obtained from the forward context.
@@ -272,24 +275,22 @@ class Qwen3TTSCode2Wav(nn.Module):
         assert self._output_sample_rate is not None
 
         sr_val = self._output_sample_rate
-        empty_ret = (
-            torch.zeros((0,), dtype=torch.float32),
-            torch.tensor(sr_val, dtype=torch.int32),
-        )
+        sr_tensor = torch.tensor(sr_val, dtype=torch.int32)
+        empty = torch.zeros((0,), dtype=torch.float32)
 
-        if input_ids is None:
-            return empty_ret
+        if input_ids is None or input_ids.numel() == 0:
+            return OmniOutput(
+                text_hidden_states=None,
+                multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
+            )
 
         ids = input_ids.reshape(-1).to(dtype=torch.long)
-        if ids.numel() == 0:
-            return empty_ret
 
         per_req_counts = self._get_per_request_token_counts()
 
         if per_req_counts is not None and len(per_req_counts) > 1:
             audio_list: list[torch.Tensor] = []
             sr_list: list[torch.Tensor] = []
-            finished_list: list[torch.Tensor] = []
             offset = 0
             for count in per_req_counts:
                 req_ids = ids[offset:offset + count]
@@ -297,17 +298,19 @@ class Qwen3TTSCode2Wav(nn.Module):
                 audio, sr = self._decode_single_request(req_ids)
                 audio_list.append(audio)
                 sr_list.append(sr)
-                finished_list.append(torch.tensor(False))
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={
                     "model_outputs": audio_list,
                     "sr": sr_list,
-                    "finished": finished_list,
                 },
             )
 
-        return self._decode_single_request(ids)
+        audio, sr = self._decode_single_request(ids)
+        return OmniOutput(
+            text_hidden_states=None,
+            multimodal_outputs={"model_outputs": audio, "sr": sr},
+        )
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
@@ -322,7 +325,6 @@ class Qwen3TTSCode2Wav(nn.Module):
             multimodal_outputs={
                 "model_outputs": audio_tensor,
                 "sr": sr,
-                "finished": torch.tensor(False),
             },
         )
 

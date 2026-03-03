@@ -518,6 +518,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         audio_tensor = audio_output[audio_key]
         sample_rate = audio_output.get("sr", 24000)
+        if isinstance(sample_rate, list):
+            sample_rate = sample_rate[-1]
         if hasattr(sample_rate, "item"):
             sample_rate = sample_rate.item()
 
@@ -625,6 +627,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             params["max_new_tokens"] = [request.max_new_tokens]
         else:
             params["max_new_tokens"] = [2048]
+
+        # VoiceDesign requires non_streaming_mode (match offline script behaviour).
+        if params["task_type"][0] == "VoiceDesign":
+            params["non_streaming_mode"] = [True]
 
         return params
 
@@ -748,10 +754,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     ):
         """Stream raw PCM audio chunks as they are produced by the model.
 
-        Yields (pcm_bytes, sample_rate) for each Code2Wav output chunk.
-        This is used by the streaming WebSocket handler so the first audio
-        frame can be sent after just the first codec chunk rather than waiting
-        for the entire sentence to be generated.
+        Yields (pcm_bytes, sample_rate) for each new Code2Wav output chunk.
+        Uses delta-slicing so only new audio is emitted on each iteration,
+        avoiding O(n²) re-concatenation of the full accumulated audio.
 
         The engine generator is explicitly closed in a finally block so that
         ``GeneratorExit`` propagates into ``async_omni.generate()``, which
@@ -766,23 +771,59 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         generator = await self._prepare_tts_generator(request)
         speed = request.speed or 1.0
+        prev_count = 0
+        sample_rate_val = 24000
 
         try:
             async for res in generator:
-                audio_chunk = self._extract_audio_from_output(res)
-                if audio_chunk is None:
+                audio_output = None
+                if hasattr(res, "multimodal_output") and res.multimodal_output:
+                    audio_output = res.multimodal_output
+                if not audio_output and hasattr(res, "request_output"):
+                    if res.request_output and hasattr(res.request_output, "multimodal_output"):
+                        audio_output = res.request_output.multimodal_output
+                if not audio_output:
                     continue
-                audio_tensor, sample_rate = audio_chunk
-                audio_obj = CreateAudio(
-                    audio_tensor=audio_tensor,
-                    sample_rate=int(sample_rate),
-                    response_format="pcm",
-                    speed=speed,
-                    stream_format="audio",
-                    base64_encode=False,
+
+                audio_key = "audio" if "audio" in audio_output else (
+                    "model_outputs" if "model_outputs" in audio_output else None
                 )
-                audio_response: AudioResponse = self.create_audio(audio_obj)
-                yield audio_response.audio_data, int(sample_rate)
+                if audio_key is None:
+                    continue
+
+                sr_raw = audio_output.get("sr")
+                if sr_raw is not None:
+                    sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
+                    sample_rate_val = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+
+                audio_val = audio_output[audio_key]
+                if isinstance(audio_val, list):
+                    new_chunks = audio_val[prev_count:]
+                    prev_count = len(audio_val)
+                else:
+                    if audio_val is not None:
+                        new_chunks = [audio_val]
+                        prev_count += 1
+                    else:
+                        new_chunks = []
+
+                for chunk_tensor in new_chunks:
+                    if hasattr(chunk_tensor, "float"):
+                        chunk_np = chunk_tensor.float().detach().cpu().numpy()
+                    else:
+                        chunk_np = chunk_tensor
+                    if chunk_np.ndim > 1:
+                        chunk_np = chunk_np.squeeze()
+                    audio_obj = CreateAudio(
+                        audio_tensor=chunk_np,
+                        sample_rate=sample_rate_val,
+                        response_format="pcm",
+                        speed=speed,
+                        stream_format="audio",
+                        base64_encode=False,
+                    )
+                    audio_response: AudioResponse = self.create_audio(audio_obj)
+                    yield audio_response.audio_data, sample_rate_val
         finally:
             await generator.aclose()
 
