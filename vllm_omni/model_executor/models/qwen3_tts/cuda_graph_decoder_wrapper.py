@@ -261,7 +261,8 @@ class CUDAGraphDecoderWrapper:
             codes_chunk = codes[..., start_index - context_size: end_index]
             wav_chunk = self.decode(codes_chunk)
 
-            wavs.append(wav_chunk[..., context_size * total_upsample:])
+            sample_count = min((end_index - start_index) * total_upsample, wav_chunk.shape[-1])
+            wavs.append(wav_chunk[..., -sample_count:])
             start_index = end_index
 
         return torch.cat(wavs, dim=-1)

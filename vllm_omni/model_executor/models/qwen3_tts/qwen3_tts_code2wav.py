@@ -5,7 +5,6 @@ import time
 from collections.abc import Iterable
 from typing import Any
 
-import numpy as np
 import torch
 import torch.nn as nn
 from transformers.utils.hub import cached_file
@@ -37,8 +36,9 @@ class Qwen3TTSCode2Wav(nn.Module):
         self.requires_raw_input_tokens = True
 
         self._speech_tokenizer: Qwen3TTSTokenizer | None = None
+        self._decoder: nn.Module | None = None
         self._num_quantizers: int | None = None
-        self._decode_upsample_rate: int | None = None
+        self._total_upsample: int | None = None
         self._output_sample_rate: int | None = None
         self._logged_codec_stats = False
         self._decode_call_count = 0
@@ -52,9 +52,9 @@ class Qwen3TTSCode2Wav(nn.Module):
                 return buf.device
             return torch.device("cpu")
 
-    def _ensure_speech_tokenizer_loaded(self) -> Qwen3TTSTokenizer:
-        if self._speech_tokenizer is not None:
-            return self._speech_tokenizer
+    def _ensure_speech_tokenizer_loaded(self) -> None:
+        if self._decoder is not None:
+            return
 
         # Locate speech_tokenizer dir from HF cache (or local path).
         cfg_path = cached_file(self.model_path, "speech_tokenizer/config.json")
@@ -92,34 +92,29 @@ class Qwen3TTSCode2Wav(nn.Module):
             raise ValueError(f"Invalid speech_tokenizer num_quantizers={num_q}")
 
         try:
-            upsample = int(tok.get_decode_upsample_rate())
-        except Exception as e:
-            raise ValueError(f"Failed to get decode upsample rate: {e}") from e
-        if upsample <= 0:
-            raise ValueError(f"Invalid decode upsample rate: {upsample}")
-
-        try:
             out_sr = int(tok.get_output_sample_rate())
         except Exception as e:
             raise ValueError(f"Failed to get output sample rate: {e}") from e
 
+        decoder = tok.model.decoder
+        decoder.eval()
+
         self._speech_tokenizer = tok
+        self._decoder = decoder
         self._num_quantizers = num_q
-        self._decode_upsample_rate = upsample
+        self._total_upsample = int(decoder.total_upsample)
         self._output_sample_rate = out_sr
 
-        self._enable_decoder_cudagraph(tok)
+        self._enable_decoder_cudagraph()
 
-        return tok
-
-    def _enable_decoder_cudagraph(self, tok: Qwen3TTSTokenizer) -> None:
+    def _enable_decoder_cudagraph(self) -> None:
         """Enable CUDA graph acceleration for the speech tokenizer decoder.
 
         This is independent of vLLM's enforce_eager setting which controls
         the AR model engine, not the codec decoder.
         """
         try:
-            decoder = tok.model.decoder
+            decoder = self._decoder
             device = self._module_device(decoder)
             if device.type != "cuda":
                 logger.info(
@@ -149,14 +144,17 @@ class Qwen3TTSCode2Wav(nn.Module):
     def _decode_single_request(
         self,
         ids: torch.Tensor,
-        tok: Qwen3TTSTokenizer,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Decode a single request's input_ids into audio.
 
         ids layout: [codec_context_frames, *flat_codes]
+
+        Calls decoder.chunked_decode() directly, staying entirely on GPU
+        and bypassing the HF Qwen3TTSTokenizer wrapper overhead.
         """
         q = int(self._num_quantizers)
         sr_val = self._output_sample_rate
+        upsample = self._total_upsample
         empty_audio = torch.zeros((0,), dtype=torch.float32)
         empty_sr = torch.tensor(sr_val, dtype=torch.int32)
 
@@ -181,29 +179,25 @@ class Qwen3TTSCode2Wav(nn.Module):
             return empty_audio, empty_sr
 
         total_frames = n_tokens // q
-        codes_fq = ids.reshape(q, total_frames).transpose(0, 1).contiguous()
+        codes_qf = ids.reshape(q, total_frames)  # [Q, F]
 
         if not self._logged_codec_stats and total_frames > 1:
             self._logged_codec_stats = True
             try:
-                uniq = int(torch.unique(codes_fq).numel())
-                cmin = int(codes_fq.min().item())
-                cmax = int(codes_fq.max().item())
-                head = codes_fq[: min(2, total_frames), : min(8, q)].cpu().tolist()
                 logger.info(
-                    "Code2Wav codec: frames=%d q=%d uniq=%d range=[%d,%d] head=%s",
+                    "Code2Wav codec: frames=%d q=%d uniq=%d range=[%d,%d]",
                     total_frames,
                     q,
-                    uniq,
-                    cmin,
-                    cmax,
-                    head,
+                    int(torch.unique(codes_qf).numel()),
+                    int(codes_qf.min().item()),
+                    int(codes_qf.max().item()),
                 )
             except Exception:
                 pass
 
         t_decode_start = time.perf_counter()
-        wavs, sr = tok.decode({"audio_codes": codes_fq})
+        wav = self._decoder.chunked_decode(codes_qf.unsqueeze(0))  # [1, 1, wav_len]
+        wav = wav.squeeze(0).squeeze(0)  # [wav_len]
         t_decode_end = time.perf_counter()
 
         self._decode_call_count += 1
@@ -218,27 +212,24 @@ class Qwen3TTSCode2Wav(nn.Module):
                 decode_ms,
             )
 
-        if not wavs:
-            raise ValueError("SpeechTokenizer code2wav produced empty waveform list.")
-        audio_np = wavs[0].astype(np.float32, copy=False)
+        expected_len = total_frames * upsample
+        if wav.shape[0] > expected_len:
+            wav = wav[:expected_len]
 
         if ctx_frames > 0:
-            upsample = self._decode_upsample_rate
-            if upsample is None or upsample <= 0:
-                raise ValueError(f"Invalid decode upsample rate: {upsample}")
             cut = ctx_frames * upsample
-            if cut < audio_np.shape[0]:
-                audio_np = audio_np[cut:]
+            if cut < wav.shape[0]:
+                wav = wav[cut:]
             else:
                 logger.warning(
                     "Context trim %d >= decoded length %d; returning empty audio.",
                     cut,
-                    audio_np.shape[0],
+                    wav.shape[0],
                 )
                 return empty_audio, empty_sr
 
-        audio_tensor = torch.from_numpy(audio_np).to(dtype=torch.float32).reshape(-1)
-        sr_tensor = torch.tensor(int(sr), dtype=torch.int32)
+        audio_tensor = wav.to(dtype=torch.float32).reshape(-1)
+        sr_tensor = torch.tensor(sr_val, dtype=torch.int32)
         return audio_tensor, sr_tensor
 
     @staticmethod
@@ -275,7 +266,8 @@ class Qwen3TTSCode2Wav(nn.Module):
         When batched, input_ids is a concatenation of multiple requests.
         Per-request boundaries are obtained from the forward context.
         """
-        tok = self._ensure_speech_tokenizer_loaded()
+        self._ensure_speech_tokenizer_loaded()
+        assert self._decoder is not None
         assert self._num_quantizers is not None
         assert self._output_sample_rate is not None
 
@@ -302,7 +294,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             for count in per_req_counts:
                 req_ids = ids[offset:offset + count]
                 offset += count
-                audio, sr = self._decode_single_request(req_ids, tok)
+                audio, sr = self._decode_single_request(req_ids)
                 audio_list.append(audio)
                 sr_list.append(sr)
                 finished_list.append(torch.tensor(False))
@@ -315,7 +307,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 },
             )
 
-        return self._decode_single_request(ids, tok)
+        return self._decode_single_request(ids)
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
