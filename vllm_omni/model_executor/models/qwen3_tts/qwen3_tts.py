@@ -29,6 +29,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .configuration_qwen3_tts import Qwen3TTSConfig
@@ -73,30 +74,30 @@ class Qwen3TTSModelForGeneration(nn.Module):
         # Store vllm_config for potential future use
         self.vllm_config = vllm_config
 
-        self._enable_decoder_cudagraph()
+        # Apply torch.compile for inference optimization if not in eager mode
+        enforce_eager = getattr(vllm_config.model_config, "enforce_eager", False)
+        if not enforce_eager:
+            self._apply_torch_compile()
 
-    def _enable_decoder_cudagraph(self):
-        model_cfg = getattr(self.vllm_config, "model_config", None)
-        if model_cfg and getattr(model_cfg, "enforce_eager", False):
-            logger.info("CUDA Graph not enabled: --enforce-eager is set")
-            return
+    def _apply_torch_compile(self) -> None:
+        """
+        Apply torch.compile to the TTS model's transformer blocks for inference optimization.
+
+        This uses regional compilation to compile the repeated decoder layers,
+        following the same pattern as diffusion models in this codebase.
+        """
         try:
-            inner_model = getattr(self.model, "model", None)
-            if inner_model is None or not hasattr(inner_model, "speech_tokenizer"):
-                return
-            tokenizer = inner_model.speech_tokenizer
-            if not (hasattr(tokenizer, "model") and hasattr(tokenizer.model, "decoder")):
-                return
-            decoder = tokenizer.model.decoder
-            device = next(decoder.parameters()).device
-            if device.type != "cuda":
-                logger.info("CUDA Graph not enabled: decoder is on %s", device)
-                return
-            if hasattr(decoder, "enable_cudagraph"):
-                decoder.enable_cudagraph()
-                logger.info("CUDA Graph enabled for speech tokenizer decoder")
-        except Exception:
-            logger.warning("Failed to enable CUDA Graph for decoder", exc_info=True)
+            # Compile the main talker model (Qwen3TTSTalkerModel)
+            talker_model = self.model.model.talker.model
+            regionally_compile(talker_model, dynamic=True)
+
+            # Compile the code predictor model (Qwen3TTSTalkerCodePredictorModel)
+            code_predictor_model = self.model.model.talker.code_predictor.model
+            regionally_compile(code_predictor_model, dynamic=True)
+
+            logger.info("Qwen3TTS: Model compiled with torch.compile (regional compilation).")
+        except Exception as e:
+            logger.warning(f"Qwen3TTS: torch.compile failed with error: {e}. Using eager mode.")
 
     def forward(
         self,
