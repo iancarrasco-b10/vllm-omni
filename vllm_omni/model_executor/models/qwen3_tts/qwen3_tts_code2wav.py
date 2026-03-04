@@ -218,17 +218,20 @@ class Qwen3TTSCode2Wav(nn.Module):
         if wav.shape[0] > expected_len:
             wav = wav[:expected_len]
 
-        if ctx_frames > 0:
-            cut = ctx_frames * upsample
-            if cut < wav.shape[0]:
-                wav = wav[cut:]
-            else:
-                logger.warning(
-                    "Context trim %d >= decoded length %d; returning empty audio.",
-                    cut,
-                    wav.shape[0],
-                )
-                return empty_audio, empty_sr
+        # Trim left-context from the start. When ctx_frames > 0 the decoder
+        # was fed context for overlap; when ctx_frames == 0 we're at the start
+        # of the stream and trim one frame of decoder warmup to reduce leading noise.
+        leading_trim_frames = ctx_frames if ctx_frames > 0 else 1
+        cut = leading_trim_frames * upsample
+        if cut < wav.shape[0]:
+            wav = wav[cut:]
+        else:
+            logger.warning(
+                "Context trim %d >= decoded length %d; returning empty audio.",
+                cut,
+                wav.shape[0],
+            )
+            return empty_audio, empty_sr
 
         audio_tensor = wav.to(dtype=torch.float32).reshape(-1)
         sr_tensor = torch.tensor(sr_val, dtype=torch.int32)

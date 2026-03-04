@@ -630,7 +630,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if request.max_new_tokens is not None:
             params["max_new_tokens"] = [request.max_new_tokens]
         else:
-            params["max_new_tokens"] = [2048]
+            params["max_new_tokens"] = [4096]
 
         # VoiceDesign requires non_streaming_mode (match offline script behaviour).
         if params["task_type"][0] == "VoiceDesign":
@@ -693,7 +693,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             tts_params.get("task_type", ["unknown"])[0],
         )
 
-        sampling_params_list = self.engine_client.default_sampling_params_list
+        # Use request max_new_tokens for the Talker stage so the scheduler does not
+        # stop before the model; avoids truncated audio on long text.
+        max_tokens = tts_params.get("max_new_tokens", [4096])[0]
+        default_list = self.engine_client.default_sampling_params_list
+        sampling_params_list = []
+        for i, sp in enumerate(default_list):
+            sp_clone = sp.clone()
+            if i == 0 and hasattr(sp_clone, "max_tokens"):
+                sp_clone.max_tokens = max_tokens
+            sampling_params_list.append(sp_clone)
 
         generator = self.engine_client.generate(
             prompt=prompt,
