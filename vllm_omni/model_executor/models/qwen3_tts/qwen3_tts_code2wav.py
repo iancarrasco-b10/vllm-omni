@@ -17,6 +17,13 @@ from .qwen3_tts_tokenizer import Qwen3TTSTokenizer
 
 logger = init_logger(__name__)
 
+# Number of codec frames to trim from the start when ctx_frames==0 to remove
+# decoder warmup artifacts. Increase if leading audio is still garbled; reduce
+# to 2–3 if the first syllable gets cut off.
+# Only applied when we have at least this many frames (so small streaming
+# chunks still emit audio and TTFA is preserved).
+_LEADING_WARMUP_TRIM_FRAMES = 5
+
 
 class Qwen3TTSCode2Wav(nn.Module):
     """Stage-1 code2wav model for Qwen3-TTS (GenerationModelRunner).
@@ -220,8 +227,16 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         # Trim left-context from the start. When ctx_frames > 0 the decoder
         # was fed context for overlap; when ctx_frames == 0 we're at the start
-        # of the stream and trim one frame of decoder warmup to reduce leading noise.
-        leading_trim_frames = ctx_frames if ctx_frames > 0 else 1
+        # of the stream and trim several frames of decoder warmup to reduce
+        # leading garbled artifacts. Only trim when we have enough frames so
+        # small streaming chunks (e.g. 1 frame) still emit audio and TTFA is
+        # preserved.
+        if ctx_frames > 0:
+            leading_trim_frames = ctx_frames
+        elif total_frames >= _LEADING_WARMUP_TRIM_FRAMES:
+            leading_trim_frames = _LEADING_WARMUP_TRIM_FRAMES
+        else:
+            leading_trim_frames = 0
         cut = leading_trim_frames * upsample
         if cut < wav.shape[0]:
             wav = wav[cut:]

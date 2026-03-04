@@ -120,6 +120,12 @@ class OmniRequestState(RequestState):
                             # When the audio tensor shape is inconsistent, torch.cat will fail.
                             # We need to use torch.cat in -1 dimension.
                             continue
+                        elif k == "model_outputs":
+                            # TTS audio chunks: keep as list so downstream can concat on dim=-1.
+                            continue
+                        elif k == "sr":
+                            # Sample rate is the same for all chunks; keep a single scalar.
+                            self.mm_accumulated[k] = v[-1]
                         else:
                             self.mm_accumulated[k] = torch.cat(v, dim=0)
                     except Exception:
