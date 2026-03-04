@@ -736,14 +736,57 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         generator = await self._prepare_tts_generator(request)
 
+        # With async_chunk, the generator yields multiple times (once per audio chunk).
+        # We must accumulate all chunks across yields; otherwise we keep only the last
+        # yield and lose the rest, causing cutoff (and "every other request" when
+        # sometimes only one yield is produced).
         final_output: OmniRequestOutput | None = None
+        all_audio_chunks: list = []
+        sample_rate_val: int = 24000
         async for res in generator:
             final_output = res
+            audio_output = None
+            if hasattr(res, "multimodal_output") and res.multimodal_output:
+                audio_output = res.multimodal_output
+            if not audio_output and hasattr(res, "request_output") and res.request_output:
+                audio_output = getattr(res.request_output, "multimodal_output", None)
+            if not audio_output:
+                continue
+            audio_key = "audio" if "audio" in audio_output else ("model_outputs" if "model_outputs" in audio_output else None)
+            if audio_key is None:
+                continue
+            sr_raw = audio_output.get("sr")
+            if sr_raw is not None:
+                sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
+                sample_rate_val = int(sr_val.item() if hasattr(sr_val, "item") else sr_val)
+            audio_val = audio_output[audio_key]
+            if isinstance(audio_val, list):
+                all_audio_chunks.extend(audio_val)
+            elif audio_val is not None:
+                all_audio_chunks.append(audio_val)
 
         if final_output is None:
             raise ValueError("No output generated from the model.")
 
-        audio_chunk = self._extract_audio_from_output(final_output)
+        # If we accumulated chunks from multiple yields, attach the full list to the
+        # last output so _extract_audio_from_output sees the complete audio.
+        if all_audio_chunks:
+            comp = None
+            if hasattr(final_output, "request_output") and final_output.request_output is not None:
+                outputs = getattr(final_output.request_output, "outputs", None)
+                if isinstance(outputs, list) and outputs:
+                    comp = outputs[0]
+            if comp is not None and hasattr(comp, "multimodal_output") and isinstance(comp.multimodal_output, dict):
+                comp.multimodal_output["model_outputs"] = all_audio_chunks
+                if "sr" not in comp.multimodal_output or comp.multimodal_output["sr"] is None:
+                    import torch
+                    comp.multimodal_output["sr"] = torch.tensor(sample_rate_val, dtype=torch.int32)
+            else:
+                # No completion output to attach; use a minimal wrapper so we don't lose chunks.
+                import torch
+                class _AudioOutputWrapper:
+                    multimodal_output = {"model_outputs": all_audio_chunks, "sr": torch.tensor(sample_rate_val, dtype=torch.int32)}
+                final_output = _AudioOutputWrapper()
         if audio_chunk is None:
             raise ValueError("TTS model did not produce audio output.")
 
