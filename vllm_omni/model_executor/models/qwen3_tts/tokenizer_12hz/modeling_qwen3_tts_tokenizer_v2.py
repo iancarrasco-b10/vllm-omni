@@ -197,12 +197,13 @@ class Qwen3TTSTokenizerV2CausalTransConvNet(nn.Module):
         self.conv = nn.ConvTranspose1d(in_channels, out_channels, kernel_size, stride=stride)
 
         pad = kernel_size - stride
-        self.left_pad = math.ceil(pad)
-        self.right_pad = pad = self.left_pad
+        self.left_pad = 0
+        self.right_pad = int(pad)
 
     def forward(self, hidden_state):
         hidden_state = self.conv(hidden_state)
-        hidden_state = hidden_state[..., self.left_pad : hidden_state.shape[-1] - self.right_pad]
+        if self.right_pad > 0:
+            hidden_state = hidden_state[..., : hidden_state.shape[-1] - self.right_pad]
         return hidden_state.contiguous()
 
 
@@ -847,6 +848,42 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
 
         self.post_init()
 
+        self._cudagraph_enabled = False
+        self._cudagraph_wrapper = None
+
+    def enable_cudagraph(
+        self,
+        exact_sizes: list[int] | None = None,
+        bucket_sizes: list[int] | None = None,
+        device: torch.device | None = None,
+    ):
+        from ..cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
+
+        if device is None:
+            device = next(self.parameters()).device
+        if device.type != "cuda":
+            logger.warning(
+                "Cannot enable CUDA Graph: decoder is not on a CUDA device (got %s)",
+                device,
+            )
+            return
+
+        self._cudagraph_wrapper = CUDAGraphDecoderWrapper(
+            decoder=self,
+            exact_sizes=exact_sizes,
+            bucket_sizes=bucket_sizes,
+            num_quantizers=self.config.num_quantizers,
+            enabled=True,
+        )
+        self._cudagraph_wrapper.warmup(device, dtype=torch.long)
+        self._cudagraph_enabled = True
+        logger.info("CUDA Graph enabled for decoder")
+
+    def disable_cudagraph(self):
+        self._cudagraph_enabled = False
+        self._cudagraph_wrapper = None
+        logger.info("CUDA Graph disabled for decoder")
+
     def forward(self, codes):
         if codes.shape[1] != self.config.num_quantizers:
             raise ValueError(f"Expected {self.config.num_quantizers} layer of codes, got {codes.shape[1]}")
@@ -865,6 +902,11 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         return wav.clamp(min=-1, max=1)
 
     def chunked_decode(self, codes, chunk_size=300, left_context_size=25):
+        if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
+            return self._cudagraph_wrapper.chunked_decode_with_cudagraph(
+                codes, chunk_size, left_context_size
+            )
+
         wavs = []
         start_index = 0
         while start_index < codes.shape[-1]:

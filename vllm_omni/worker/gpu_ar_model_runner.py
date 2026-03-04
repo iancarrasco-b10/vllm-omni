@@ -13,7 +13,8 @@ import numpy as np
 import torch
 from vllm.config import CUDAGraphMode
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
-from vllm.distributed.kv_transfer import get_kv_transfer_group
+from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
@@ -28,9 +29,6 @@ from vllm.v1.worker.gpu_model_runner import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncGPUModelRunnerOutput,
     IntermediateTensors,
-    get_pp_group,
-    get_tp_group,
-    has_kv_transfer_group,
 )
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
@@ -52,7 +50,10 @@ class ExecuteModelState(NamedTuple):
     aux_hidden_states: list[torch.Tensor] | None
     ec_connector_output: Any
     cudagraph_stats: Any
+    # OMNI: multimodal_outputs field for omni-specific multimodal handling
     multimodal_outputs: Any
+    # slot_mappings for attention/drafter (aligned with upstream v1 API)
+    slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None
 
 
 class GPUARModelRunner(OmniGPUModelRunner):
@@ -221,6 +222,24 @@ class GPUARModelRunner(OmniGPUModelRunner):
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
+            # True if any attention backend handles KV cache update separately
+            # from forward() (i.e., forward_includes_kv_cache_update=False). When true,
+            # slot_mappings must use padded dimensions to match the key/value tensors.
+            from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec
+
+            has_separate_kv_update = not all(
+                all(g.backend.forward_includes_kv_cache_update for g in self.attn_groups[id])
+                for id, spec in enumerate(self.kv_cache_config.kv_cache_groups)
+                if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
+            )
+
+            slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+                num_tokens_padded=num_tokens_padded if pad_attn or has_separate_kv_update else num_tokens_unpadded,
+                num_reqs_padded=(num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs),
+                num_tokens_unpadded=num_tokens_unpadded,
+                ubatch_slices=ubatch_slices_padded,
+            )
+
             attn_metadata, spec_decode_common_attn_metadata = self._build_attention_metadata(
                 num_tokens=num_tokens_unpadded,
                 num_tokens_padded=num_tokens_padded if pad_attn else None,
@@ -232,6 +251,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 use_spec_decode=use_spec_decode,
                 num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                 cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                slot_mappings=slot_mappings_by_group,
             )
 
             (
@@ -262,10 +282,13 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 cudagraph_runtime_mode=cudagraph_mode,
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
+                slot_mapping=slot_mappings,  # OMNI: required for KV cache operations
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
+            import time as _time
+            _fwd_t0 = _time.perf_counter()
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -276,6 +299,20 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 logits_index=logits_indices,
                 sampler=self.sampler,
             )
+            _fwd_t1 = _time.perf_counter()
+            _fwd_ms = (_fwd_t1 - _fwd_t0) * 1000.0
+            if not hasattr(self, "_fwd_count"):
+                self._fwd_count = 0
+                self._fwd_total_ms = 0.0
+            self._fwd_count += 1
+            self._fwd_total_ms += _fwd_ms
+            if self._fwd_count % 5 == 1:
+                logger.info(
+                    "[Stage-0 AR] #%d  model_forward=%.1fms  num_tokens=%d  "
+                    "cudagraph=%s  avg=%.1fms",
+                    self._fwd_count, _fwd_ms, num_scheduled_tokens,
+                    cudagraph_mode, self._fwd_total_ms / self._fwd_count,
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -368,6 +405,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             ec_connector_output,
             cudagraph_stats,
             multimodal_outputs,
+            slot_mappings,  # OMNI: pass slot_mappings for drafter
         )
         self.kv_connector_output = kv_connector_output
 
@@ -410,6 +448,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             ec_connector_output,
             cudagraph_stats,
             multimodal_outputs,
+            slot_mappings,  # OMNI: unpack slot_mappings for drafter
         ) = self.execute_model_state
         self.execute_model_state = None
 
@@ -436,6 +475,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     aux_hidden_states,
                     spec_decode_metadata,
                     spec_decode_common_attn_metadata,
+                    slot_mappings,  # OMNI: pass slot_mappings to drafter (upstream v1 API)
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
@@ -498,7 +538,22 @@ class GPUARModelRunner(OmniGPUModelRunner):
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
 
+        import time as _time
+        _hs_t0 = _time.perf_counter()
         hidden_states_cpu = hidden_states.detach().to("cpu").contiguous()
+        _hs_t1 = _time.perf_counter()
+        _hs_ms = (_hs_t1 - _hs_t0) * 1000.0
+        if not hasattr(self, "_hs_copy_count"):
+            self._hs_copy_count = 0
+            self._hs_copy_total_ms = 0.0
+        self._hs_copy_count += 1
+        self._hs_copy_total_ms += _hs_ms
+        if self._hs_copy_count % 5 == 1:
+            logger.info(
+                "[Stage-0 AR] #%d  hidden_states→cpu=%.1fms  shape=%s  avg=%.1fms",
+                self._hs_copy_count, _hs_ms, list(hidden_states.shape),
+                self._hs_copy_total_ms / self._hs_copy_count,
+            )
         num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
         if num_scheduled_tokens_np is None:
             req_ids = self.input_batch.req_ids

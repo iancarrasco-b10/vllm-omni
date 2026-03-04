@@ -48,6 +48,10 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description="Maximum tokens to generate",
     )
+    stream: bool = Field(
+        default=False,
+        description="Stream audio chunks as they are generated",
+    )
 
     @field_validator("stream_format")
     @classmethod
@@ -72,3 +76,31 @@ class CreateAudio(BaseModel):
 class AudioResponse(BaseModel):
     audio_data: bytes | str
     media_type: str
+
+
+class StreamingSpeechSessionConfig(BaseModel):
+    """Configuration sent as the first WebSocket message for streaming TTS.
+
+    For voice cloning (task_type="Base"), you can provide ref_audio (base64
+    data URI) and ref_text inline.  When voice_name is also set, the server
+    caches the voice clone in /tmp so subsequent sessions with the same
+    voice_name skip the expensive embedding extraction.
+    """
+
+    model: str | None = None
+    voice: str | None = None
+    task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
+    language: str | None = None
+    instructions: str | None = None
+    response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] = "wav"
+    speed: float | None = Field(default=1.0, ge=0.25, le=4.0)
+    max_new_tokens: int | None = None
+    ref_audio: str | None = None
+    ref_text: str | None = None
+    x_vector_only_mode: bool | None = None
+    voice_name: str | None = Field(
+        default=None,
+        description="Name for caching the voice clone. On first use, provide "
+        "ref_audio too; subsequent sessions with the same voice_name "
+        "reuse the cached embeddings without needing ref_audio.",
+    )

@@ -236,6 +236,63 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
     return stage_args
 
 
+def auto_assign_stage_devices(stage_configs: list) -> list:
+    """Spread stages across available GPUs when all stages target the same device.
+
+    If multiple CUDA devices are available and every stage in the config
+    uses the same single GPU, reassign them round-robin (stage 0 -> GPU 0,
+    stage 1 -> GPU 1, etc.) and bump gpu_memory_utilization since each
+    stage now has a dedicated GPU.
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return stage_configs
+        num_gpus = torch.cuda.device_count()
+        if num_gpus < 2:
+            return stage_configs
+    except ImportError:
+        return stage_configs
+
+    devices = []
+    for cfg in stage_configs:
+        rt = getattr(cfg, "runtime", None)
+        if rt is None:
+            return stage_configs
+        dev = str(rt.get("devices", "0"))
+        devices.append(dev)
+
+    if len(set(devices)) != 1:
+        return stage_configs
+
+    num_stages = len(stage_configs)
+    if num_stages <= 1:
+        return stage_configs
+
+    logger.info(
+        "Auto-assigning %d stages across %d GPUs (was all on device %s).",
+        num_stages, min(num_gpus, num_stages), devices[0],
+    )
+
+    for i, cfg in enumerate(stage_configs):
+        gpu_id = i % num_gpus
+        cfg.runtime.devices = str(gpu_id)
+
+        ea = getattr(cfg, "engine_args", None)
+        if ea is not None and hasattr(ea, "gpu_memory_utilization"):
+            old_util = float(ea.gpu_memory_utilization)
+            new_util = min(0.9, old_util + 0.15)
+            ea.gpu_memory_utilization = new_util
+
+        logger.info(
+            "  Stage %d -> GPU %d (gpu_memory_utilization=%.2f)",
+            i, gpu_id,
+            float(getattr(ea, "gpu_memory_utilization", 0)) if ea else 0,
+        )
+
+    return stage_configs
+
+
 def get_final_stage_id_for_e2e(
     output_modalities: list[str] | None, default_modalities: list[str], stage_list: list
 ) -> int:
@@ -280,3 +337,63 @@ def get_final_stage_id_for_e2e(
         final_stage_id_for_e2e = last_stage_id
 
     return final_stage_id_for_e2e
+
+
+# The following code detects if the process is running in a container and if
+# PID host is available. If so, we can use process-scoped memory tracking;
+# otherwise we need sequential init locks.
+
+
+def _read_text(path: str) -> str | None:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+
+
+def in_container() -> bool:
+    # Common Docker signal
+    if os.path.exists("/.dockerenv"):
+        return True
+
+    # cgroup markers (works for Docker/containerd/K8s/Podman in many setups)
+    cg = _read_text("/proc/1/cgroup") or ""
+    markers = ("docker", "containerd", "kubepods", "libpod", "podman")
+    return any(m in cg for m in markers)
+
+
+def has_pid_host() -> bool | None:
+    """
+    Returns:
+      True  -> very likely running with --pid=host (host PID namespace)
+      False -> very likely isolated PID namespace (default)
+      None  -> cannot determine
+    """
+    # Strong signal: in host pid namespace, PID 2 is usually kthreadd
+    comm2 = _read_text("/proc/2/comm")
+    if comm2 is not None:
+        comm2 = comm2.strip()
+        if comm2 == "kthreadd":
+            return True
+        # If PID 2 exists and is NOT kthreadd, we're almost certainly not in host pid ns
+        return False
+
+    # Fallback: check for other low-numbered kernel threads (best-effort)
+    for pid, name in [(3, "rcu_gp"), (4, "rcu_par_gp"), (10, "ksoftirqd/0")]:
+        comm = _read_text(f"/proc/{pid}/comm")
+        if comm is not None:
+            if comm.strip() == name:
+                return True
+            else:
+                return False
+
+    return False
+
+
+def detect_pid_host() -> bool:
+    ic = in_container()
+    if not ic:
+        return True
+
+    return has_pid_host()

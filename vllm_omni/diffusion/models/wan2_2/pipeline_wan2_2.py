@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from collections.abc import Iterable
-from typing import cast
+from typing import Any, cast
 
 import PIL.Image
 import torch
@@ -18,12 +18,14 @@ from transformers import AutoTokenizer, UMT5EncoderModel
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniTextPrompt
+from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
 
@@ -184,7 +186,7 @@ def get_wan22_pre_process_func(
     return pre_process_func
 
 
-class Wan22Pipeline(nn.Module):
+class Wan22Pipeline(nn.Module, CFGParallelMixin):
     def __init__(
         self,
         *,
@@ -227,17 +229,30 @@ class Wan22Pipeline(nn.Module):
             except Exception:
                 pass
 
+        self.boundary_ratio = od_config.boundary_ratio
+
+        # Determine which transformers to load based on boundary_ratio
+        # boundary_ratio=1.0: only load transformer_2 (low-noise stage only)
+        # boundary_ratio=0.0: only load transformer (high-noise stage only)
+        # otherwise: load both transformers
+        load_transformer = self.boundary_ratio != 1.0 if self.boundary_ratio is not None else True
+        load_transformer_2 = self.has_transformer_2 and (
+            self.boundary_ratio != 0.0 if self.boundary_ratio is not None else True
+        )
+
         # Set up weights sources for transformer(s)
-        self.weights_sources = [
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=od_config.model,
-                subfolder="transformer",
-                revision=None,
-                prefix="transformer.",
-                fall_back_to_pt=True,
-            ),
-        ]
-        if self.has_transformer_2:
+        self.weights_sources = []
+        if load_transformer:
+            self.weights_sources.append(
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=od_config.model,
+                    subfolder="transformer",
+                    revision=None,
+                    prefix="transformer.",
+                    fall_back_to_pt=True,
+                )
+            )
+        if load_transformer_2:
             self.weights_sources.append(
                 DiffusersPipelineLoader.ComponentSource(
                     model_or_path=od_config.model,
@@ -257,13 +272,25 @@ class Wan22Pipeline(nn.Module):
         ).to(self.device)
 
         # Initialize transformers with correct config (weights loaded via load_weights)
-        transformer_config = load_transformer_config(model, "transformer", local_files_only)
-        self.transformer = create_transformer_from_config(transformer_config)
-        if self.has_transformer_2:
+        if load_transformer:
+            transformer_config = load_transformer_config(model, "transformer", local_files_only)
+            self.transformer = create_transformer_from_config(transformer_config)
+        else:
+            self.transformer = None
+
+        if load_transformer_2:
             transformer_2_config = load_transformer_config(model, "transformer_2", local_files_only)
             self.transformer_2 = create_transformer_from_config(transformer_2_config)
         else:
             self.transformer_2 = None
+
+        # Store the active transformer config
+        if load_transformer:
+            self.transformer_config = self.transformer.config
+        elif load_transformer_2:
+            self.transformer_config = self.transformer_2.config
+        else:
+            raise RuntimeError("No transformer loaded")
 
         # Initialize UniPC scheduler
         flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0  # default for 720p
@@ -275,7 +302,6 @@ class Wan22Pipeline(nn.Module):
 
         self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if getattr(self, "vae", None) else 4
         self.vae_scale_factor_spatial = self.vae.config.scale_factor_spatial if getattr(self, "vae", None) else 8
-        self.boundary_ratio = od_config.boundary_ratio
 
         self._guidance_scale = None
         self._guidance_scale_2 = None
@@ -333,7 +359,7 @@ class Wan22Pipeline(nn.Module):
 
         # Ensure dimensions are compatible with VAE and patch size
         # For expand_timesteps mode, we need latent dims to be even (divisible by patch_size)
-        patch_size = self.transformer.config.patch_size
+        patch_size = self.transformer_config.patch_size
         mod_value = self.vae_scale_factor_spatial * patch_size[1]  # 16*2=32 for TI2V, 8*2=16 for I2V
         height = (height // mod_value) * mod_value
         width = (width // mod_value) * mod_value
@@ -358,6 +384,13 @@ class Wan22Pipeline(nn.Module):
         self._guidance_scale = guidance_low
         self._guidance_scale_2 = guidance_high
 
+        # Prefer engine-configured boundary_ratio, but allow per-request fallback.
+        boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else req.sampling_params.boundary_ratio
+
+        if boundary_ratio is None:
+            boundary_ratio = 0.875
+            logger.warning("boundary_ratio is required for T2V generation. using default value 0.875")
+
         # validate shapes
         self.check_inputs(
             prompt=prompt,
@@ -366,7 +399,8 @@ class Wan22Pipeline(nn.Module):
             width=width,
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
-            guidance_scale_2=guidance_high if self.boundary_ratio is not None else None,
+            guidance_scale_2=guidance_high if boundary_ratio is not None else None,
+            boundary_ratio=boundary_ratio,
         )
 
         if num_frames % self.vae_scale_factor_temporal != 1:
@@ -374,7 +408,14 @@ class Wan22Pipeline(nn.Module):
         num_frames = max(num_frames, 1)
 
         device = self.device
-        dtype = self.transformer.dtype
+        # Get dtype from whichever transformer is loaded
+        if self.transformer is not None:
+            dtype = self.transformer.dtype
+        elif self.transformer_2 is not None:
+            dtype = self.transformer_2.dtype
+        else:
+            # Fallback to text_encoder dtype if no transformer loaded
+            dtype = self.text_encoder.dtype
 
         # Seed / generator
         if generator is None:
@@ -407,8 +448,8 @@ class Wan22Pipeline(nn.Module):
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
         boundary_timestep = None
-        if self.boundary_ratio is not None:
-            boundary_timestep = self.boundary_ratio * self.scheduler.config.num_train_timesteps
+        if boundary_ratio is not None:
+            boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
 
         # Handle I2V mode when expand_timesteps=True and image is provided
         multi_modal_data = req.prompts[0].get("multi_modal_data", {}) if not isinstance(req.prompts[0], str) else None
@@ -444,7 +485,7 @@ class Wan22Pipeline(nn.Module):
                 image_tensor = image
 
             # Use out_channels for noise latents (not in_channels which includes condition)
-            num_channels_latents = self.transformer.config.out_channels
+            num_channels_latents = self.transformer_config.out_channels
             batch_size = prompt_embeds.shape[0]
 
             # Prepare noise latents
@@ -489,7 +530,7 @@ class Wan22Pipeline(nn.Module):
             first_frame_mask[:, :, 0] = 0
         else:
             # T2V mode: standard latent preparation
-            num_channels_latents = self.transformer.config.in_channels
+            num_channels_latents = self.transformer_config.in_channels
             latents = self.prepare_latents(
                 batch_size=prompt_embeds.shape[0],
                 num_channels_latents=num_channels_latents,
@@ -508,11 +549,30 @@ class Wan22Pipeline(nn.Module):
         # Denoising
         for t in timesteps:
             self._current_timestep = t
-            current_model = self.transformer
-            current_guidance_scale = guidance_low
-            if boundary_timestep is not None and t < boundary_timestep and self.transformer_2 is not None:
-                current_model = self.transformer_2
+
+            # Select model based on timestep and boundary_ratio
+            # High noise stage (t >= boundary_timestep): use transformer
+            # Low noise stage (t < boundary_timestep): use transformer_2
+            if boundary_timestep is not None and t < boundary_timestep:
+                # Low noise stage - always use guidance_high for this stage
                 current_guidance_scale = guidance_high
+                if self.transformer_2 is not None:
+                    current_model = self.transformer_2
+                elif self.transformer is not None:
+                    # Fallback to transformer if transformer_2 not loaded
+                    current_model = self.transformer
+                else:
+                    raise RuntimeError("No transformer available for low-noise stage")
+            else:
+                # High noise stage - always use guidance_low for this stage
+                current_guidance_scale = guidance_low
+                if self.transformer is not None:
+                    current_model = self.transformer
+                elif self.transformer_2 is not None:
+                    # Fallback to transformer_2 if transformer not loaded
+                    current_model = self.transformer_2
+                else:
+                    raise RuntimeError("No transformer available for high-noise stage")
 
             if self.expand_timesteps and latent_condition is not None:
                 # I2V mode: blend condition with latents using mask
@@ -520,7 +580,7 @@ class Wan22Pipeline(nn.Module):
                 latent_model_input = latent_model_input.to(dtype)
 
                 # Expand timesteps per patch - use floor division to match patch embedding
-                patch_size = self.transformer.config.patch_size
+                patch_size = self.transformer_config.patch_size
                 num_latent_frames = latents.shape[2]
                 patch_height = latents.shape[3] // patch_size[1]
                 patch_width = latents.shape[4] // patch_size[2]
@@ -535,26 +595,44 @@ class Wan22Pipeline(nn.Module):
                 latent_model_input = latents.to(dtype)
                 timestep = t.expand(latents.shape[0])
 
-            noise_pred = current_model(
-                hidden_states=latent_model_input,
-                timestep=timestep,
-                encoder_hidden_states=prompt_embeds,
-                attention_kwargs=attention_kwargs,
-                return_dict=False,
-            )[0]
+            do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
+            # Prepare kwargs for positive and negative predictions
+            positive_kwargs = {
+                "hidden_states": latent_model_input,
+                "timestep": timestep,
+                "encoder_hidden_states": prompt_embeds,
+                "attention_kwargs": attention_kwargs,
+                "return_dict": False,
+                "current_model": current_model,
+            }
+            if do_true_cfg:
+                negative_kwargs = {
+                    "hidden_states": latent_model_input,
+                    "timestep": timestep,
+                    "encoder_hidden_states": negative_prompt_embeds,
+                    "attention_kwargs": attention_kwargs,
+                    "return_dict": False,
+                    "current_model": current_model,
+                }
+            else:
+                negative_kwargs = None
 
-            if current_guidance_scale > 1.0 and negative_prompt_embeds is not None:
-                noise_uncond = current_model(
-                    hidden_states=latent_model_input,
-                    timestep=timestep,
-                    encoder_hidden_states=negative_prompt_embeds,
-                    attention_kwargs=attention_kwargs,
-                    return_dict=False,
-                )[0]
-                noise_pred = noise_uncond + current_guidance_scale * (noise_pred - noise_uncond)
+            # Predict noise with automatic CFG parallel handling
+            noise_pred = self.predict_noise_maybe_with_cfg(
+                do_true_cfg=do_true_cfg,
+                true_cfg_scale=current_guidance_scale,
+                positive_kwargs=positive_kwargs,
+                negative_kwargs=negative_kwargs,
+                cfg_normalize=False,
+            )
 
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+            # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
+            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
+        # Wan2.2 is prone to out of memory errors when predicting large videos
+        # so we empty the cache here to avoid OOM before vae decoding.
+        if current_omni_platform.is_available():
+            current_omni_platform.empty_cache()
         self._current_timestep = None
 
         # For I2V mode: blend final latents with condition
@@ -578,6 +656,21 @@ class Wan22Pipeline(nn.Module):
             output = self.vae.decode(latents, return_dict=False)[0]
 
         return DiffusionOutput(output=output)
+
+    def predict_noise(self, current_model: nn.Module | None = None, **kwargs: Any) -> torch.Tensor:
+        """
+        Forward pass through transformer to predict noise.
+
+        Args:
+            current_model: The transformer model to use (transformer or transformer_2)
+            **kwargs: Arguments to pass to the transformer
+
+        Returns:
+            Predicted noise tensor
+        """
+        if current_model is None:
+            current_model = self.transformer
+        return current_model(**kwargs)[0]
 
     def encode_prompt(
         self,
@@ -695,6 +788,7 @@ class Wan22Pipeline(nn.Module):
         prompt_embeds=None,
         negative_prompt_embeds=None,
         guidance_scale_2=None,
+        boundary_ratio=None,
     ):
         if height % 16 != 0 or width % 16 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 16 but are {height} and {width}.")
@@ -721,5 +815,5 @@ class Wan22Pipeline(nn.Module):
         ):
             raise ValueError(f"`negative_prompt` has to be of type `str` or `list` but is {type(negative_prompt)}")
 
-        if self.boundary_ratio is None and guidance_scale_2 is not None:
+        if boundary_ratio is None and guidance_scale_2 is not None:
             raise ValueError("`guidance_scale_2` is only supported when `boundary_ratio` is set.")
