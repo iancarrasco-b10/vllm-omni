@@ -5,6 +5,13 @@ and reports TTFA (Time To First Audio) and RTF (Real-Time Factor) statistics
 at each level.  Supports staggered connections so that sessions ramp up
 gradually rather than hammering the server all at once.
 
+TTFA with voice cloning (Base): If you pass --ref-audio and --voice-name,
+the first request is used to register the voice (cold path); all sweep
+sessions then use only voice_name (cached). This matches sweep_clone.py
+and keeps TTFA low. If you omit --voice-name and only pass --ref-audio,
+every session re-sends the reference audio and pays speaker-embedding
+cost, so TTFA will be much higher.
+
 Usage:
     # Sweep 1,2,4,8 concurrent sessions (default levels)
     python concurrency_sweep.py
@@ -392,6 +399,17 @@ async def main_async(args):
     if args.max_new_tokens is not None:
         config["max_new_tokens"] = args.max_new_tokens
 
+    # For Base/voice-clone: register once then sweep with voice_name only, so TTFA
+    # is comparable to sweep_clone (otherwise every session re-sends ref_audio).
+    sweep_config = dict(config)
+    do_register_first = (
+        args.task_type == "Base"
+        and args.ref_audio
+        and args.voice_name
+    )
+    if do_register_first:
+        sweep_config = {k: v for k, v in config.items() if k not in ("ref_audio", "ref_text")}
+
     texts = _resolve_texts(args)
 
     print("=" * 60)
@@ -417,12 +435,25 @@ async def main_async(args):
         print(f"Warmup:      {args.warmup} session(s)")
     print("=" * 60)
 
+    # One-time registration for Base + ref_audio + voice_name (so sweep uses cache)
+    if do_register_first:
+        print("\nRegistering voice (one session with ref_audio)...", end="", flush=True)
+        reg_result = await run_one_session(
+            args.url, texts[0], config, session_id=0,
+            concurrency_tag=0, round_num=-1,
+        )
+        if "error" in reg_result:
+            print(f" ERROR: {reg_result['error']}")
+            print("Sweep will still run but each session may re-send ref_audio.")
+        else:
+            print(" done. Sweep will use cached voice_name.")
+
     # Optional warmup: send a few requests so the server is primed
     if args.warmup > 0:
         print(f"\nWarming up with {args.warmup} sequential session(s)...")
         for w in range(args.warmup):
             result = await run_one_session(
-                args.url, texts[0], config, session_id=w,
+                args.url, texts[0], sweep_config, session_id=w,
                 concurrency_tag=0, round_num=-1,
             )
             if "error" in result:
@@ -447,7 +478,7 @@ async def main_async(args):
             results = await run_round(
                 args.url,
                 texts,
-                config,
+                sweep_config,
                 concurrency=level,
                 stagger=args.stagger,
                 round_num=rnd,

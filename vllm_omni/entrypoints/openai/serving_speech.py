@@ -410,6 +410,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Validate Base task requirements
         if task_type == "Base":
+            self._refresh_uploaded_speakers_cache()
             if request.voice is not None:
                 voice_lower = request.voice.lower()
                 if voice_lower in self.uploaded_speakers:
@@ -417,7 +418,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     if not Path(speaker_info["file_path"]).exists():
                         return f"Audio file for cached voice '{request.voice}' not found on disk"
                 elif request.ref_audio is None:
-                    return "Base task requires 'ref_audio' for voice cloning (or a previously cached voice_name)"
+                    return (
+                        f"Voice '{request.voice}' is not cached. "
+                        "Provide ref_audio (and optionally ref_text) to register a voice clone first."
+                    )
                 elif not (
                     request.ref_audio.startswith(("http://", "https://")) or request.ref_audio.startswith("data:")
                 ):

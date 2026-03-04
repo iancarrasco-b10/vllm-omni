@@ -118,12 +118,13 @@ class OmniStreamingSpeechHandler:
             elif config.voice_name:
                 # Reuse a previously cached voice clone — only voice_name
                 # is needed; no ref_audio or task_type required.
+                self._speech_service._refresh_uploaded_speakers_cache()
                 voice_key = config.voice_name.lower()
                 if voice_key not in self._speech_service.uploaded_speakers:
                     await self._send_error(
                         websocket,
-                        f"Voice '{config.voice_name}' not found in cache. "
-                        "Provide ref_audio on first use.",
+                        f"Voice '{config.voice_name}' is not cached. "
+                        "Provide ref_audio (and optionally ref_text) in session.config to register it first.",
                     )
                     return
 
@@ -131,6 +132,18 @@ class OmniStreamingSpeechHandler:
                 config.task_type = "Base"
                 config.ref_audio = None
                 config.ref_text = None
+
+            elif (config.task_type or "").lower() == "base" and config.voice and not config.ref_audio:
+                # Base task with voice but no ref_audio: voice must be cached.
+                self._speech_service._refresh_uploaded_speakers_cache()
+                voice_key = config.voice.lower()
+                if voice_key not in self._speech_service.uploaded_speakers:
+                    await self._send_error(
+                        websocket,
+                        f"Voice '{config.voice}' is not cached. "
+                        "Provide ref_audio (and optionally ref_text) to register a voice clone first.",
+                    )
+                    return
 
             # Determine text buffering strategy.
             # ICL mode interleaves ref_code with text in the prompt, so it
