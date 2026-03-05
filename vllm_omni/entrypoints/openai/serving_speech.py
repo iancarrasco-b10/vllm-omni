@@ -488,7 +488,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 buf = io.BytesIO(base64.b64decode(b64))
             else:
                 raise ValueError("ref_audio must be an http(s) URL or data: base64 URI")
-            audio, sr = sf.read(buf, dtype="float32", always_2d=False)
+            try:
+                audio, sr = sf.read(buf, dtype="float32", always_2d=False)
+            except Exception:
+                # Fallback for formats not supported by libsndfile (M4A, AAC, MP3, etc.)
+                from pydub import AudioSegment
+
+                buf.seek(0)
+                seg = AudioSegment.from_file(buf)
+                sr = seg.frame_rate
+                samples = np.array(seg.get_array_of_samples(), dtype=np.float32)
+                samples /= float(1 << (seg.sample_width * 8 - 1))
+                if seg.channels > 1:
+                    samples = samples.reshape(-1, seg.channels).mean(axis=-1)
+                audio = samples
             if isinstance(audio, np.ndarray) and audio.ndim > 1:
                 audio = np.mean(audio, axis=-1)
             return np.asarray(audio, dtype=np.float32), int(sr)
@@ -628,6 +641,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             params["ref_text"] = [request.ref_text]
         if request.x_vector_only_mode is not None:
             params["x_vector_only_mode"] = [request.x_vector_only_mode]
+
+        # ref_audio without ref_text can only use speaker embedding (x-vector).
+        if (
+            params["task_type"][0] == "Base"
+            and request.ref_audio is not None
+            and "ref_text" not in params
+            and "x_vector_only_mode" not in params
+        ):
+            params["x_vector_only_mode"] = [True]
 
         # Generation parameters
         if request.max_new_tokens is not None:

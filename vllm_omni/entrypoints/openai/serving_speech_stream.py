@@ -145,6 +145,15 @@ class OmniStreamingSpeechHandler:
                     )
                     return
 
+            # ref_audio without ref_text can only use speaker embedding.
+            if (
+                (config.task_type or "").lower() == "base"
+                and config.ref_audio
+                and not config.ref_text
+                and not config.x_vector_only_mode
+            ):
+                config.x_vector_only_mode = True
+
             # Determine text buffering strategy.
             # ICL mode interleaves ref_code with text in the prompt, so it
             # requires all text upfront.  x_vector_only mode only uses the
