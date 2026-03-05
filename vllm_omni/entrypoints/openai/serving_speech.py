@@ -279,8 +279,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # Fast path for streaming Base tasks with a warm cache.
             # The streaming formula doesn't depend on tokenized text length,
             # so we can skip the tokenizer entirely (~2-5 ms saved per request).
+            # Skip when non_streaming_mode is set (ICL) — the prompt is larger
+            # and requires the full tokenizer-based estimate.
+            non_streaming = bool((tts_params.get("non_streaming_mode") or [False])[0])
             cached_ref_code_len = (tts_params.get("_cached_ref_code_len") or [None])[0]
-            if task_type == "Base" and isinstance(cached_ref_code_len, (int, float)):
+            if task_type == "Base" and isinstance(cached_ref_code_len, (int, float)) and not non_streaming:
                 return self._fast_estimate_base_streaming(
                     tts_params, int(cached_ref_code_len), hf_config, talker_config
                 )
@@ -635,6 +638,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # VoiceDesign requires non_streaming_mode (match offline script behaviour).
         if params["task_type"][0] == "VoiceDesign":
             params["non_streaming_mode"] = [True]
+
+        # ICL mode (Base with ref_text, no x_vector_only) also requires
+        # non_streaming_mode.  In streaming mode the text+codec are interleaved
+        # positionally; when text_lens < codec_lens the eos is consumed during
+        # prefill and the model loses the text-timing signal during decode,
+        # causing unpredictable cutoff or runaway generation.
+        if params["task_type"][0] == "Base":
+            xvec = params.get("x_vector_only_mode", [True])[0]
+            if not xvec and "ref_text" in params:
+                params["non_streaming_mode"] = [True]
 
         return params
 
