@@ -560,6 +560,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 take = prompt_embeds_cpu[s:e]
                 if int(take.shape[0]) < span_len:
                     pad_n = int(span_len - int(take.shape[0]))
+                    logger.warning(
+                        "Prompt length MISMATCH (first prefill): actual=%d, placeholder(span_len)=%d, padding %d extra",
+                        int(prompt_embeds_cpu.shape[0]), span_len, pad_n,
+                    )
                     pad_rows = tts_pad_embed.detach().to("cpu").contiguous().reshape(1, -1).expand(pad_n, -1)
                     take = torch.cat([take, pad_rows], dim=0)
                 prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
@@ -1506,6 +1510,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         if instruct_embed is not None:
             talker_prompt = torch.cat([instruct_embed, talker_prompt], dim=1)
+
+        logger.info(
+            "Talker _build_prompt_embeds: actual prompt_len=%d, ref_code_len=%s, task_type=%s",
+            talker_prompt.shape[1], ref_code_len, task_type,
+        )
 
         return (
             talker_prompt.squeeze(0),  # [prompt_len, H]

@@ -22,7 +22,7 @@ Usage:
     python streaming_speech_client.py \
         --text "Hello world. How are you?" \
         --task-type Base \
-        --ref-audio /path/to/reference.wav \
+        --ref-audio finn-20s.wav \
         --ref-text "Transcript of reference audio"
 
 Requirements:
@@ -31,6 +31,7 @@ Requirements:
 
 import argparse
 import asyncio
+import base64
 import json
 import os
 
@@ -39,6 +40,31 @@ try:
 except ImportError:
     print("Please install websockets: pip install websockets")
     raise SystemExit(1)
+
+
+def encode_audio_to_base64(audio_path: str) -> str:
+    """Encode a local audio file to base64 data URL."""
+    if not os.path.exists(audio_path):
+        raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+    audio_path_lower = audio_path.lower()
+    if audio_path_lower.endswith(".wav"):
+        mime_type = "audio/wav"
+    elif audio_path_lower.endswith((".mp3", ".mpeg")):
+        mime_type = "audio/mpeg"
+    elif audio_path_lower.endswith((".m4a",)):
+        mime_type = "audio/mp4"
+    elif audio_path_lower.endswith(".flac"):
+        mime_type = "audio/flac"
+    elif audio_path_lower.endswith(".ogg"):
+        mime_type = "audio/ogg"
+    else:
+        mime_type = "audio/wav"
+
+    with open(audio_path, "rb") as f:
+        audio_bytes = f.read()
+    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+    return f"data:{mime_type};base64,{audio_b64}"
 
 
 async def stream_tts(
@@ -56,7 +82,6 @@ async def stream_tts(
         # 1. Send session config
         config_msg = {"type": "session.config", **config}
         await ws.send(json.dumps(config_msg))
-        print(f"Sent session config: {config}")
 
         # 2. Send text (either all at once or word-by-word)
         async def send_text():
@@ -139,7 +164,7 @@ def main():
     parser = argparse.ArgumentParser(description="Streaming text-input TTS client")
     parser.add_argument(
         "--url",
-        default="ws://localhost:8000/v1/audio/speech/stream",
+        default="ws://localhost:8091/v1/audio/speech/stream",
         help="WebSocket endpoint URL",
     )
     parser.add_argument(
@@ -209,14 +234,25 @@ def main():
         "response_format",
         "speed",
         "max_new_tokens",
-        "ref_audio",
-        "ref_text",
     ]:
         val = getattr(args, key.replace("-", "_"), None)
         if val is not None:
             config[key] = val
     if args.x_vector_only_mode:
         config["x_vector_only_mode"] = True
+
+    if args.ref_audio:
+        if args.ref_audio.startswith(("http://", "https://", "data:")):
+            config["ref_audio"] = args.ref_audio
+        else:
+            config["ref_audio"] = encode_audio_to_base64(args.ref_audio)
+
+    if args.ref_text:
+        if os.path.isfile(args.ref_text):
+            with open(args.ref_text) as f:
+                config["ref_text"] = f.read().strip()
+        else:
+            config["ref_text"] = args.ref_text
 
     asyncio.run(
         stream_tts(

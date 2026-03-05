@@ -84,6 +84,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         try:
             model_path = self.engine_client.model_config.model
             st_config_path = os.path.join(model_path, "speech_tokenizer", "config.json")
+            if not os.path.exists(st_config_path):
+                # model_path may be a HuggingFace model ID; resolve to local cache
+                try:
+                    from huggingface_hub import snapshot_download
+                    local_dir = snapshot_download(model_path, local_files_only=True)
+                    st_config_path = os.path.join(local_dir, "speech_tokenizer", "config.json")
+                except Exception:
+                    pass
             if os.path.exists(st_config_path):
                 with open(st_config_path) as f:
                     st_config = json.load(f)
@@ -511,6 +519,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 tts_params["ref_audio"] = [[wav_list, sr]]
 
             ph_len = self._estimate_prompt_len(tts_params)
+            logger.info("Estimated prompt_len (ph_len) = %d, codec_frame_rate = %s", ph_len, self._codec_frame_rate)
             prompt = {
                 "prompt_token_ids": [1] * ph_len,
                 "additional_information": tts_params,
@@ -638,6 +647,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
                 # Prompt length must match model-side embeddings; values are placeholders.
                 ph_len = self._estimate_prompt_len(tts_params)
+                logger.info("REST: Estimated prompt_len (ph_len) = %d, codec_frame_rate = %s", ph_len, self._codec_frame_rate)
                 prompt = {"prompt_token_ids": [1] * ph_len, "additional_information": tts_params}
             else:
                 tts_params = {}
