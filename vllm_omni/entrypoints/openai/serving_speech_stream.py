@@ -22,10 +22,12 @@ Protocol:
         {"type": "input.text", "text": "..."} # Text chunks
         {"type": "input.done"}            # End of input
         {"type": "voice.delete", "voice_name": "..."}  # Delete a cached voice
+        {"type": "voice.list"}                         # List available voices
 
     Server -> Client:
         {"type": "voice.registered", "voice_name": "...", "cached": true}
         {"type": "voice.deleted", "voice_name": "..."}
+        {"type": "voice.list", "voices": [...], "uploaded_voices": [...]}
         {"type": "audio.start", "sentence_index": 0, "sentence_text": "...", "format": "wav"}
         <binary frame: audio bytes>
         {"type": "audio.done", "sentence_index": 0}
@@ -281,10 +283,29 @@ class OmniStreamingSpeechHandler:
                 )
             return None
 
+        # Handle voice.list as a one-shot command
+        if msg.get("type") == "voice.list":
+            self._speech_service._refresh_uploaded_speakers_cache()
+            builtin = sorted(self._speech_service.supported_speakers - set(self._speech_service.uploaded_speakers.keys()))
+            uploaded = []
+            for key, info in self._speech_service.uploaded_speakers.items():
+                uploaded.append({
+                    "name": info.get("name", key),
+                    "cache_status": info.get("cache_status", "pending"),
+                    "has_ref_text": bool(info.get("ref_text")),
+                    "created_at": info.get("created_at", 0),
+                })
+            await websocket.send_json({
+                "type": "voice.list",
+                "voices": builtin,
+                "uploaded_voices": uploaded,
+            })
+            return None
+
         if msg.get("type") != "session.config":
             await self._send_error(
                 websocket,
-                f"Expected session.config or voice.delete, got: {msg.get('type')}",
+                f"Expected session.config, voice.delete, or voice.list, got: {msg.get('type')}",
             )
             return None
 
