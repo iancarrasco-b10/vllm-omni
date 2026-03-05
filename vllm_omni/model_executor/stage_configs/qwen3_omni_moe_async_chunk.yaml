@@ -112,6 +112,6 @@ runtime:
     connector_of_shared_memory:
       name: SharedMemoryConnector
       extra:
-        # Align with Omni: small chunks with sufficient context overlap.
-        codec_chunk_frames: 25 # code2wav decode chunk size
+        # Minimal chunk size for lowest TTFA; each codec frame is emitted immediately.
+        codec_chunk_frames: 1 # code2wav decode chunk size
         codec_left_context_frames: 25 # code2wav left context size

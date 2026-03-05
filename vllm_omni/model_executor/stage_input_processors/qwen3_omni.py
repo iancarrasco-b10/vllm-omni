@@ -223,7 +223,7 @@ def talker2code2wav_async_chunk(
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
-    chunk_size_config = int(cfg.get("codec_chunk_frames", 25))
+    chunk_size_config = int(cfg.get("codec_chunk_frames", 1))
     left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
 
     code_predictor_codes = pooling_output["code_predictor_codes"]
