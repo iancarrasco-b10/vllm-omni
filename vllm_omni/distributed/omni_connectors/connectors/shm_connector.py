@@ -118,21 +118,24 @@ class SharedMemoryConnector(OmniConnectorBase):
 
         from multiprocessing import shared_memory as shm_pkg
 
-        # Wait for shared memory to be available (with retry logic)
-        max_retries = 30
-        retry_delay = 0.1  # 100ms between retries
+        # Quick check with minimal retries.  The caller (recv_loop) already
+        # re-polls on every iteration, so blocking here for a long time only
+        # stalls other pending requests sharing the same recv thread.  A small
+        # number of retries absorbs minor write-read timing jitter while
+        # keeping the loop responsive.
+        max_retries = 3
+        retry_delay = 0.05  # 50ms between retries
         shm = None
 
         for attempt in range(max_retries):
             try:
                 shm = shm_pkg.SharedMemory(name=get_key)
-                break  # Successfully opened, exit retry loop
+                break
             except FileNotFoundError:
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay)
                 else:
-                    # Max retries reached, return None
-                    logger.warning(f"Shared memory '{get_key}' not found after {max_retries} retries")
+                    logger.debug(f"Shared memory '{get_key}' not ready yet (will retry on next poll)")
                     return None
 
         if shm is None:
