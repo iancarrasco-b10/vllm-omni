@@ -122,6 +122,11 @@ class StreamingSpeechSessionConfig(BaseModel):
         "ref_audio too; subsequent sessions with the same voice_name "
         "reuse the cached embeddings without needing ref_audio.",
     )
+    min_sentence_length: int | None = Field(
+        default=None,
+        description="Minimum character length before a sentence boundary triggers a split. "
+        "Higher values merge short sentences for better prosody.",
+    )
 
     # Sampling parameters for codec generation
     temperature: float | None = Field(

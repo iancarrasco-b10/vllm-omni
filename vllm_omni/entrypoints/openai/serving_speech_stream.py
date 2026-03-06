@@ -178,7 +178,9 @@ class OmniStreamingSpeechHandler:
                 else:
                     icl_mode = config.ref_text is not None
 
-            splitter = SentenceSplitter()
+            splitter = SentenceSplitter(
+                min_sentence_length=config.min_sentence_length or 20,
+            )
             sentence_index = 0
             text_buffer: list[str] = []
 

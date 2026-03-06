@@ -297,6 +297,9 @@ def main():
     parser.add_argument("--speed", type=float, default=1.0, help="Playback speed (0.25-4.0)")
     parser.add_argument("--max-new-tokens", type=int, default=None, help="Max tokens")
 
+    parser.add_argument("--min-sentence-length", type=int, default=None,
+                        help="Minimum characters before splitting at sentence boundary (default: 20)")
+
     # Sampling parameters
     parser.add_argument("--temperature", type=float, default=None,
                         help="Sampling temperature for codec generation (default: server-side 0.7)")
@@ -399,6 +402,7 @@ def main():
         "max_new_tokens",
         "ref_text",
         "voice_name",
+        "min_sentence_length",
         "temperature",
         "top_k",
         "top_p",
