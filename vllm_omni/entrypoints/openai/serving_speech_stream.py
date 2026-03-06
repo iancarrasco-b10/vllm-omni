@@ -16,6 +16,12 @@ Voice cloning:
     per-sentence streaming, which gives much lower TTFA at the cost of
     slightly reduced voice similarity.
 
+Sampling parameters:
+    session.config accepts optional ``temperature``, ``top_k``, ``top_p``,
+    and ``repetition_penalty`` fields to override the Talker stage's default
+    sampling.  Lower temperature/top_k produce more consistent voice
+    adherence at the cost of reduced expressiveness.
+
 Protocol:
     Client -> Server:
         {"type": "session.config", ...}   # Session config (sent once first)
@@ -364,6 +370,10 @@ class OmniStreamingSpeechHandler:
                 ref_audio=config.ref_audio,
                 ref_text=config.ref_text,
                 x_vector_only_mode=config.x_vector_only_mode,
+                temperature=config.temperature,
+                top_k=config.top_k,
+                top_p=config.top_p,
+                repetition_penalty=config.repetition_penalty,
             )
 
             audio_gen = self._speech_service._generate_audio_stream(request)

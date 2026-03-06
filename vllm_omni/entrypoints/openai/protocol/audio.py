@@ -53,6 +53,24 @@ class OpenAICreateSpeechRequest(BaseModel):
         description="Stream audio chunks as they are generated",
     )
 
+    # Sampling parameters for codec generation
+    temperature: float | None = Field(
+        default=None,
+        description="Sampling temperature for main codebook (lower = more consistent voice)",
+    )
+    top_k: int | None = Field(
+        default=None,
+        description="Top-k sampling for main codebook",
+    )
+    top_p: float | None = Field(
+        default=None,
+        description="Nucleus sampling threshold for main codebook",
+    )
+    repetition_penalty: float | None = Field(
+        default=None,
+        description="Repetition penalty for codec token generation",
+    )
+
     @field_validator("stream_format")
     @classmethod
     def validate_stream_format(cls, v: str) -> str:
@@ -103,4 +121,22 @@ class StreamingSpeechSessionConfig(BaseModel):
         description="Name for caching the voice clone. On first use, provide "
         "ref_audio too; subsequent sessions with the same voice_name "
         "reuse the cached embeddings without needing ref_audio.",
+    )
+
+    # Sampling parameters for codec generation
+    temperature: float | None = Field(
+        default=None,
+        description="Sampling temperature for main codebook (lower = more consistent voice)",
+    )
+    top_k: int | None = Field(
+        default=None,
+        description="Top-k sampling for main codebook",
+    )
+    top_p: float | None = Field(
+        default=None,
+        description="Nucleus sampling threshold for main codebook",
+    )
+    repetition_penalty: float | None = Field(
+        default=None,
+        description="Repetition penalty for codec token generation",
     )

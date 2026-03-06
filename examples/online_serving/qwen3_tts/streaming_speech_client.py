@@ -103,6 +103,33 @@ async def _delete_voice(url: str, voice_name: str) -> None:
             print(f"Unexpected response: {msg}")
 
 
+async def _list_voices(url: str) -> None:
+    """Connect to the WebSocket endpoint and send a voice.list command."""
+    async with websockets.connect(url) as ws:
+        await ws.send(json.dumps({"type": "voice.list"}))
+        raw = await ws.recv()
+        msg = json.loads(raw)
+        if msg.get("type") == "voice.list":
+            builtin = msg.get("voices", [])
+            uploaded = msg.get("uploaded_voices", [])
+            if builtin:
+                print("Built-in voices:")
+                for v in builtin:
+                    print(f"  {v}")
+            if uploaded:
+                print("Uploaded voices:")
+                for v in uploaded:
+                    status = v.get("cache_status", "?")
+                    mode = "ICL" if v.get("has_ref_text") else "x-vector"
+                    print(f"  {v['name']:20s}  {status:8s}  {mode}")
+            if not builtin and not uploaded:
+                print("No voices available.")
+        elif msg.get("type") == "error":
+            print(f"Error: {msg.get('message')}")
+        else:
+            print(f"Unexpected response: {msg}")
+
+
 async def stream_tts(
     url: str,
     text: str,
@@ -270,6 +297,16 @@ def main():
     parser.add_argument("--speed", type=float, default=1.0, help="Playback speed (0.25-4.0)")
     parser.add_argument("--max-new-tokens", type=int, default=None, help="Max tokens")
 
+    # Sampling parameters
+    parser.add_argument("--temperature", type=float, default=None,
+                        help="Sampling temperature for codec generation (default: server-side 0.7)")
+    parser.add_argument("--top-k", type=int, default=None,
+                        help="Top-k sampling for codec generation (default: server-side 30)")
+    parser.add_argument("--top-p", type=float, default=None,
+                        help="Nucleus sampling threshold (default: server-side 1.0)")
+    parser.add_argument("--repetition-penalty", type=float, default=None,
+                        help="Repetition penalty (default: server-side 1.05)")
+
     # Voice cloning options
     parser.add_argument(
         "--ref-audio",
@@ -302,6 +339,11 @@ def main():
         metavar="NAME",
         help="Delete a cached voice clone by name and exit.",
     )
+    parser.add_argument(
+        "--list-voices",
+        action="store_true",
+        help="List available voices and exit.",
+    )
 
     # STT simulation
     parser.add_argument(
@@ -321,6 +363,11 @@ def main():
     # Handle --delete-voice as a one-shot command
     if args.delete_voice:
         asyncio.run(_delete_voice(args.url, args.delete_voice))
+        return
+
+    # Handle --list-voices as a one-shot command
+    if args.list_voices:
+        asyncio.run(_list_voices(args.url))
         return
 
     # If ref-text looks like a file path, read its contents
@@ -352,6 +399,10 @@ def main():
         "max_new_tokens",
         "ref_text",
         "voice_name",
+        "temperature",
+        "top_k",
+        "top_p",
+        "repetition_penalty",
     ]:
         val = getattr(args, key.replace("-", "_"), None)
         if val is not None:

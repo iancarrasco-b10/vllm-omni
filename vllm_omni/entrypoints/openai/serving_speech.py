@@ -558,6 +558,27 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return audio_tensor, int(sample_rate)
 
+    def _build_sampling_params_list(self, request: OpenAICreateSpeechRequest) -> list:
+        """Clone default sampling params and apply client-side overrides.
+
+        Only the Talker stage (stage 0) params are overridden; Code2Wav
+        (stage 1) keeps its defaults.
+        """
+        defaults = self.engine_client.default_sampling_params_list
+        params_list = [p.clone() for p in defaults]
+
+        talker_params = params_list[0]
+        if request.temperature is not None:
+            talker_params.temperature = request.temperature
+        if request.top_k is not None:
+            talker_params.top_k = request.top_k
+        if request.top_p is not None:
+            talker_params.top_p = request.top_p
+        if request.repetition_penalty is not None:
+            talker_params.repetition_penalty = request.repetition_penalty
+
+        return params_list
+
     def _build_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         """Build TTS parameters from request.
 
@@ -728,7 +749,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             tts_params.get("task_type", ["unknown"])[0],
         )
 
-        sampling_params_list = self.engine_client.default_sampling_params_list
+        sampling_params_list = self._build_sampling_params_list(request)
 
         generator = self.engine_client.generate(
             prompt=prompt,
