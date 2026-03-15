@@ -227,26 +227,36 @@ def test_first_streaming_chunk_prepends_ref_code_context():
     assert len(payload["code_predictor_codes"]) == _Q * 12
 
 
-def test_ref_code_context_only_applies_to_first_streaming_chunk():
+def test_ref_code_context_prepended_to_undersized_windows():
+    """ref_code tail is prepended to any chunk where the window is undersized,
+    not just the first chunk.  This matches the FastAPI optimized backend
+    (_add_ref_code_context) and gives the decoder stable voice identity context
+    throughout early generation."""
     tm = _tm()
     rid = "r-ref2"
     tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(20)]
     tm.put_req_chunk[rid] = 1
     ref_code = torch.tensor([[9, 9, 9, 9], [8, 8, 8, 8]], dtype=torch.long)
+    # Store ref_code via pooling_output on an earlier call
+    tm.request_payload = {rid: ref_code}
 
     payload = talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output={"audio_codes": torch.zeros((0,)), "ref_code": ref_code},
+        pooling_output={"audio_codes": torch.zeros((0,))},
         request=_req(rid, finished=False, initial_codec_chunk_frames=10),
         is_finished=False,
     )
 
     assert payload is not None
-    assert payload["left_context_size"] == 10
-    assert len(payload["code_predictor_codes"]) == _Q * 20
+    # Window is 20 frames, target is left_context(25)+IC(10)=35, so 2 ref frames prepended
+    assert payload["left_context_size"] == 10 + 2  # 10 left_context + 2 ref_code
+    assert len(payload["code_predictor_codes"]) == _Q * 22  # 20 generated + 2 ref
 
 
 def test_ref_code_context_can_be_buffered_before_first_emit():
+    """ref_code is stored on the first pooling_output and persists across chunks.
+    It is prepended as context when the window is undersized, and cleaned up
+    only when the request finishes."""
     tm = _tm()
     rid = "r-ref-buffered"
     ref_code = torch.tensor([[9, 9, 9, 9], [8, 8, 8, 8]], dtype=torch.long)
@@ -276,8 +286,21 @@ def test_ref_code_context_can_be_buffered_before_first_emit():
     )
 
     assert payload is not None
+    # 10 frames generated, target window = left_context(25)+IC(10)=35
+    # So 2 ref_code frames are prepended as context
     assert payload["left_context_size"] == 2
     assert len(payload["code_predictor_codes"]) == _Q * 12
+    # ref_code persists until request finishes (not popped on first emit)
+    assert rid in tm.request_payload
+
+    # Verify cleanup on finish
+    finish_payload = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        pooling_output=None,
+        request=_req(rid, finished=True, initial_codec_chunk_frames=10),
+        is_finished=True,
+    )
+    assert finish_payload is not None
     assert rid not in tm.request_payload
 
 

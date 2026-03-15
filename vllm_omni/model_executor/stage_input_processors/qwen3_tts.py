@@ -181,13 +181,27 @@ def talker2code2wav_async_chunk(
     left_context_size = max(0, end_index - context_length)
     window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
 
-    # Prepend ref_code to the first decoder window only.
-    if transfer_manager.put_req_chunk[request_id] == 0:
-        ref_code = request_payload.pop(request_id, None)
-        if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
-            ref_frames = ref_code.tolist()
+    # Prepend ref_code as decoder context when the window is undersized.
+    # The FastAPI optimized backend prepends ref_code tail to *every* early chunk
+    # (not just the first) so the decoder always has voice identity context.
+    # Without this, early IC-phase chunks (e.g. 2-4 frames) have no voice
+    # reference, causing audible quality artifacts.
+    ref_code = request_payload.get(request_id)
+    if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
+        target_window = left_context_size_config + context_length
+        current_window = len(window_frames)
+        if current_window < target_window:
+            available_space = target_window - current_window
+            ref_code_frames = ref_code.shape[0]
+            n_ref = min(available_space, ref_code_frames)
+            # Use tail of ref_code (most recent context, matches FastAPI impl)
+            ref_frames = ref_code[-n_ref:].tolist()
             window_frames = ref_frames + window_frames
-            left_context_size += len(ref_frames)
+            left_context_size += n_ref
+
+    # Clean up ref_code when request is done to avoid memory leak.
+    if finished and request_id in request_payload:
+        del request_payload[request_id]
 
     code_predictor_codes = torch.tensor(window_frames).transpose(0, 1).reshape(-1).tolist()
 

@@ -886,6 +886,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 raise ValueError(validation_error)
 
             tts_params = self._build_tts_params(request)
+
             if request.ref_audio is not None:
                 wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
                 tts_params["ref_audio"] = [[wav_list, sr]]
