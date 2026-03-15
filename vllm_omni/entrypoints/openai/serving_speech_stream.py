@@ -8,11 +8,14 @@ Protocol:
         {"type": "session.config", ...}   # Session config (sent once first)
         {"type": "input.text", "text": "..."} # Text chunks
         {"type": "input.done"}            # End of input
+        {"type": "voice.delete", "voice_name": "..."}  # Delete a cached voice
 
     Server -> Client:
+        {"type": "voice.registered", "voice_name": "...", "cached": true}  # if voice_name provided
+        {"type": "voice.deleted", "voice_name": "...", "success": true}
         {"type": "audio.start", "sentence_index": 0, "sentence_text": "...", "format": "wav"}
         <binary frame: audio bytes>
-        {"type": "audio.done", "sentence_index": 0}
+        {"type": "audio.done", "sentence_index": 0, "sample_rate": 24000}
         {"type": "session.done", "total_sentences": N}
         {"type": "error", "message": "..."}
 """
@@ -79,6 +82,10 @@ class OmniStreamingSpeechHandler:
             if config is None:
                 return  # Error already sent, connection closing
 
+            # If voice_name is provided, map it to the voice field for cache lookup
+            if config.voice_name:
+                config.voice = config.voice_name
+
             # Validate model if specified
             if config.model and hasattr(self._speech_service, "_check_model"):
                 error = await self._speech_service._check_model(
@@ -87,6 +94,14 @@ class OmniStreamingSpeechHandler:
                 if error is not None:
                     await self._send_error(websocket, str(error))
                     return
+
+            # Check if voice is already cached and notify client
+            if config.voice_name and self._speech_service._has_voice_cache(config.voice_name):
+                await websocket.send_json({
+                    "type": "voice.registered",
+                    "voice_name": config.voice_name,
+                    "cached": True,
+                })
 
             boundary_re = SPLIT_CLAUSE if config.split_granularity == "clause" else SPLIT_SENTENCE
             splitter = SentenceSplitter(boundary_re=boundary_re)
@@ -144,6 +159,9 @@ class OmniStreamingSpeechHandler:
                         }
                     )
                     return
+
+                elif msg_type == "voice.delete":
+                    await self._handle_voice_delete(websocket, msg)
 
                 else:
                     await self._send_error(
@@ -264,16 +282,86 @@ class OmniStreamingSpeechHandler:
             await self._send_error(websocket, f"Generation failed for sentence {sentence_index}: {e}")
         finally:
             try:
-                await websocket.send_json(
-                    {
-                        "type": "audio.done",
-                        "sentence_index": sentence_index,
-                        "total_bytes": total_bytes,
-                        "error": generation_failed,
-                    }
-                )
+                done_payload: dict = {
+                    "type": "audio.done",
+                    "sentence_index": sentence_index,
+                    "total_bytes": total_bytes,
+                    "sample_rate": _PCM_SAMPLE_RATE,
+                    "error": generation_failed,
+                }
+                await websocket.send_json(done_payload)
             except Exception:
                 logger.debug("Failed to send audio.done for sentence %d", sentence_index, exc_info=True)
+
+            # After first sentence, check if voice was newly cached and notify
+            if (
+                sentence_index == 0
+                and config.voice_name
+                and not generation_failed
+                and self._speech_service._has_voice_cache(config.voice_name)
+            ):
+                try:
+                    await websocket.send_json({
+                        "type": "voice.registered",
+                        "voice_name": config.voice_name,
+                        "cached": True,
+                    })
+                    # Clear ref_audio for subsequent sentences — cache will be used
+                    config.ref_audio = None
+                    config.ref_text = None
+                except Exception:
+                    logger.debug("Failed to send voice.registered", exc_info=True)
+
+    async def _handle_voice_delete(self, websocket: WebSocket, msg: dict) -> None:
+        """Handle a voice.delete request.
+
+        Deletes from both uploaded_speakers registry and voice cache (safetensors).
+        """
+        voice_name = msg.get("voice_name")
+        if not voice_name or not isinstance(voice_name, str):
+            await self._send_error(websocket, "voice.delete requires a 'voice_name' string")
+            return
+
+        try:
+            # Try uploaded speakers first
+            deleted_uploaded = await self._speech_service.delete_voice(voice_name)
+
+            # Also clean up voice cache files (safetensors + wav)
+            deleted_cache = self._delete_voice_cache_files(voice_name)
+
+            success = deleted_uploaded or deleted_cache
+            await websocket.send_json({
+                "type": "voice.deleted",
+                "voice_name": voice_name,
+                "success": success,
+            })
+            if success:
+                logger.info("Voice %r deleted via WebSocket (uploaded=%s, cache=%s)",
+                            voice_name, deleted_uploaded, deleted_cache)
+            else:
+                logger.warning("Voice %r not found for deletion via WebSocket", voice_name)
+        except Exception as e:
+            logger.error("Failed to delete voice %r: %s", voice_name, e)
+            await self._send_error(websocket, f"Failed to delete voice '{voice_name}': {e}")
+
+    @staticmethod
+    def _delete_voice_cache_files(voice_name: str) -> bool:
+        """Remove safetensors + wav voice cache files from disk."""
+        import os
+        from pathlib import Path
+
+        cache_dir = Path(os.environ.get("SPEECH_VOICE_SAMPLES", "/tmp/voice_samples"))
+        deleted = False
+        for ext in (".safetensors", ".wav"):
+            path = cache_dir / f"{voice_name.lower()}{ext}"
+            if path.exists():
+                try:
+                    path.unlink()
+                    deleted = True
+                    logger.info("Deleted voice cache file: %s", path)
+                except Exception as e:
+                    logger.warning("Failed to delete %s: %s", path, e)
+        return deleted
 
     @staticmethod
     async def _send_error(websocket: WebSocket, message: str) -> None:

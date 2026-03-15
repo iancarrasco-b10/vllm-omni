@@ -120,6 +120,14 @@ class StreamingSpeechSessionConfig(BaseModel):
     )
     ref_audio: str | None = None
     ref_text: str | None = None
+    voice_name: str | None = Field(
+        default=None,
+        description=(
+            "Optional name for voice cache. When provided with ref_audio, the cloned voice "
+            "is cached under this name. Subsequent requests with the same voice_name skip "
+            "ref_audio processing. Maps to the 'voice' field internally."
+        ),
+    )
     x_vector_only_mode: bool | None = None
     stream_audio: bool = Field(
         default=False,
