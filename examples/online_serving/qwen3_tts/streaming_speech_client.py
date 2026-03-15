@@ -267,6 +267,12 @@ def main():
         action="store_true",
         help="Receive one or more PCM chunks per sentence (requires --response-format pcm)",
     )
+    parser.add_argument(
+        "--max-buffered-words",
+        type=int,
+        default=None,
+        help="Flush text to TTS after this many words even without sentence boundary",
+    )
     parser.add_argument("--speed", type=float, default=1.0, help="Playback speed (0.25-4.0)")
     parser.add_argument("--max-new-tokens", type=int, default=None, help="Max tokens")
 
@@ -326,6 +332,7 @@ def main():
         "ref_audio",
         "ref_text",
         "voice_name",
+        "max_buffered_words",
     ]:
         val = getattr(args, key.replace("-", "_"), None)
         if val is not None:

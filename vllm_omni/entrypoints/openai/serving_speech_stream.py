@@ -104,7 +104,10 @@ class OmniStreamingSpeechHandler:
                 })
 
             boundary_re = SPLIT_CLAUSE if config.split_granularity == "clause" else SPLIT_SENTENCE
-            splitter = SentenceSplitter(boundary_re=boundary_re)
+            splitter = SentenceSplitter(
+                boundary_re=boundary_re,
+                max_buffered_words=config.max_buffered_words,
+            )
             sentence_index = 0
 
             # 2. Receive text chunks until input.done
@@ -307,8 +310,8 @@ class OmniStreamingSpeechHandler:
                         "cached": True,
                     })
                     # Clear ref_audio for subsequent sentences — cache will be used
+                    # Keep ref_text as the talker still needs it for tokenization
                     config.ref_audio = None
-                    config.ref_text = None
                 except Exception:
                     logger.debug("Failed to send voice.registered", exc_info=True)
 

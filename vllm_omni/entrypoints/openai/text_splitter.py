@@ -42,16 +42,22 @@ class SentenceSplitter:
             Use ``SPLIT_SENTENCE`` (default) for sentence-level splitting,
             ``SPLIT_CLAUSE`` for finer-grained clause-level splitting,
             or pass your own ``re.Pattern``.
+        max_buffered_words: When set, flush the buffer once it contains at
+            least this many words even if no sentence boundary has been found.
+            Useful for long-running input without punctuation.  Set to 0 or
+            ``None`` to disable (default).
     """
 
     def __init__(
         self,
         min_sentence_length: int = 2,
         boundary_re: Pattern[str] | None = None,
+        max_buffered_words: int | None = None,
     ) -> None:
         self._buffer: str = ""
         self._min_sentence_length = min_sentence_length
         self._boundary_re = boundary_re or _SENTENCE_BOUNDARY_RE
+        self._max_buffered_words = max_buffered_words or 0
 
     @property
     def buffer(self) -> str:
@@ -93,12 +99,17 @@ class SentenceSplitter:
         return remaining if remaining else None
 
     def _extract_sentences(self) -> list[str]:
-        """Split buffer at sentence boundaries, keeping incomplete text buffered."""
+        """Split buffer at sentence boundaries, keeping incomplete text buffered.
+
+        If ``max_buffered_words`` is set and no sentence boundary is found,
+        the buffer is flushed at the last word boundary once the word count
+        threshold is reached.
+        """
         parts = self._boundary_re.split(self._buffer)
 
         if len(parts) <= 1:
-            # No boundary found — keep everything in buffer
-            return []
+            # No boundary found — try word-count flush
+            return self._maybe_flush_by_word_count()
 
         sentences: list[str] = []
         carry = ""
@@ -117,4 +128,31 @@ class SentenceSplitter:
         # Last part stays in buffer (may be incomplete)
         self._buffer = carry + parts[-1]
 
+        # After extracting boundary-based sentences, the remainder may
+        # still exceed the word threshold.
+        sentences.extend(self._maybe_flush_by_word_count())
+
         return sentences
+
+    def _maybe_flush_by_word_count(self) -> list[str]:
+        """Flush buffer at word boundary if max_buffered_words is exceeded."""
+        if self._max_buffered_words <= 0:
+            return []
+
+        words = self._buffer.split()
+        if len(words) < self._max_buffered_words:
+            return []
+
+        # Flush exactly max_buffered_words, keep the rest
+        flush_words = words[: self._max_buffered_words]
+        remaining_words = words[self._max_buffered_words :]
+        self._buffer = " ".join(remaining_words) if remaining_words else ""
+
+        sentence = " ".join(flush_words).strip()
+        if not sentence:
+            return []
+
+        # Recurse in case remaining still exceeds threshold
+        result = [sentence]
+        result.extend(self._maybe_flush_by_word_count())
+        return result

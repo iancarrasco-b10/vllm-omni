@@ -143,6 +143,15 @@ class StreamingSpeechSessionConfig(BaseModel):
             "'clause' also splits on CJK commas ， and semicolons ；."
         ),
     )
+    max_buffered_words: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Maximum number of words to buffer before flushing to TTS, even "
+            "without a sentence boundary. Useful for unpunctuated streaming "
+            "input (e.g. live STT). Set to null/omit to disable."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "StreamingSpeechSessionConfig":
