@@ -122,6 +122,7 @@ async def stream_tts(
             b"data", 0xFFFFFFFF,  # placeholder data size
         ))
 
+        interrupted = False
         try:
             while True:
                 message = await ws.recv()
@@ -180,8 +181,12 @@ async def stream_tts(
                         print(f"  ERROR: {msg['message']}")
                     else:
                         print(f"  Unknown message: {msg}")
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            interrupted = True
+            elapsed = time.perf_counter() - session_t0
+            print(f"\n  Interrupted after {elapsed:.2f}s")
         finally:
-            # Patch WAV header with actual sizes
+            # Patch WAV header with actual sizes — always runs so partial audio is usable
             data_size = total_bytes_written
             riff_size = 36 + data_size
             combined_file.seek(4)
@@ -195,7 +200,8 @@ async def stream_tts(
             except asyncio.CancelledError:
                 pass  # Task cancellation is expected during shutdown
 
-    print(f"\nAudio files saved to: {output_dir}/")
+    label = "Interrupted — partial" if interrupted else "Audio files saved to"
+    print(f"\n{label}: {output_dir}/")
     print(f"Combined stream: {combined_path} ({total_bytes_written} bytes)")
 
 
@@ -351,16 +357,19 @@ def main():
     if args.x_vector_only_mode:
         config["x_vector_only_mode"] = True
 
-    asyncio.run(
-        stream_tts(
-            url=args.url,
-            text=args.text,
-            config=config,
-            output_dir=args.output_dir,
-            simulate_stt=args.simulate_stt,
-            stt_delay=args.stt_delay,
+    try:
+        asyncio.run(
+            stream_tts(
+                url=args.url,
+                text=args.text,
+                config=config,
+                output_dir=args.output_dir,
+                simulate_stt=args.simulate_stt,
+                stt_delay=args.stt_delay,
+            )
         )
-    )
+    except KeyboardInterrupt:
+        pass  # stream_tts already saved partial output in its finally block
 
 
 if __name__ == "__main__":
