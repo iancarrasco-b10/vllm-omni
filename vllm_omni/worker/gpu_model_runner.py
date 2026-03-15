@@ -966,12 +966,12 @@ class OmniGPUModelRunner(GPUModelRunner):
             if info:
                 info["generated_len"] = generated_len
                 per_req_runtime_info.append(info)
-                if "thinker_reply_part_per_request" in info:
-                    q = info["thinker_reply_part_per_request"]
-                    if hasattr(q, "shape"):
-                        logger.debug(f"[OMNI] req={req_id} has thinker_reply_part_per_request queue shape: {q.shape}")
             else:
                 per_req_runtime_info.append({})
+            if "thinker_reply_part_per_request" in info:
+                q = info["thinker_reply_part_per_request"]
+                if hasattr(q, "shape"):
+                    logger.debug(f"[OMNI] req={req_id} has thinker_reply_part_per_request queue shape: {q.shape}")
         return per_req_runtime_info
 
     def _compute_request_token_spans(self, num_scheduled_tokens_np) -> list[tuple[int, int]]:

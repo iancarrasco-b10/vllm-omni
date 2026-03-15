@@ -90,7 +90,7 @@ def test_flush_on_finish():
         is_finished=True,
     )
     assert p is not None
-    assert p["finished"].item() is True
+    assert p["finished"] is True
     assert len(p["code_predictor_codes"]) == _Q * 24
 
 

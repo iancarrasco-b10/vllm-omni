@@ -297,13 +297,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             hf_config = self.engine_client.model_config.hf_config
             talker_config = hf_config.talker_config
             task_type = (tts_params.get("task_type") or ["CustomVoice"])[0]
+            # When ref_audio was skipped (voice cache hit), use the cached
+            # ref_code_len directly instead of estimating from waveform.
+            cached_rcl = tts_params.pop("_cached_ref_code_len", None)
+            estimator = self._estimate_ref_code_len
+            if cached_rcl is not None:
+                estimator = lambda _ref_audio: cached_rcl
+
             return Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
                 additional_information=tts_params,
                 task_type=task_type,
                 tokenize_prompt=lambda t: self._tts_tokenizer(t, padding=False)["input_ids"],
                 codec_language_id=getattr(talker_config, "codec_language_id", None),
                 spk_is_dialect=getattr(talker_config, "spk_is_dialect", None),
-                estimate_ref_code_len=self._estimate_ref_code_len,
+                estimate_ref_code_len=estimator,
             )
         except Exception as e:
             logger.warning("Failed to estimate TTS prompt length, using fallback 2048: %s", e)
@@ -563,13 +570,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     file_path = Path(speaker_info["file_path"])
                     if not file_path.exists():
                         return f"Audio file for uploaded speaker '{request.voice}' not found on disk"
+                elif self._has_voice_cache(voice_lower):
+                    # Voice cache exists — talker will load ref_code + speaker
+                    # embedding from safetensors. No ref_audio needed.
+                    pass
                 else:
-                    # need ref_audio for built-in speaker
+                    # No cache — need ref_audio for voice cloning
                     if request.ref_audio is None:
                         return (
-                            f"Base task with built-in speaker '{request.voice}' requires 'ref_audio' for voice cloning"
+                            f"Base task with speaker '{request.voice}' requires 'ref_audio' for voice cloning "
+                            "(no voice cache found; upload once with ref_audio to cache)"
                         )
-                    # Validate ref_audio format for built-in speaker
+                    # Validate ref_audio format
                     if not (
                         request.ref_audio.startswith(("http://", "https://"))
                         or request.ref_audio.startswith("data:")
@@ -603,13 +615,56 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return None
 
+    def _has_voice_cache(self, speaker: str) -> bool:
+        """Check if the talker has a ready voice cache for this speaker."""
+        cache_dir = os.environ.get("SPEECH_VOICE_SAMPLES", "/tmp/voice_samples")
+        cache_file = Path(cache_dir) / f"{speaker}.safetensors"
+        if not cache_file.exists():
+            return False
+        # Also check metadata to confirm cache_status is ready.
+        meta_file = Path(cache_dir) / "metadata.json"
+        if meta_file.exists():
+            try:
+                import json as _json
+                meta = _json.loads(meta_file.read_text())
+                info = meta.get("uploaded_speakers", {}).get(speaker.lower(), {})
+                return info.get("cache_status") == "ready"
+            except Exception:
+                pass
+        return cache_file.exists()
+
+    def _get_cached_ref_code_len(self, speaker: str) -> int | None:
+        """Read ref_code length from the safetensors cache without loading full tensors."""
+        cache_dir = os.environ.get("SPEECH_VOICE_SAMPLES", "/tmp/voice_samples")
+        cache_file = Path(cache_dir) / f"{speaker}.safetensors"
+        if not cache_file.exists():
+            return None
+        try:
+            from safetensors import safe_open
+            with safe_open(str(cache_file), framework="pt") as f:
+                if "item_0_ref_code" in f.keys():
+                    return f.get_slice("item_0_ref_code").get_shape()[0]
+            return None
+        except Exception:
+            return None
+
     async def _resolve_ref_audio(self, ref_audio_str: str) -> tuple[list[float], int]:
         """Resolve ref_audio to (wav_samples, sample_rate).
 
         Delegates to upstream vLLM's MediaConnector which handles http(s)
         URLs, ``data:`` base64 URIs, and ``file:`` local paths (the latter
         gated by ``--allowed-local-media-path``).
+
+        Results are cached by URI so repeated calls (e.g. per-sentence in
+        WebSocket streaming) avoid redundant file I/O and decoding.
         """
+        cache = getattr(self, "_ref_audio_cache", None)
+        if cache is None:
+            cache = {}
+            self._ref_audio_cache = cache
+        if ref_audio_str in cache:
+            return cache[ref_audio_str]
+
         model_config = self.model_config
         connector = MediaConnector(
             allowed_local_media_path=model_config.allowed_local_media_path,
@@ -619,7 +674,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         wav_np = np.asarray(wav_np, dtype=np.float32)
         if wav_np.ndim > 1:
             wav_np = np.mean(wav_np, axis=-1)
-        return wav_np.tolist(), int(sr)
+        result = (wav_np.tolist(), int(sr))
+        cache[ref_audio_str] = result
+        return result
 
     async def _generate_audio_chunks(self, generator, request_id: str, response_format: str = "pcm"):
         """Generate audio chunks for streaming response.
@@ -887,7 +944,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
             tts_params = self._build_tts_params(request)
 
-            if request.ref_audio is not None:
+            # Check voice cache first — if the speaker has a cached voice,
+            # skip ref_audio entirely (the talker loads from safetensors).
+            voice_name = (request.voice or "").strip()
+            if voice_name and self._has_voice_cache(voice_name):
+                logger.info("Voice cache HIT for %r — skipping ref_audio transfer", voice_name)
+                ref_code_len = self._get_cached_ref_code_len(voice_name)
+                if ref_code_len is not None and ref_code_len > 0:
+                    tts_params["_cached_ref_code_len"] = ref_code_len
+            elif request.ref_audio is not None:
                 wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
                 tts_params["ref_audio"] = [[wav_list, sr]]
 

@@ -33,6 +33,7 @@ import argparse
 import asyncio
 import json
 import os
+import time
 
 try:
     import websockets
@@ -95,12 +96,20 @@ async def stream_tts(
         response_format = config.get("response_format", "wav")
         current_sentence_index = 0
         current_chunks: list[bytes] = []
+        session_t0 = time.perf_counter()
+        sentence_t0: float | None = None
+        first_audio_received = False
 
         try:
             while True:
                 message = await ws.recv()
 
                 if isinstance(message, bytes):
+                    if not first_audio_received:
+                        first_audio_received = True
+                        ttfa = time.perf_counter() - session_t0
+                        sentence_ttfa = time.perf_counter() - sentence_t0 if sentence_t0 else ttfa
+                        print(f"  TTFA: {ttfa:.3f}s (session) / {sentence_ttfa:.3f}s (sentence)")
                     current_chunks.append(message)
                     print(f"  Received audio chunk for sentence {current_sentence_index}: {len(message)} bytes")
                 else:
@@ -111,8 +120,11 @@ async def stream_tts(
                     if msg_type == "audio.start":
                         current_sentence_index = msg["sentence_index"]
                         current_chunks = []
+                        first_audio_received = False
+                        sentence_t0 = time.perf_counter()
                         print(f"  [sentence {msg['sentence_index']}] Generating: {msg['sentence_text']!r}")
                     elif msg_type == "audio.done":
+                        sentence_elapsed = time.perf_counter() - sentence_t0 if sentence_t0 else 0
                         filename = os.path.join(
                             output_dir,
                             f"sentence_{msg['sentence_index']:03d}.{response_format}",
@@ -122,12 +134,17 @@ async def stream_tts(
                         print(
                             f"  [sentence {msg['sentence_index']}] Done"
                             f" bytes={msg.get('total_bytes', len(b''.join(current_chunks)))}"
+                            f" time={sentence_elapsed:.2f}s"
                             f" error={msg.get('error', False)}"
                             f" -> {filename}"
                         )
                         current_chunks = []
                     elif msg_type == "session.done":
-                        print(f"\nSession complete: {msg['total_sentences']} sentence(s) generated")
+                        total_elapsed = time.perf_counter() - session_t0
+                        print(
+                            f"\nSession complete: {msg['total_sentences']} sentence(s)"
+                            f" in {total_elapsed:.2f}s"
+                        )
                         break
                     elif msg_type == "error":
                         print(f"  ERROR: {msg['message']}")
