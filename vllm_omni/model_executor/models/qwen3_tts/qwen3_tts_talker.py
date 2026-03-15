@@ -397,6 +397,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self._tokenizer = None
         self._speech_tokenizer: Qwen3TTSTokenizer | None = None
 
+        # File-based voice cache for consistent ICL voice across sentences.
+        from .voice_cache_manager import VoiceCacheManager
+        self._voice_cache_manager = VoiceCacheManager()
+
     # -------------------- vLLM required hooks --------------------
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
@@ -1314,6 +1318,25 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             xvec_only = bool((info_dict.get("x_vector_only_mode") or [False])[0])
             in_context_mode = not xvec_only
             voice_clone_prompt = _normalize_voice_clone_prompt(info_dict.get("voice_clone_prompt"))
+
+            # --- Voice file cache: load safetensors by speaker name ---
+            # Provides consistent voice across sentences (encoder is non-deterministic)
+            # and avoids re-encoding on every call.
+            if voice_clone_prompt is None:
+                _spk_list = info_dict.get("speaker")
+                _voice_name = _spk_list[0] if isinstance(_spk_list, list) and _spk_list else None
+                if _voice_name is not None:
+                    _cached = self._voice_cache_manager.load_cached_voice_prompt(
+                        _voice_name, device=str(input_ids.device),
+                    )
+                    if _cached is not None:
+                        voice_clone_prompt = {
+                            "ref_code": _cached[0].ref_code,
+                            "ref_spk_embedding": _cached[0].ref_spk_embedding,
+                            "icl_mode": _cached[0].icl_mode,
+                        }
+                        logger.info("Voice cache HIT for %r", _voice_name)
+
             # Official implementation may pass `voice_clone_prompt.icl_mode`.
             if voice_clone_prompt is not None and "icl_mode" in voice_clone_prompt:
                 icl_flag = _as_singleton(voice_clone_prompt.get("icl_mode"))
@@ -1356,6 +1379,31 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     raise ValueError("Base requires `ref_audio`.")
                 wav_np, sr = self._normalize_ref_audio(ref_audio_list[0])
                 speaker_embed = self._extract_speaker_embedding(wav_np, sr).view(1, 1, -1)
+
+            # --- Save to voice file cache if we just encoded from ref_audio ---
+            if voice_clone_prompt is None and isinstance(ref_code_t, torch.Tensor):
+                _spk_list = info_dict.get("speaker")
+                _voice_name = _spk_list[0] if isinstance(_spk_list, list) and _spk_list else None
+                if _voice_name is not None:
+                    from pathlib import Path
+
+                    from .voice_cache_manager import VoiceClonePromptItem
+                    _item = VoiceClonePromptItem(
+                        ref_code=ref_code_t.detach().cpu().contiguous(),
+                        ref_spk_embedding=speaker_embed.detach().cpu().contiguous().view(-1),
+                        x_vector_only_mode=xvec_only,
+                        icl_mode=in_context_mode,
+                        ref_text=_as_singleton(info_dict.get("ref_text")),
+                    )
+                    _dir = Path(self._voice_cache_manager.speech_voice_samples_dir)
+                    _dir.mkdir(parents=True, exist_ok=True)
+                    _path = _dir / f"{_voice_name}.wav"
+                    _path.touch(exist_ok=True)
+                    self._voice_cache_manager.metadata_manager.update_speaker(
+                        _voice_name.lower(), {"file_path": str(_path)},
+                    )
+                    _ok = self._voice_cache_manager.save_voice_cache(_voice_name, _path, [_item])
+                    logger.info("Voice cache SAVE for %r (ok=%s)", _voice_name, _ok)
 
             codec_input = torch.cat([codec_input_0, speaker_embed, codec_input_1], dim=1)
 

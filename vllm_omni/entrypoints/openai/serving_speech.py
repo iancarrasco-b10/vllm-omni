@@ -700,6 +700,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             logger.exception("Streaming speech generation failed for %s: %s", request_id, e)
             raise
 
+    async def _generate_pcm_chunks(self, generator, request_id: str):
+        """Yield raw PCM audio bytes without any container header."""
+        async for chunk in self._generate_audio_chunks(generator, request_id, "pcm"):
+            yield chunk
+
     @staticmethod
     def _extract_audio_output(res) -> tuple[dict | None, str | None]:
         """Return (audio_output dict, audio key) or (None, None).

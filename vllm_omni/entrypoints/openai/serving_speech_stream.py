@@ -41,7 +41,7 @@ logger = init_logger(__name__)
 _DEFAULT_IDLE_TIMEOUT = 30.0  # seconds
 _DEFAULT_CONFIG_TIMEOUT = 10.0  # seconds
 _PCM_SAMPLE_RATE = 24000
-_MAX_CONFIG_MESSAGE_SIZE = 4 * 1024 * 1024  # allow large ref_audio payloads
+_MAX_CONFIG_MESSAGE_SIZE = 16 * 1024 * 1024  # allow large base64-encoded ref_audio payloads
 _MAX_INPUT_TEXT_MESSAGE_SIZE = 128 * 1024
 
 
