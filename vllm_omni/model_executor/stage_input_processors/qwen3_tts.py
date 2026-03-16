@@ -97,7 +97,7 @@ def talker2code2wav_async_chunk(
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
     chunk_size = int(cfg.get("codec_chunk_frames", 25))
-    left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
+    left_context_size_config = int(cfg.get("codec_left_context_frames", 100))
 
     # Per-request override takes priority over dynamic IC.
     per_request_override = False
@@ -181,15 +181,25 @@ def talker2code2wav_async_chunk(
     # (not just the first) so the decoder always has voice identity context.
     # Without this, early IC-phase chunks (e.g. 2-4 frames) have no voice
     # reference, causing audible quality artifacts.
+    # On the first decode use the full ref so we trim all of it (no ref in output)
+    # and the decoder has maximum voice identity; later chunks use capped overlap.
     ref_code = request_payload.get(request_id)
     if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
-        target_window = left_context_size_config + context_length
+        ref_code_frames = ref_code.shape[0]
         current_window = len(window_frames)
-        if current_window < target_window:
-            available_space = target_window - current_window
-            ref_code_frames = ref_code.shape[0]
-            n_ref = min(available_space, ref_code_frames)
-            # Use tail of ref_code (most recent context, matches FastAPI impl)
+        is_first_decode = left_context_size == 0 and current_window == length
+        if is_first_decode and ref_code_frames > 0:
+            # First decode: prepend full ref, trim all of it at Code2Wav.
+            target_window = ref_code_frames + context_length
+            n_ref = ref_code_frames
+        else:
+            target_window = left_context_size_config + context_length
+            if current_window < target_window:
+                available_space = target_window - current_window
+                n_ref = min(available_space, ref_code_frames)
+            else:
+                n_ref = 0
+        if current_window < target_window and n_ref > 0:
             ref_frames = ref_code[-n_ref:].tolist()
             window_frames = ref_frames + window_frames
             left_context_size += n_ref

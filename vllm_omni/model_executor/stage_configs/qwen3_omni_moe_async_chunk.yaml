@@ -114,4 +114,4 @@ runtime:
       extra:
         # Align with Omni: small chunks with sufficient context overlap.
         codec_chunk_frames: 25 # code2wav decode chunk size
-        codec_left_context_frames: 25 # code2wav left context size
+        codec_left_context_frames: 100 # code2wav left context size

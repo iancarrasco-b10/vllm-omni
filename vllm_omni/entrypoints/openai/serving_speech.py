@@ -304,7 +304,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if cached_rcl is not None:
                 estimator = lambda _ref_audio: cached_rcl
 
-            return Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
+            raw_len = Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
                 additional_information=tts_params,
                 task_type=task_type,
                 tokenize_prompt=lambda t: self._tts_tokenizer(t, padding=False)["input_ids"],
@@ -312,6 +312,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 spk_is_dialect=getattr(talker_config, "spk_is_dialect", None),
                 estimate_ref_code_len=estimator,
             )
+            # When we have exact ref_ids_len from cache, the ref-side length matches
+            # the Talker; no buffer needed. Otherwise add a buffer to avoid
+            # underestimation (which causes ref speech to leak into output).
+            if cached_rcl is not None and tts_params.get("_cached_ref_ids_len") is None:
+                raw_len = raw_len + max(128, raw_len // 4)
+            return raw_len
         except Exception as e:
             logger.warning("Failed to estimate TTS prompt length, using fallback 2048: %s", e)
             return 2048
@@ -633,36 +639,49 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 pass
         return cache_file.exists()
 
-    def _get_cached_ref_code_len(self, speaker: str) -> int | None:
-        """Read ref_code length from the safetensors cache without loading full tensors."""
-        cache_dir = os.environ.get("SPEECH_VOICE_SAMPLES", "/tmp/voice_samples")
-        cache_file = Path(cache_dir) / f"{speaker}.safetensors"
-        if not cache_file.exists():
-            return None
-        try:
-            from safetensors import safe_open
-            with safe_open(str(cache_file), framework="pt") as f:
-                if "item_0_ref_code" in f.keys():
-                    return f.get_slice("item_0_ref_code").get_shape()[0]
-            return None
-        except Exception:
-            return None
+    def _get_cached_voice_prompt_info(self, speaker: str) -> tuple[int | None, str | None, int | None]:
+        """Read ref_code length, ref_text, and ref_ids_len from the voice cache (one safetensors open).
 
-    def _get_cached_ref_text(self, speaker: str) -> str | None:
-        """Read ref_text from the safetensors cache metadata."""
+        ref_ids_len is the exact token length of ref_text as stored when the cache was
+        created, so prompt length estimation can use it and avoid tokenizer mismatch.
+
+        Returns:
+            (ref_code_len, ref_text, ref_ids_len) or (None, None, None) if cache missing/invalid.
+        """
         cache_dir = os.environ.get("SPEECH_VOICE_SAMPLES", "/tmp/voice_samples")
-        cache_file = Path(cache_dir) / f"{speaker}.safetensors"
-        if not cache_file.exists():
-            return None
+        cache_dir_path = Path(cache_dir)
+        speaker_key = speaker.lower()
+
+        # Prefer path from metadata so we match the Talker's load path
+        path = None
+        info = self.uploaded_speakers.get(speaker_key)
+        if info and info.get("cache_status") == "ready" and info.get("cache_file"):
+            p = Path(info["cache_file"]).resolve()
+            base = cache_dir_path.resolve()
+            if p.exists() and str(p).startswith(str(base)):
+                path = p
+        if path is None:
+            path = cache_dir_path / f"{speaker_key}.safetensors"
+        if not path.exists():
+            return None, None, None
+
         try:
             from safetensors import safe_open
-            with safe_open(str(cache_file), framework="pt") as f:
-                meta = f.metadata()
-                if meta:
-                    return meta.get("item_0_ref_text")
-            return None
+            with safe_open(str(path), framework="pt") as f:
+                ref_code_len = None
+                if "item_0_ref_code" in f.keys():
+                    ref_code_len = f.get_slice("item_0_ref_code").get_shape()[0]
+                meta = f.metadata() or {}
+                ref_text = meta.get("item_0_ref_text")
+                ref_ids_len = None
+                if "item_0_ref_ids_len" in meta:
+                    try:
+                        ref_ids_len = int(meta["item_0_ref_ids_len"])
+                    except (TypeError, ValueError):
+                        pass
+                return ref_code_len, ref_text, ref_ids_len
         except Exception:
-            return None
+            return None, None, None
 
     async def _resolve_ref_audio(self, ref_audio_str: str) -> tuple[list[float], int]:
         """Resolve ref_audio to (wav_samples, sample_rate).
@@ -971,25 +990,29 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
             tts_params = self._build_tts_params(request)
 
-            # Check voice cache first — if the speaker has a cached voice,
-            # skip ref_audio entirely (the talker loads from safetensors).
+            # Voice cache: use ref_code_len + ref_text from cache for prompt estimation;
+            # the Talker loads the full VoiceClonePromptItem from safetensors (see reference
+            # Qwen3-TTS create_voice_clone_prompt / generate_voice_clone).
             voice_name = (request.voice or "").strip()
             if voice_name and self._has_voice_cache(voice_name):
-                logger.info("Voice cache HIT for %r — skipping ref_audio transfer", voice_name)
-                ref_code_len = self._get_cached_ref_code_len(voice_name)
+                ref_code_len, cached_ref_text, cached_ref_ids_len = self._get_cached_voice_prompt_info(voice_name)
                 if ref_code_len is not None and ref_code_len > 0:
                     tts_params["_cached_ref_code_len"] = ref_code_len
-                # Restore cached ref_text for prompt length estimation
-                if "ref_text" not in tts_params:
-                    cached_ref_text = self._get_cached_ref_text(voice_name)
-                    if cached_ref_text:
+                    if "ref_text" not in tts_params and cached_ref_text:
                         tts_params["ref_text"] = [cached_ref_text]
-            elif request.ref_audio is not None:
+                    if cached_ref_ids_len is not None:
+                        tts_params["_cached_ref_ids_len"] = cached_ref_ids_len
+                    logger.info(
+                        "Voice cache HIT for %r (ref_code_len=%s, ref_ids_len=%s) — skipping ref_audio",
+                        voice_name, ref_code_len, cached_ref_ids_len,
+                    )
+            if "_cached_ref_code_len" not in tts_params and request.ref_audio is not None:
                 wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
                 tts_params["ref_audio"] = [[wav_list, sr]]
 
             ph_len = self._estimate_prompt_len(tts_params)
             tts_params.pop("_cached_ref_code_len", None)
+            tts_params.pop("_cached_ref_ids_len", None)
             logger.info("Estimated prompt_len=%d for text=%r", ph_len, (tts_params.get("text") or [""])[0][:60])
             prompt = {"prompt_token_ids": [1] * ph_len, "additional_information": tts_params}
         else:

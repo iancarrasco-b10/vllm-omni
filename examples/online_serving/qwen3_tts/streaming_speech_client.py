@@ -32,11 +32,13 @@ Requirements:
 import argparse
 import asyncio
 import base64
+import io
 import json
 import mimetypes
 import os
 import struct
 import time
+import wave
 
 try:
     import websockets
@@ -56,11 +58,46 @@ async def stream_tts(
     """Connect to the streaming TTS endpoint and process audio responses."""
     os.makedirs(output_dir, exist_ok=True)
 
+    def _write_wav_header(file_obj, sample_rate: int) -> None:
+        bits_per_sample = 16
+        num_channels = 1
+        byte_rate = sample_rate * num_channels * bits_per_sample // 8
+        block_align = num_channels * bits_per_sample // 8
+        file_obj.write(struct.pack(
+            "<4sI4s4sIHHIIHH4sI",
+            b"RIFF", 0xFFFFFFFF,
+            b"WAVE",
+            b"fmt ", 16,
+            1, num_channels, sample_rate, byte_rate, block_align, bits_per_sample,
+            b"data", 0xFFFFFFFF,
+        ))
+
+    def _finalize_wav_file(file_obj, data_size: int) -> None:
+        riff_size = 36 + data_size
+        file_obj.seek(4)
+        file_obj.write(struct.pack("<I", riff_size))
+        file_obj.seek(40)
+        file_obj.write(struct.pack("<I", data_size))
+        file_obj.close()
+
+    def _extract_pcm_for_combined(audio_bytes: bytes, fmt: str) -> bytes:
+        """Return raw PCM payload for the combined WAV output."""
+        if fmt == "pcm":
+            return audio_bytes
+        if fmt != "wav":
+            return b""
+
+        # Each sentence arrives as a complete WAV file. Strip the container header
+        # before appending so `combined.wav` is valid continuous PCM.
+        with wave.open(io.BytesIO(audio_bytes), "rb") as wav_file:
+            return wav_file.readframes(wav_file.getnframes())
+
     async with websockets.connect(url, ping_interval=None) as ws:
         # 1. Send session config
         config_msg = {"type": "session.config", **config}
         await ws.send(json.dumps(config_msg))
-        print(f"Sent session config: {config}")
+        config_display = {k: (f"<{len(v)} chars>" if k == "ref_audio" and isinstance(v, str) and len(v) > 200 else v) for k, v in config.items()}
+        print(f"Sent session config: {config_display}")
 
         # 2. Send text (either all at once or word-by-word)
         async def send_text():
@@ -103,24 +140,15 @@ async def stream_tts(
         sentence_t0: float | None = None
         first_audio_received = False
         total_bytes_written = 0
+        current_sentence_file = None
+        current_sentence_path: str | None = None
+        current_sentence_pcm_bytes = 0
+        current_sentence_sample_rate = 24000
 
         # Combined output file: append all PCM chunks as they arrive, wrapped in WAV
         combined_path = os.path.join(output_dir, "combined.wav")
         combined_file = open(combined_path, "wb")
-        # Write WAV header with placeholder sizes (patched on close)
-        sample_rate = 24000
-        bits_per_sample = 16
-        num_channels = 1
-        byte_rate = sample_rate * num_channels * bits_per_sample // 8
-        block_align = num_channels * bits_per_sample // 8
-        combined_file.write(struct.pack(
-            "<4sI4s4sIHHIIHH4sI",
-            b"RIFF", 0xFFFFFFFF,  # placeholder RIFF size
-            b"WAVE",
-            b"fmt ", 16,  # PCM fmt chunk
-            1, num_channels, sample_rate, byte_rate, block_align, bits_per_sample,
-            b"data", 0xFFFFFFFF,  # placeholder data size
-        ))
+        _write_wav_header(combined_file, sample_rate=24000)
 
         interrupted = False
         try:
@@ -134,10 +162,16 @@ async def stream_tts(
                         sentence_ttfa = time.perf_counter() - sentence_t0 if sentence_t0 else ttfa
                         print(f"  TTFA: {ttfa:.3f}s (session) / {sentence_ttfa:.3f}s (sentence)")
                     current_chunks.append(message)
-                    # Append to combined file immediately
-                    combined_file.write(message)
-                    combined_file.flush()
-                    total_bytes_written += len(message)
+                    # Append only raw PCM to the combined WAV output.
+                    pcm_bytes = _extract_pcm_for_combined(message, response_format)
+                    if pcm_bytes:
+                        combined_file.write(pcm_bytes)
+                        combined_file.flush()
+                        total_bytes_written += len(pcm_bytes)
+                        if current_sentence_file is not None:
+                            current_sentence_file.write(pcm_bytes)
+                            current_sentence_file.flush()
+                            current_sentence_pcm_bytes += len(pcm_bytes)
                     print(f"  Received audio chunk for sentence {current_sentence_index}: {len(message)} bytes")
                 else:
                     # JSON frame
@@ -153,15 +187,36 @@ async def stream_tts(
                         current_chunks = []
                         first_audio_received = False
                         sentence_t0 = time.perf_counter()
+                        current_sentence_sample_rate = int(msg.get("sample_rate", 24000))
+                        current_sentence_pcm_bytes = 0
+                        current_sentence_path = None
+                        if current_sentence_file is not None:
+                            _finalize_wav_file(current_sentence_file, current_sentence_pcm_bytes)
+                            current_sentence_file = None
+                        if response_format == "pcm":
+                            current_sentence_path = os.path.join(
+                                output_dir,
+                                f"sentence_{msg['sentence_index']:03d}.wav",
+                            )
+                            current_sentence_file = open(current_sentence_path, "wb")
+                            _write_wav_header(current_sentence_file, sample_rate=current_sentence_sample_rate)
                         print(f"  [sentence {msg['sentence_index']}] Generating: {msg['sentence_text']!r}")
                     elif msg_type == "audio.done":
                         sentence_elapsed = time.perf_counter() - sentence_t0 if sentence_t0 else 0
-                        filename = os.path.join(
-                            output_dir,
-                            f"sentence_{msg['sentence_index']:03d}.{response_format}",
-                        )
-                        with open(filename, "wb") as f:
-                            f.write(b"".join(current_chunks))
+                        if current_sentence_file is not None:
+                            _finalize_wav_file(current_sentence_file, current_sentence_pcm_bytes)
+                            current_sentence_file = None
+                            filename = current_sentence_path or os.path.join(
+                                output_dir,
+                                f"sentence_{msg['sentence_index']:03d}.wav",
+                            )
+                        else:
+                            filename = os.path.join(
+                                output_dir,
+                                f"sentence_{msg['sentence_index']:03d}.{response_format}",
+                            )
+                            with open(filename, "wb") as f:
+                                f.write(b"".join(current_chunks))
                         print(
                             f"  [sentence {msg['sentence_index']}] Done"
                             f" bytes={msg.get('total_bytes', len(b''.join(current_chunks)))}"
@@ -187,13 +242,10 @@ async def stream_tts(
             print(f"\n  Interrupted after {elapsed:.2f}s")
         finally:
             # Patch WAV header with actual sizes — always runs so partial audio is usable
+            if current_sentence_file is not None:
+                _finalize_wav_file(current_sentence_file, current_sentence_pcm_bytes)
             data_size = total_bytes_written
-            riff_size = 36 + data_size
-            combined_file.seek(4)
-            combined_file.write(struct.pack("<I", riff_size))
-            combined_file.seek(40)
-            combined_file.write(struct.pack("<I", data_size))
-            combined_file.close()
+            _finalize_wav_file(combined_file, data_size)
             sender_task.cancel()
             try:
                 await sender_task
@@ -264,14 +316,15 @@ def main():
     parser.add_argument("--instructions", default=None, help="Voice style instructions")
     parser.add_argument(
         "--response-format",
-        default="wav",
+        default="pcm",
         choices=["wav", "pcm", "flac", "mp3", "aac", "opus"],
-        help="Audio format",
+        help="Audio format (default: pcm for progressive WebSocket streaming)",
     )
     parser.add_argument(
         "--stream-audio",
-        action="store_true",
-        help="Receive one or more PCM chunks per sentence (requires --response-format pcm)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Receive progressive PCM chunks per sentence (default: enabled, requires --response-format pcm)",
     )
     parser.add_argument(
         "--max-buffered-words",
@@ -343,6 +396,12 @@ def main():
         val = getattr(args, key.replace("-", "_"), None)
         if val is not None:
             config[key] = val
+
+    if 'ref_text' in config and os.path.isfile(config['ref_text']):
+        with open(config['ref_text'], 'r', encoding='utf-8') as f:
+            config['ref_text'] = f.read().strip()
+        print(f"Read ref_text from file: {config['ref_text']}")
+
     # Encode local ref_audio file as data URI if it's a file path
     if "ref_audio" in config and not config["ref_audio"].startswith(("data:", "http://", "https://", "file://")):
         path = config["ref_audio"]
@@ -352,8 +411,7 @@ def main():
         config["ref_audio"] = f"data:{mime};base64,{b64}"
         print(f"Encoded ref_audio as data URI ({mime}, {len(b64)} chars)")
 
-    if args.stream_audio:
-        config["stream_audio"] = True
+    config["stream_audio"] = args.stream_audio
     if args.x_vector_only_mode:
         config["x_vector_only_mode"] = True
 

@@ -926,7 +926,10 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
             return self._cudagraph_wrapper.chunked_decode_with_cudagraph(codes, chunk_size, left_context_size)
 
-        # Original implementation (eager mode)
+        # Original implementation (eager mode).
+        # Take expected sample count from the end (not trim from front) to avoid
+        # over-trimming when decoder returns fewer samples than expected (pops/sample loss).
+        # See https://github.com/QwenLM/Qwen3-TTS/pull/234
         wavs = []
         start_index = 0
         while start_index < codes.shape[-1]:
@@ -934,7 +937,11 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             context_size = left_context_size if start_index - left_context_size > 0 else start_index
             codes_chunk = codes[..., start_index - context_size : end_index]
             wav_chunk = self(codes_chunk)
-            wavs.append(wav_chunk[..., context_size * self.total_upsample :])
+            sample_count = min(
+                (end_index - start_index) * self.total_upsample,
+                wav_chunk.shape[-1],
+            )
+            wavs.append(wav_chunk[..., -sample_count:])
             start_index = end_index
         return torch.cat(wavs, dim=-1)
 

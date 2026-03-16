@@ -697,7 +697,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         estimate_ref_code_len: Callable[[object], int | None] | None = None,
     ) -> int:
         """Compute Stage-0 placeholder prompt length (length-only mirror of `_build_prompt_embeds()`).
-        It must match the model-side `inputs_embeds` length to avoid extra padding and quality drop."""
+        Must match model-side `inputs_embeds` length. For Base ICL: ref_ids (ref_text) + text_ids + eos,
+        then codec_bos + ref_code; see Qwen3-TTS generate_icl_prompt / create_voice_clone_prompt."""
 
         def _first(x: object, default: object) -> object:
             if isinstance(x, list):
@@ -810,25 +811,29 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 if non_streaming_mode:
                     # _generate_icl_prompt(non_streaming_mode=True):
                     # text_embed = ref_ids + text_ids + eos.
-                    ref_ids = _first(info.get("ref_ids"), None)
-                    if isinstance(voice_clone_prompt, dict) and ref_ids is None:
-                        ref_ids = _first(voice_clone_prompt.get("ref_ids") or voice_clone_prompt.get("ref_id"), None)
+                    ref_ids_len = None
+                    if "_cached_ref_ids_len" in info and info["_cached_ref_ids_len"] is not None:
+                        ref_ids_len = int(info["_cached_ref_ids_len"])
+                    if ref_ids_len is None:
+                        ref_ids = _first(info.get("ref_ids"), None)
+                        if isinstance(voice_clone_prompt, dict) and ref_ids is None:
+                            ref_ids = _first(voice_clone_prompt.get("ref_ids") or voice_clone_prompt.get("ref_id"), None)
 
-                    if ref_ids is None:
-                        ref_text = _first(info.get("ref_text"), "")
-                        if not isinstance(ref_text, str) or not ref_text.strip():
-                            raise ValueError(
-                                "Base in-context non-streaming requires `ref_text` or tokenized `ref_ids`."
-                            )
-                        ref_text_ids = tokenize_prompt(Qwen3TTSTalkerForConditionalGeneration._build_ref_text(ref_text))
-                        ref_ids_len = len(ref_text_ids)
-                    elif hasattr(ref_ids, "shape"):
-                        shape = getattr(ref_ids, "shape", None)
-                        ref_ids_len = int(shape[-1]) if shape else 0
-                    elif isinstance(ref_ids, list):
-                        ref_ids_len = len(ref_ids)
-                    else:
-                        ref_ids_len = 0
+                        if ref_ids is None:
+                            ref_text = _first(info.get("ref_text"), "")
+                            if not isinstance(ref_text, str) or not ref_text.strip():
+                                raise ValueError(
+                                    "Base in-context non-streaming requires `ref_text` or tokenized `ref_ids`."
+                                )
+                            ref_text_ids = tokenize_prompt(Qwen3TTSTalkerForConditionalGeneration._build_ref_text(ref_text))
+                            ref_ids_len = len(ref_text_ids)
+                        elif hasattr(ref_ids, "shape"):
+                            shape = getattr(ref_ids, "shape", None)
+                            ref_ids_len = int(shape[-1]) if shape else 0
+                        elif isinstance(ref_ids, list):
+                            ref_ids_len = len(ref_ids)
+                        else:
+                            ref_ids_len = 0
 
                     # model uses ref_ids[:, 3:-2] (strip 5 tokens) and text_id=input_ids[:, 3:-5] (strip 8).
                     ref_id_len = max(0, int(ref_ids_len) - 5)
@@ -1413,12 +1418,21 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     from pathlib import Path
 
                     from .voice_cache_manager import VoiceClonePromptItem
+                    _ref_text = _as_singleton(info_dict.get("ref_text"))
+                    _ref_ids_len: int | None = None
+                    if isinstance(_ref_text, str) and _ref_text.strip():
+                        _tok = self._get_tokenizer()
+                        _ref_ids = _tok(
+                            self._build_ref_text(_ref_text), return_tensors="pt", padding=False
+                        )["input_ids"]
+                        _ref_ids_len = int(_ref_ids.shape[-1])
                     _item = VoiceClonePromptItem(
                         ref_code=ref_code_t.detach().cpu().contiguous(),
                         ref_spk_embedding=speaker_embed.detach().cpu().contiguous().view(-1),
                         x_vector_only_mode=xvec_only,
                         icl_mode=in_context_mode,
-                        ref_text=_as_singleton(info_dict.get("ref_text")),
+                        ref_text=_ref_text,
+                        ref_ids_len=_ref_ids_len,
                     )
                     _dir = Path(self._voice_cache_manager.speech_voice_samples_dir)
                     _dir.mkdir(parents=True, exist_ok=True)

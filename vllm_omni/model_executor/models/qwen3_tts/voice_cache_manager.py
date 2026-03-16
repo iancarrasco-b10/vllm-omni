@@ -41,6 +41,7 @@ class VoiceClonePromptItem:
     x_vector_only_mode: bool
     icl_mode: bool
     ref_text: str | None = None
+    ref_ids_len: int | None = None  # exact token length from ref_text (for prompt length estimation)
 
 
 class VoiceCacheManager:
@@ -149,6 +150,8 @@ class VoiceCacheManager:
 
                 if item.ref_text is not None:
                     metadata[prefix + "ref_text"] = item.ref_text
+                if item.ref_ids_len is not None:
+                    metadata[prefix + "ref_ids_len"] = str(item.ref_ids_len)
 
             save_file(tensors, str(cache_file_path), metadata=metadata)
 
@@ -223,6 +226,12 @@ class VoiceCacheManager:
                     icl_mode = bool(f.get_tensor(prefix + "icl_mode").item())
 
                     ref_text = meta.get(prefix + "ref_text")
+                    ref_ids_len = None
+                    if prefix + "ref_ids_len" in meta:
+                        try:
+                            ref_ids_len = int(meta[prefix + "ref_ids_len"])
+                        except (TypeError, ValueError):
+                            pass
 
                     result.append(
                         VoiceClonePromptItem(
@@ -231,6 +240,7 @@ class VoiceCacheManager:
                             x_vector_only_mode=x_vector_only_mode,
                             icl_mode=icl_mode,
                             ref_text=ref_text,
+                            ref_ids_len=ref_ids_len,
                         )
                     )
 
