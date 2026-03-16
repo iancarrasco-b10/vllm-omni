@@ -18,9 +18,10 @@ SPLIT_SENTENCE = re.compile(
     r"|(?<=[。！？])"
 )
 
-# Clause-level: adds CJK commas ， and semicolons ；
+# Clause-level: adds commas and semicolons (English and CJK)
 SPLIT_CLAUSE = re.compile(
     r"(?<=[.!?])\s+"
+    r"|(?<=[,;])\s+"
     r"|(?<=[。！？，；])"
 )
 
@@ -121,8 +122,10 @@ class SentenceSplitter:
             if len(stripped) >= self._min_sentence_length:
                 sentences.append(stripped)
             elif stripped:
-                # Too short (e.g. "Dr.") — carry forward to next part
-                carry = text
+                # Too short (e.g. "Dr." or "a new nation,") — carry forward
+                # and merge with next part. Append a space since the regex
+                # consumed the whitespace boundary between parts.
+                carry = text + " "
             # else: empty, skip
 
         # Last part stays in buffer (may be incomplete)

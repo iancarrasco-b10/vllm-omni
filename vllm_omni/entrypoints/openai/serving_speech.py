@@ -849,19 +849,27 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if request.x_vector_only_mode is not None:
             params["x_vector_only_mode"] = [request.x_vector_only_mode]
 
-        # Generation parameters
         if request.max_new_tokens is not None:
             params["max_new_tokens"] = [request.max_new_tokens]
-        else:
-            params["max_new_tokens"] = [2048]
 
         if request.initial_codec_chunk_frames is not None:
             params["initial_codec_chunk_frames"] = [request.initial_codec_chunk_frames]
 
         # VoiceDesign requires non_streaming_mode (match offline script behaviour).
-        # CustomVoice and Base rely on the model default (True and False respectively).
+        # Base with ICL (voice cloning) also uses non_streaming_mode: the streaming
+        # text-codec overlay dilutes text conditioning when the reference audio is
+        # long (codec_lens >> text_lens), causing the model to miss EOS on certain
+        # sentences. Non-streaming mode concatenates them instead, giving the model
+        # full text context upfront. The full text is always available in API calls.
         if params["task_type"][0] == "VoiceDesign":
             params["non_streaming_mode"] = [True]
+        elif params["task_type"][0] == "Base":
+            has_voice_clone = bool(
+                request.ref_audio
+                or (request.voice and request.voice.strip())
+            )
+            if has_voice_clone:
+                params["non_streaming_mode"] = [True]
 
         return params
 
@@ -1005,12 +1013,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         sampling_params_list = self.engine_client.default_sampling_params_list
 
-        # Override Stage-0 max_tokens if caller specified max_new_tokens (Fish Speech).
-        if self._is_fish_speech and request.max_new_tokens is not None and sampling_params_list:
+        # Override Stage-0 max_tokens from request max_new_tokens.
+        max_new_tokens = (tts_params.get("max_new_tokens") or [None])[0] if tts_params else None
+        if max_new_tokens is None and request.max_new_tokens is not None:
+            max_new_tokens = request.max_new_tokens
+        if max_new_tokens is not None and sampling_params_list:
             import copy
 
             sampling_params_list = copy.deepcopy(sampling_params_list)
-            sampling_params_list[0].max_tokens = request.max_new_tokens
+            sampling_params_list[0].max_tokens = max_new_tokens
 
         generator = self.engine_client.generate(
             prompt=prompt,

@@ -137,10 +137,10 @@ class StreamingSpeechSessionConfig(BaseModel):
         ),
     )
     split_granularity: Literal["sentence", "clause"] = Field(
-        default="sentence",
+        default="clause",
         description=(
             "Text splitting granularity: 'sentence' splits on .!?。！？, "
-            "'clause' also splits on CJK commas ， and semicolons ；."
+            "'clause' also splits on commas and semicolons (English and CJK)."
         ),
     )
     max_buffered_words: int | None = Field(
