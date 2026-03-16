@@ -648,6 +648,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except Exception:
             return None
 
+    def _get_cached_ref_text(self, speaker: str) -> str | None:
+        """Read ref_text from the safetensors cache metadata."""
+        cache_dir = os.environ.get("SPEECH_VOICE_SAMPLES", "/tmp/voice_samples")
+        cache_file = Path(cache_dir) / f"{speaker}.safetensors"
+        if not cache_file.exists():
+            return None
+        try:
+            from safetensors import safe_open
+            with safe_open(str(cache_file), framework="pt") as f:
+                meta = f.metadata()
+                if meta:
+                    return meta.get("item_0_ref_text")
+            return None
+        except Exception:
+            return None
+
     async def _resolve_ref_audio(self, ref_audio_str: str) -> tuple[list[float], int]:
         """Resolve ref_audio to (wav_samples, sample_rate).
 
@@ -806,7 +822,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             params["speaker"] = [request.voice]
 
             # If voice is an uploaded speaker and no ref_audio provided, auto-set it
-            if request.voice.lower() in self.uploaded_speakers and request.ref_audio is None:
+            # Skip if a voice cache exists — the talker will load from safetensors.
+            if (request.voice.lower() in self.uploaded_speakers
+                    and request.ref_audio is None
+                    and not self._has_voice_cache(request.voice.lower())):
                 audio_data = self._get_uploaded_audio_data(request.voice)
                 if audio_data:
                     params["ref_audio"] = [audio_data]
@@ -830,19 +849,27 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if request.x_vector_only_mode is not None:
             params["x_vector_only_mode"] = [request.x_vector_only_mode]
 
-        # Generation parameters
         if request.max_new_tokens is not None:
             params["max_new_tokens"] = [request.max_new_tokens]
-        else:
-            params["max_new_tokens"] = [2048]
 
         if request.initial_codec_chunk_frames is not None:
             params["initial_codec_chunk_frames"] = [request.initial_codec_chunk_frames]
 
         # VoiceDesign requires non_streaming_mode (match offline script behaviour).
-        # CustomVoice and Base rely on the model default (True and False respectively).
+        # Base with ICL (voice cloning) also uses non_streaming_mode: the streaming
+        # text-codec overlay dilutes text conditioning when the reference audio is
+        # long (codec_lens >> text_lens), causing the model to miss EOS on certain
+        # sentences. Non-streaming mode concatenates them instead, giving the model
+        # full text context upfront. The full text is always available in API calls.
         if params["task_type"][0] == "VoiceDesign":
             params["non_streaming_mode"] = [True]
+        elif params["task_type"][0] == "Base":
+            has_voice_clone = bool(
+                request.ref_audio
+                or (request.voice and request.voice.strip())
+            )
+            if has_voice_clone:
+                params["non_streaming_mode"] = [True]
 
         return params
 
@@ -952,11 +979,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 ref_code_len = self._get_cached_ref_code_len(voice_name)
                 if ref_code_len is not None and ref_code_len > 0:
                     tts_params["_cached_ref_code_len"] = ref_code_len
+                # Restore cached ref_text for prompt length estimation
+                if "ref_text" not in tts_params:
+                    cached_ref_text = self._get_cached_ref_text(voice_name)
+                    if cached_ref_text:
+                        tts_params["ref_text"] = [cached_ref_text]
             elif request.ref_audio is not None:
                 wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
                 tts_params["ref_audio"] = [[wav_list, sr]]
 
             ph_len = self._estimate_prompt_len(tts_params)
+            tts_params.pop("_cached_ref_code_len", None)
+            logger.info("Estimated prompt_len=%d for text=%r", ph_len, (tts_params.get("text") or [""])[0][:60])
             prompt = {"prompt_token_ids": [1] * ph_len, "additional_information": tts_params}
         else:
             tts_params = {}
@@ -979,12 +1013,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         sampling_params_list = self.engine_client.default_sampling_params_list
 
-        # Override Stage-0 max_tokens if caller specified max_new_tokens (Fish Speech).
-        if self._is_fish_speech and request.max_new_tokens is not None and sampling_params_list:
+        # Override Stage-0 max_tokens from request max_new_tokens.
+        max_new_tokens = (tts_params.get("max_new_tokens") or [None])[0] if tts_params else None
+        if max_new_tokens is None and request.max_new_tokens is not None:
+            max_new_tokens = request.max_new_tokens
+        if max_new_tokens is not None and sampling_params_list:
             import copy
 
             sampling_params_list = copy.deepcopy(sampling_params_list)
-            sampling_params_list[0].max_tokens = request.max_new_tokens
+            sampling_params_list[0].max_tokens = max_new_tokens
 
         generator = self.engine_client.generate(
             prompt=prompt,
