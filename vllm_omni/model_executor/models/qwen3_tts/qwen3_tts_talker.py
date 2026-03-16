@@ -1344,6 +1344,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                             "ref_spk_embedding": _cached[0].ref_spk_embedding,
                             "icl_mode": _cached[0].icl_mode,
                         }
+                        # Restore cached ref_text so ICL mode can tokenize it
+                        if _cached[0].ref_text and "ref_text" not in info_dict:
+                            info_dict["ref_text"] = [_cached[0].ref_text]
                         logger.info("Voice cache HIT for %r", _voice_name)
 
             # Official implementation may pass `voice_clone_prompt.icl_mode`.
