@@ -332,6 +332,18 @@ def main():
         default=None,
         help="Flush text to TTS after this many words even without sentence boundary",
     )
+    parser.add_argument(
+        "--split-granularity",
+        default="sentence",
+        choices=["sentence", "clause"],
+        help="Text splitting granularity for websocket TTS (default: sentence)",
+    )
+    parser.add_argument(
+        "--min-sentence-length",
+        type=int,
+        default=40,
+        help="Minimum characters before the websocket splitter emits a segment (default: 40)",
+    )
     parser.add_argument("--speed", type=float, default=1.0, help="Playback speed (0.25-4.0)")
     parser.add_argument("--max-new-tokens", type=int, default=None, help="Max tokens")
 
@@ -392,6 +404,8 @@ def main():
         "ref_text",
         "voice_name",
         "max_buffered_words",
+        "split_granularity",
+        "min_sentence_length",
     ]:
         val = getattr(args, key.replace("-", "_"), None)
         if val is not None:

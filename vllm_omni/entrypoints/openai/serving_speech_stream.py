@@ -105,7 +105,7 @@ class OmniStreamingSpeechHandler:
 
             boundary_re = SPLIT_CLAUSE if config.split_granularity == "clause" else SPLIT_SENTENCE
             splitter = SentenceSplitter(
-                min_sentence_length=20,
+                min_sentence_length=(config.min_sentence_length if config.min_sentence_length is not None else 20),
                 boundary_re=boundary_re,
                 max_buffered_words=config.max_buffered_words,
             )

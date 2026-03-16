@@ -152,6 +152,14 @@ class StreamingSpeechSessionConfig(BaseModel):
             "input (e.g. live STT). Set to null/omit to disable."
         ),
     )
+    min_sentence_length: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Minimum character length for a buffered segment before the websocket "
+            "splitter emits it. Larger values reduce short sentence/clause flushes."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "StreamingSpeechSessionConfig":
