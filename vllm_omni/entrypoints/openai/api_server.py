@@ -302,6 +302,8 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
             # no access log will be output.
             access_log=not args.disable_uvicorn_access_log,
             timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
+            ws_ping_interval=300,
+            ws_ping_timeout=300,
             ssl_keyfile=args.ssl_keyfile,
             ssl_certfile=args.ssl_certfile,
             ssl_ca_certs=args.ssl_ca_certs,

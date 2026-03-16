@@ -822,7 +822,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             params["speaker"] = [request.voice]
 
             # If voice is an uploaded speaker and no ref_audio provided, auto-set it
-            if request.voice.lower() in self.uploaded_speakers and request.ref_audio is None:
+            # Skip if a voice cache exists — the talker will load from safetensors.
+            if (request.voice.lower() in self.uploaded_speakers
+                    and request.ref_audio is None
+                    and not self._has_voice_cache(request.voice.lower())):
                 audio_data = self._get_uploaded_audio_data(request.voice)
                 if audio_data:
                     params["ref_audio"] = [audio_data]
@@ -978,6 +981,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 tts_params["ref_audio"] = [[wav_list, sr]]
 
             ph_len = self._estimate_prompt_len(tts_params)
+            tts_params.pop("_cached_ref_code_len", None)
+            logger.info("Estimated prompt_len=%d for text=%r", ph_len, (tts_params.get("text") or [""])[0][:60])
             prompt = {"prompt_token_ids": [1] * ph_len, "additional_information": tts_params}
         else:
             tts_params = {}

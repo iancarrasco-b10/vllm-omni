@@ -559,6 +559,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 full_prompt_embeds, tailing_text_hidden, tts_pad_embed, ref_code_len, ref_code = (
                     self._build_prompt_embeds(task_type=task_type, info_dict=info_dict)
                 )
+                logger.info(
+                    "Actual prompt_embeds=%d, trailing_text=%d, span_len=%d",
+                    int(full_prompt_embeds.shape[0]),
+                    int(tailing_text_hidden.shape[0]),
+                    span_len,
+                )
                 # Store full prompt embeddings + trailing queue on CPU for later chunks/steps.
                 prompt_embeds_cpu = full_prompt_embeds.detach().to("cpu").contiguous()
                 info_update: dict[str, Any] = {
@@ -830,7 +836,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     text_embed_len = ref_id_len + text_id_len + 1  # + eos
                     prompt_len += text_embed_len + codec_lens
                 else:
-                    # _generate_icl_prompt(non_streaming_mode=False): aligned to codec_lens.
+                    # _generate_icl_prompt(non_streaming_mode=False):
+                    # icl_input_embed is always codec_lens wide — text is
+                    # truncated or padded to match codec, with any overflow
+                    # going into trailing_text_hidden (consumed during decode).
                     prompt_len += codec_lens
             else:
                 # Base without ICL behaves like CustomVoice.

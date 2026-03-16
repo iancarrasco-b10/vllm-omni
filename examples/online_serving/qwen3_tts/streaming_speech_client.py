@@ -56,7 +56,7 @@ async def stream_tts(
     """Connect to the streaming TTS endpoint and process audio responses."""
     os.makedirs(output_dir, exist_ok=True)
 
-    async with websockets.connect(url) as ws:
+    async with websockets.connect(url, ping_interval=None) as ws:
         # 1. Send session config
         config_msg = {"type": "session.config", **config}
         await ws.send(json.dumps(config_msg))
@@ -207,7 +207,7 @@ async def stream_tts(
 
 async def delete_voice(url: str, voice_name: str) -> None:
     """Connect and send a voice.delete request."""
-    async with websockets.connect(url) as ws:
+    async with websockets.connect(url, ping_interval=None) as ws:
         # Must send session.config first (protocol requirement)
         await ws.send(json.dumps({"type": "session.config"}))
 
