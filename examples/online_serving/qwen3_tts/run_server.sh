@@ -2,31 +2,45 @@
 # Launch vLLM-Omni server for Qwen3-TTS models
 #
 # Usage:
-#   ./run_server.sh                           # Default: CustomVoice model
-#   ./run_server.sh CustomVoice               # CustomVoice model
-#   ./run_server.sh VoiceDesign               # VoiceDesign model
-#   ./run_server.sh Base                      # Base (voice clone) model
+#   ./run_server.sh Base                      # Base 0.6B 12Hz (defaults)
+#   ./run_server.sh Base 1.7B                 # Base 1.7B 12Hz
+#   ./run_server.sh Base 0.6B 25Hz            # Base 0.6B 25Hz
+#   ./run_server.sh CustomVoice 1.7B 25Hz     # CustomVoice 1.7B 25Hz
+#   ./run_server.sh Qwen/Qwen3-TTS-12Hz-0.6B-Base   # Direct HF model path
+#   ./run_server.sh /local/path/to/model             # Local model path
 
 set -e
 
-TASK_TYPE="${1:-CustomVoice}"
+ARG1="${1:-CustomVoice}"
 
-case "$TASK_TYPE" in
-    CustomVoice)
-        MODEL="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
-        ;;
-    VoiceDesign)
-        MODEL="Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
-        ;;
-    Base)
-        MODEL="Qwen/Qwen3-TTS-12Hz-1.7B-Base"
-        ;;
-    *)
-        echo "Unknown task type: $TASK_TYPE"
-        echo "Supported: CustomVoice, VoiceDesign, Base"
-        exit 1
-        ;;
-esac
+# If the first arg contains a slash, treat it as a direct model path.
+if [[ "$ARG1" == */* ]]; then
+    MODEL="$ARG1"
+else
+    TASK_TYPE="$ARG1"
+    SIZE="${2:-}"
+    HZ="${3:-12Hz}"
+
+    case "$TASK_TYPE" in
+        CustomVoice)
+            SIZE="${SIZE:-1.7B}"
+            MODEL="Qwen/Qwen3-TTS-${HZ}-${SIZE}-CustomVoice"
+            ;;
+        VoiceDesign)
+            SIZE="${SIZE:-1.7B}"
+            MODEL="Qwen/Qwen3-TTS-${HZ}-${SIZE}-VoiceDesign"
+            ;;
+        Base)
+            SIZE="${SIZE:-0.6B}"
+            MODEL="Qwen/Qwen3-TTS-${HZ}-${SIZE}-Base"
+            ;;
+        *)
+            echo "Unknown task type: $TASK_TYPE"
+            echo "Supported: CustomVoice, VoiceDesign, Base"
+            exit 1
+            ;;
+    esac
+fi
 
 echo "Starting Qwen3-TTS server with model: $MODEL"
 
@@ -36,5 +50,5 @@ vllm-omni serve "$MODEL" \
     --port 8091 \
     --gpu-memory-utilization 0.9 \
     --trust-remote-code \
-    --enforce-eager \
+    --chat-template "{% for m in messages %}{{ m['content'] }}{% endfor %}" \
     --omni
