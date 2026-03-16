@@ -648,6 +648,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except Exception:
             return None
 
+    def _get_cached_ref_text(self, speaker: str) -> str | None:
+        """Read ref_text from the safetensors cache metadata."""
+        cache_dir = os.environ.get("SPEECH_VOICE_SAMPLES", "/tmp/voice_samples")
+        cache_file = Path(cache_dir) / f"{speaker}.safetensors"
+        if not cache_file.exists():
+            return None
+        try:
+            from safetensors import safe_open
+            with safe_open(str(cache_file), framework="pt") as f:
+                meta = f.metadata()
+                if meta:
+                    return meta.get("item_0_ref_text")
+            return None
+        except Exception:
+            return None
+
     async def _resolve_ref_audio(self, ref_audio_str: str) -> tuple[list[float], int]:
         """Resolve ref_audio to (wav_samples, sample_rate).
 
@@ -952,6 +968,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 ref_code_len = self._get_cached_ref_code_len(voice_name)
                 if ref_code_len is not None and ref_code_len > 0:
                     tts_params["_cached_ref_code_len"] = ref_code_len
+                # Restore cached ref_text for prompt length estimation
+                if "ref_text" not in tts_params:
+                    cached_ref_text = self._get_cached_ref_text(voice_name)
+                    if cached_ref_text:
+                        tts_params["ref_text"] = [cached_ref_text]
             elif request.ref_audio is not None:
                 wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
                 tts_params["ref_audio"] = [[wav_list, sr]]
