@@ -286,7 +286,11 @@ class Qwen3TTSCode2Wav(nn.Module):
             wav = wav_tensors[j]
             expected_len = actual_frames * upsample
             if wav.shape[0] > expected_len:
-                wav = wav[:expected_len]
+                # Align to the tail of the decode rather than the head.  The
+                # decoder can overrun slightly around chunk boundaries, and
+                # front-trimming here can clip the audible tail after we later
+                # remove left-context samples.
+                wav = wav[-expected_len:]
             if ctx_frames > 0:
                 cut = ctx_frames * upsample
                 if cut < wav.shape[0]:
