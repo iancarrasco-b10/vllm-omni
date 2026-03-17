@@ -114,6 +114,13 @@ def talker2code2wav_async_chunk(
             initial_chunk_size = int(entry.list_data[0])
             per_request_override = True
 
+    # Static IC from config takes next priority.
+    if not per_request_override:
+        static_ic = int(cfg.get("initial_codec_chunk_frames", 0))
+        if static_ic > 0:
+            initial_chunk_size = static_ic
+            per_request_override = True
+
     # Dynamic IC: cache per request so boundaries stay stable for its lifetime.
     if not per_request_override:
         _ic_cache = getattr(transfer_manager, "_cached_ic", None)
