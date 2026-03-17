@@ -597,9 +597,45 @@ class TestTTSMethods:
 
     def test_validate_tts_request_customvoice_no_speakers(self, speech_server):
         """CustomVoice on a model with no speakers returns 400 instead of crashing engine."""
+        speech_server.supported_speakers = set()
+        speech_server.uploaded_speakers = {}
         req = OpenAICreateSpeechRequest(input="Hello", task_type="CustomVoice")
         result = speech_server._validate_tts_request(req)
         assert "does not support CustomVoice" in result
+
+    def test_validate_tts_request_uploaded_voice_requires_ready_cache(self, speech_server, mocker: MockerFixture):
+        speech_server.uploaded_speakers = {
+            "finn": {
+                "name": "finn",
+                "file_path": "/tmp/voice_samples/finn.wav",
+                "cache_status": "pending",
+            }
+        }
+        speech_server.supported_speakers = {"vivian", "finn"}
+        mocker.patch.object(speech_server, "_has_voice_cache", return_value=False)
+
+        req = OpenAICreateSpeechRequest(input="Hello", voice="finn")
+        result = speech_server._validate_tts_request(req)
+
+        assert "not initialized in the voice cache yet" in result
+        assert "ref_audio/ref_text" in result
+
+    def test_validate_tts_request_base_voice_name_requires_ready_cache(self, speech_server, mocker: MockerFixture):
+        speech_server.uploaded_speakers = {
+            "finn": {
+                "name": "finn",
+                "file_path": "/tmp/voice_samples/finn.wav",
+                "cache_status": "pending",
+            }
+        }
+        speech_server.supported_speakers = {"vivian", "finn"}
+        mocker.patch.object(speech_server, "_has_voice_cache", return_value=False)
+
+        req = OpenAICreateSpeechRequest(input="Hello", task_type="Base", voice="finn")
+        result = speech_server._validate_tts_request(req)
+
+        assert "not initialized in the voice cache yet" in result
+        assert "ref_audio/ref_text" in result
 
     def test_build_tts_params(self, speech_server):
         """Test TTS parameter building."""

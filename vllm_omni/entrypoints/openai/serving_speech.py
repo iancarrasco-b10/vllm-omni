@@ -519,6 +519,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _validate_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate TTS request parameters. Returns error message or None."""
+        def _missing_voice_cache_error(voice_name: str) -> str:
+            return (
+                f"Voice '{voice_name}' is not initialized in the voice cache yet. "
+                "Initialize it first with Base voice cloning (provide ref_audio/ref_text once), "
+                "then reuse the cached voice name."
+            )
+
         # Infer Base task when ref_audio or ref_text is provided without explicit task_type.
         if request.task_type is None and (request.ref_audio is not None or request.ref_text is not None):
             request.task_type = "Base"
@@ -544,6 +551,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     "Use task_type='Base' with ref_audio/ref_text for voice cloning, "
                     "or use a CustomVoice model."
                 )
+            if request.voice is not None and request.voice in self.uploaded_speakers and not self._has_voice_cache(request.voice):
+                return _missing_voice_cache_error(request.voice)
             if request.voice is not None and request.voice not in self.supported_speakers:
                 return f"Invalid speaker '{request.voice}'. Supported: {', '.join(sorted(self.supported_speakers))}"
 
@@ -570,6 +579,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             else:
                 # voice is not None
                 voice_lower = request.voice.lower()
+                if request.ref_audio is None and not self._has_voice_cache(voice_lower):
+                    return _missing_voice_cache_error(request.voice)
                 if voice_lower in self.uploaded_speakers:
                     # Check if audio file exists for uploaded speaker
                     speaker_info = self.uploaded_speakers[voice_lower]
