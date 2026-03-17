@@ -965,6 +965,91 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "additional_information": additional_information,
         }
 
+    @staticmethod
+    def _clone_sampling_params_list(sampling_params_list: list[Any] | None) -> list[Any]:
+        import copy
+
+        return copy.deepcopy(sampling_params_list) if sampling_params_list else []
+
+    @staticmethod
+    def _has_base_voice_clone_context(request: OpenAICreateSpeechRequest, tts_params: dict[str, Any]) -> bool:
+        task_type = (tts_params.get("task_type") or [None])[0]
+        if task_type != "Base":
+            return False
+        voice_name = (request.voice or "").strip()
+        return bool(request.ref_audio or voice_name)
+
+    @staticmethod
+    def _estimate_short_sentence_min_tokens(text: str) -> int | None:
+        stripped = text.strip()
+        if not stripped:
+            return None
+
+        # Guard short isolated sentences against overly eager codec EOS.
+        char_len = len(stripped)
+        if char_len > 80:
+            return None
+
+        words = len(stripped.split())
+        if words < 4:
+            return None
+
+        punctuation = sum(ch in ",;:?!." for ch in stripped)
+        estimate = max(24, min(48, words * 4 + punctuation))
+        return estimate
+
+    def _resolve_stage0_min_tokens(
+        self,
+        request: OpenAICreateSpeechRequest,
+        tts_params: dict[str, Any],
+    ) -> int | None:
+        if request.min_tokens is not None:
+            return request.min_tokens
+        if not self._has_base_voice_clone_context(request, tts_params):
+            return None
+        return self._estimate_short_sentence_min_tokens(request.input)
+
+    def _apply_speech_sampling_overrides(
+        self,
+        request: OpenAICreateSpeechRequest,
+        sampling_params_list: list[Any] | None,
+        tts_params: dict[str, Any],
+    ) -> list[Any] | None:
+        if not sampling_params_list:
+            return sampling_params_list
+
+        stage0_updates: dict[str, Any] = {}
+        if request.temperature is not None:
+            stage0_updates["temperature"] = request.temperature
+        if request.top_p is not None:
+            stage0_updates["top_p"] = request.top_p
+        if request.top_k is not None:
+            stage0_updates["top_k"] = request.top_k
+        if request.repetition_penalty is not None:
+            stage0_updates["repetition_penalty"] = request.repetition_penalty
+
+        max_new_tokens = (tts_params.get("max_new_tokens") or [None])[0] if tts_params else None
+        if max_new_tokens is None and request.max_new_tokens is not None:
+            max_new_tokens = request.max_new_tokens
+        if max_new_tokens is not None:
+            stage0_updates["max_tokens"] = max_new_tokens
+
+        min_tokens = self._resolve_stage0_min_tokens(request, tts_params)
+        if min_tokens is not None:
+            stage0_updates["min_tokens"] = min_tokens
+
+        if not stage0_updates:
+            return sampling_params_list
+
+        sampling_params_list = self._clone_sampling_params_list(sampling_params_list)
+        stage0_params = sampling_params_list[0]
+        for field_name, value in stage0_updates.items():
+            if isinstance(stage0_params, dict):
+                stage0_params[field_name] = value
+            else:
+                setattr(stage0_params, field_name, value)
+        return sampling_params_list
+
     async def _prepare_speech_generation(
         self,
         request: OpenAICreateSpeechRequest,
@@ -1035,16 +1120,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
 
         sampling_params_list = self.engine_client.default_sampling_params_list
-
-        # Override Stage-0 max_tokens from request max_new_tokens.
-        max_new_tokens = (tts_params.get("max_new_tokens") or [None])[0] if tts_params else None
-        if max_new_tokens is None and request.max_new_tokens is not None:
-            max_new_tokens = request.max_new_tokens
-        if max_new_tokens is not None and sampling_params_list:
-            import copy
-
-            sampling_params_list = copy.deepcopy(sampling_params_list)
-            sampling_params_list[0].max_tokens = max_new_tokens
+        sampling_params_list = self._apply_speech_sampling_overrides(
+            request=request,
+            sampling_params_list=sampling_params_list,
+            tts_params=tts_params,
+        )
 
         generator = self.engine_client.generate(
             prompt=prompt,

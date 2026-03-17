@@ -5,6 +5,7 @@ import os
 import struct
 from inspect import Signature, signature
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
@@ -609,6 +610,91 @@ class TestTTSMethods:
         assert params["speaker"] == ["Ryan"]
         assert params["language"] == ["English"]
         assert params["task_type"] == ["CustomVoice"]
+
+    def test_short_base_voice_clone_min_tokens_heuristic(self, speech_server):
+        req = OpenAICreateSpeechRequest(
+            input="Let's take it one step at a time, okay?",
+            task_type="Base",
+            voice="finn",
+        )
+        tts_params = {"task_type": ["Base"]}
+
+        assert speech_server._resolve_stage0_min_tokens(req, tts_params) == 38
+
+    def test_explicit_min_tokens_overrides_heuristic(self, speech_server):
+        req = OpenAICreateSpeechRequest(
+            input="Let's take it one step at a time, okay?",
+            task_type="Base",
+            voice="finn",
+            min_tokens=12,
+        )
+        tts_params = {"task_type": ["Base"]}
+
+        assert speech_server._resolve_stage0_min_tokens(req, tts_params) == 12
+
+    def test_prepare_speech_generation_applies_sampling_overrides(self, mocker: MockerFixture):
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.generate = mocker.MagicMock(return_value=object())
+        mock_engine_client.default_sampling_params_list = [
+            SimpleNamespace(
+                temperature=0.9,
+                top_p=1.0,
+                top_k=50,
+                repetition_penalty=1.05,
+                max_tokens=8192,
+                min_tokens=0,
+            )
+        ]
+
+        mock_stage = mocker.MagicMock()
+        mock_stage.model_stage = "qwen3_tts"
+        mock_stage.tts_args = {}
+        mock_engine_client.stage_list = [mock_stage]
+
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+
+        mocker.patch.object(server, "_validate_tts_request", return_value=None)
+        mocker.patch.object(
+            server,
+            "_build_tts_params",
+            return_value={"text": ["Let's take it one step at a time, okay?"], "task_type": ["Base"]},
+        )
+        mocker.patch.object(server, "_estimate_prompt_len", return_value=64)
+        mocker.patch.object(server, "_has_voice_cache", return_value=False)
+
+        request = OpenAICreateSpeechRequest(
+            input="Let's take it one step at a time, okay?",
+            task_type="Base",
+            voice="finn",
+            temperature=0.2,
+            top_p=0.8,
+            top_k=12,
+            repetition_penalty=1.2,
+            max_new_tokens=256,
+        )
+
+        asyncio.run(server._prepare_speech_generation(request))
+
+        call = mock_engine_client.generate.call_args
+        sampling_params_list = call.kwargs["sampling_params_list"]
+        stage0 = sampling_params_list[0]
+        default_stage0 = mock_engine_client.default_sampling_params_list[0]
+
+        assert stage0.temperature == 0.2
+        assert stage0.top_p == 0.8
+        assert stage0.top_k == 12
+        assert stage0.repetition_penalty == 1.2
+        assert stage0.max_tokens == 256
+        assert stage0.min_tokens == 38
+        assert default_stage0.temperature == 0.9
+        assert default_stage0.max_tokens == 8192
 
     def test_load_supported_speakers(self, mocker: MockerFixture):
         """Test _load_supported_speakers."""

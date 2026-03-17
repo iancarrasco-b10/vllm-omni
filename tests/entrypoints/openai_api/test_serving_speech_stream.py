@@ -47,7 +47,7 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "voice": "Vivian", "min_sentence_length": 0})
                 ws.send_json({"type": "input.text", "text": "Hello world. "})
 
                 start = ws.receive_json()
@@ -60,7 +60,13 @@ class TestStreamingSpeechWebSocket:
                 assert audio.startswith(b"RIFF")
 
                 done = ws.receive_json()
-                assert done == {"type": "audio.done", "sentence_index": 0, "total_bytes": len(audio), "error": False}
+                assert done == {
+                    "type": "audio.done",
+                    "sentence_index": 0,
+                    "total_bytes": len(audio),
+                    "sample_rate": 24000,
+                    "error": False,
+                }
 
                 ws.send_json({"type": "input.done"})
                 session_done = ws.receive_json()
@@ -97,6 +103,12 @@ class TestStreamingSpeechWebSocket:
                         "voice": "Vivian",
                         "stream_audio": True,
                         "response_format": "pcm",
+                        "min_sentence_length": 0,
+                        "temperature": 0.4,
+                        "top_p": 0.95,
+                        "top_k": 32,
+                        "repetition_penalty": 1.1,
+                        "min_tokens": 28,
                         "initial_codec_chunk_frames": 12,
                     }
                 )
@@ -112,7 +124,13 @@ class TestStreamingSpeechWebSocket:
                 assert ws.receive_bytes() == b"\x06"
 
                 done = ws.receive_json()
-                assert done == {"type": "audio.done", "sentence_index": 0, "total_bytes": 6, "error": False}
+                assert done == {
+                    "type": "audio.done",
+                    "sentence_index": 0,
+                    "total_bytes": 6,
+                    "sample_rate": 24000,
+                    "error": False,
+                }
 
                 ws.send_json({"type": "input.done"})
                 assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
@@ -120,6 +138,11 @@ class TestStreamingSpeechWebSocket:
         assert len(captured_requests) == 1
         assert captured_requests[0].stream is True
         assert captured_requests[0].response_format == "pcm"
+        assert captured_requests[0].temperature == 0.4
+        assert captured_requests[0].top_p == 0.95
+        assert captured_requests[0].top_k == 32
+        assert captured_requests[0].repetition_penalty == 1.1
+        assert captured_requests[0].min_tokens == 28
         assert captured_requests[0].initial_codec_chunk_frames == 12
         assert speech_service._generate_audio_bytes.await_count == 0
 
@@ -128,7 +151,7 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "voice": "Vivian", "min_sentence_length": 0})
                 ws.send_json({"type": "input.text", "text": "Hello world without punctuation"})
                 ws.send_json({"type": "input.done"})
 
@@ -138,6 +161,7 @@ class TestStreamingSpeechWebSocket:
                     "type": "audio.done",
                     "sentence_index": 0,
                     "total_bytes": 36,
+                    "sample_rate": 24000,
                     "error": False,
                 }
                 assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
@@ -164,7 +188,7 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "voice": "Vivian", "min_sentence_length": 0})
                 ws.send_json({"type": "input.text", "text": ""})
                 ws.send_json({"type": "input.done"})
 
@@ -177,7 +201,7 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "voice": "Vivian", "min_sentence_length": 0})
                 ws.send_json({"type": "input.text", "text": "First sentence. Second sentence. "})
 
                 first_start = ws.receive_json()
@@ -187,6 +211,7 @@ class TestStreamingSpeechWebSocket:
                     "type": "audio.done",
                     "sentence_index": 0,
                     "total_bytes": 36,
+                    "sample_rate": 24000,
                     "error": False,
                 }
 
@@ -197,6 +222,7 @@ class TestStreamingSpeechWebSocket:
                     "type": "audio.done",
                     "sentence_index": 1,
                     "total_bytes": 36,
+                    "sample_rate": 24000,
                     "error": False,
                 }
 
@@ -208,7 +234,7 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "voice": "Vivian", "min_sentence_length": 0})
                 ws.send_json({"type": "unknown"})
 
                 error = ws.receive_json()
@@ -221,6 +247,7 @@ class TestStreamingSpeechWebSocket:
                     "type": "audio.done",
                     "sentence_index": 0,
                     "total_bytes": 36,
+                    "sample_rate": 24000,
                     "error": False,
                 }
 
@@ -246,12 +273,18 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "voice": "Vivian", "min_sentence_length": 0})
                 ws.send_json({"type": "input.text", "text": "Hello world. "})
 
                 assert ws.receive_json()["type"] == "audio.start"
                 assert ws.receive_json() == {"type": "error", "message": "Generation failed for sentence 0: boom"}
-                assert ws.receive_json() == {"type": "audio.done", "sentence_index": 0, "total_bytes": 0, "error": True}
+                assert ws.receive_json() == {
+                    "type": "audio.done",
+                    "sentence_index": 0,
+                    "total_bytes": 0,
+                    "sample_rate": 24000,
+                    "error": True,
+                }
 
                 ws.send_json({"type": "input.done"})
                 assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
@@ -278,6 +311,7 @@ class TestStreamingSpeechWebSocket:
                         "voice": "Vivian",
                         "stream_audio": True,
                         "response_format": "pcm",
+                        "min_sentence_length": 0,
                     }
                 )
                 ws.send_json({"type": "input.text", "text": "Hello world. "})
@@ -292,6 +326,7 @@ class TestStreamingSpeechWebSocket:
                     "type": "audio.done",
                     "sentence_index": 0,
                     "total_bytes": 2,
+                    "sample_rate": 24000,
                     "error": True,
                 }
 
@@ -374,6 +409,11 @@ class TestStreamingSpeechWebSocket:
         config.response_format = "pcm"
         config.speed = 1.0
         config.max_new_tokens = None
+        config.min_tokens = None
+        config.temperature = None
+        config.top_p = None
+        config.top_k = None
+        config.repetition_penalty = None
         config.initial_codec_chunk_frames = None
         config.ref_audio = None
         config.ref_text = None

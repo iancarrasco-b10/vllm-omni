@@ -55,6 +55,32 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description="Maximum tokens to generate",
     )
+    min_tokens: int | None = Field(
+        default=None,
+        ge=0,
+        description="Minimum number of tokens to generate before EOS can stop decoding",
+    )
+    temperature: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Sampling temperature override for the stage-0 talker",
+    )
+    top_p: float | None = Field(
+        default=None,
+        gt=0.0,
+        le=1.0,
+        description="Nucleus sampling threshold override for the stage-0 talker",
+    )
+    top_k: int | None = Field(
+        default=None,
+        ge=-1,
+        description="Top-k sampling override for the stage-0 talker (-1 disables top-k)",
+    )
+    repetition_penalty: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="Repetition penalty override for the stage-0 talker",
+    )
     initial_codec_chunk_frames: int | None = Field(
         default=None,
         ge=0,
@@ -113,6 +139,32 @@ class StreamingSpeechSessionConfig(BaseModel):
     response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] = "wav"
     speed: float | None = Field(default=1.0, ge=0.25, le=4.0)
     max_new_tokens: int | None = Field(default=None, ge=1)
+    min_tokens: int | None = Field(
+        default=None,
+        ge=0,
+        description="Minimum number of tokens to generate before EOS can stop decoding.",
+    )
+    temperature: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Sampling temperature override for the stage-0 talker.",
+    )
+    top_p: float | None = Field(
+        default=None,
+        gt=0.0,
+        le=1.0,
+        description="Nucleus sampling threshold override for the stage-0 talker.",
+    )
+    top_k: int | None = Field(
+        default=None,
+        ge=-1,
+        description="Top-k sampling override for the stage-0 talker (-1 disables top-k).",
+    )
+    repetition_penalty: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="Repetition penalty override for the stage-0 talker.",
+    )
     initial_codec_chunk_frames: int | None = Field(
         default=None,
         ge=0,
