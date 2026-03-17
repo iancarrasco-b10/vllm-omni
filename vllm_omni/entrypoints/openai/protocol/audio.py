@@ -55,11 +55,6 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description="Maximum tokens to generate",
     )
-    min_tokens: int | None = Field(
-        default=None,
-        ge=0,
-        description="Minimum number of tokens to generate before EOS can stop decoding",
-    )
     temperature: float | None = Field(
         default=None,
         ge=0.0,
@@ -139,11 +134,6 @@ class StreamingSpeechSessionConfig(BaseModel):
     response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] = "wav"
     speed: float | None = Field(default=1.0, ge=0.25, le=4.0)
     max_new_tokens: int | None = Field(default=None, ge=1)
-    min_tokens: int | None = Field(
-        default=None,
-        ge=0,
-        description="Minimum number of tokens to generate before EOS can stop decoding.",
-    )
     temperature: float | None = Field(
         default=None,
         ge=0.0,

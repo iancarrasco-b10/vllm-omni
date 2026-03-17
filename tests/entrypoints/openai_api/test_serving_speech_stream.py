@@ -108,7 +108,6 @@ class TestStreamingSpeechWebSocket:
                         "top_p": 0.95,
                         "top_k": 32,
                         "repetition_penalty": 1.1,
-                        "min_tokens": 28,
                         "initial_codec_chunk_frames": 12,
                     }
                 )
@@ -142,7 +141,6 @@ class TestStreamingSpeechWebSocket:
         assert captured_requests[0].top_p == 0.95
         assert captured_requests[0].top_k == 32
         assert captured_requests[0].repetition_penalty == 1.1
-        assert captured_requests[0].min_tokens == 28
         assert captured_requests[0].initial_codec_chunk_frames == 12
         assert speech_service._generate_audio_bytes.await_count == 0
 
@@ -409,7 +407,6 @@ class TestStreamingSpeechWebSocket:
         config.response_format = "pcm"
         config.speed = 1.0
         config.max_new_tokens = None
-        config.min_tokens = None
         config.temperature = None
         config.top_p = None
         config.top_k = None

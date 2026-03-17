@@ -669,27 +669,6 @@ class TestTTSMethods:
         assert params["language"] == ["English"]
         assert params["task_type"] == ["CustomVoice"]
 
-    def test_short_base_voice_clone_min_tokens_heuristic(self, speech_server):
-        req = OpenAICreateSpeechRequest(
-            input="Let's take it one step at a time, okay?",
-            task_type="Base",
-            voice="finn",
-        )
-        tts_params = {"task_type": ["Base"]}
-
-        assert speech_server._resolve_stage0_min_tokens(req, tts_params) == 38
-
-    def test_explicit_min_tokens_overrides_heuristic(self, speech_server):
-        req = OpenAICreateSpeechRequest(
-            input="Let's take it one step at a time, okay?",
-            task_type="Base",
-            voice="finn",
-            min_tokens=12,
-        )
-        tts_params = {"task_type": ["Base"]}
-
-        assert speech_server._resolve_stage0_min_tokens(req, tts_params) == 12
-
     def test_prepare_speech_generation_applies_sampling_overrides(self, mocker: MockerFixture):
         mock_engine_client = mocker.MagicMock()
         mock_engine_client.errored = False
@@ -701,7 +680,6 @@ class TestTTSMethods:
                 top_k=50,
                 repetition_penalty=1.05,
                 max_tokens=8192,
-                min_tokens=0,
             )
         ]
 
@@ -750,7 +728,6 @@ class TestTTSMethods:
         assert stage0.top_k == 12
         assert stage0.repetition_penalty == 1.2
         assert stage0.max_tokens == 256
-        assert stage0.min_tokens == 38
         assert default_stage0.temperature == 0.9
         assert default_stage0.max_tokens == 8192
 

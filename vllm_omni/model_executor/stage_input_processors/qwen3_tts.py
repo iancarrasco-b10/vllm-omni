@@ -12,6 +12,11 @@ from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
 
 logger = init_logger(__name__)
 
+# 12Hz speech tokenizer codebook size.  Any codec value >= this threshold is
+# invalid for the decoder's embedding table and must be filtered (e.g. the
+# talker's stop-token ID 2150 / codec_eos_token_id 4198).
+_CODEBOOK_SIZE = 2048
+
 
 def talker2code2wav(
     stage_list: list[Any],
@@ -29,8 +34,9 @@ def talker2code2wav(
         output = talker_output.outputs[0]
         # audio_codes shape: [num_frames, Q] where Q=num_quantizers (16)
         audio_codes = output.multimodal_output["audio_codes"].to(torch.long)
-        # Filter zero-padded frames (EOS/invalid steps), matching _extract_last_frame behavior
-        valid_mask = audio_codes.any(dim=1)
+        # Filter zero-padded frames AND frames containing out-of-range codec
+        # values (e.g. stop tokens) that would crash the decoder embedding.
+        valid_mask = audio_codes.any(dim=1) & (audio_codes.max(dim=1).values < _CODEBOOK_SIZE)
         audio_codes = audio_codes[valid_mask]
         ref_code = output.multimodal_output.get("ref_code")
         if isinstance(ref_code, list):
@@ -63,9 +69,15 @@ def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
         frame = audio_codes[-1]
         if frame.numel() == 0 or not bool(frame.any().item()):
             return None
-        return frame.to(torch.long).reshape(-1)
+        frame = frame.to(torch.long).reshape(-1)
+        if int(frame.max().item()) >= _CODEBOOK_SIZE:
+            return None
+        return frame
     if audio_codes.ndim == 1:
-        return audio_codes.to(torch.long).reshape(-1)
+        frame = audio_codes.to(torch.long).reshape(-1)
+        if int(frame.max().item()) >= _CODEBOOK_SIZE:
+            return None
+        return frame
     raise ValueError(f"Invalid audio_codes shape for Qwen3-TTS async_chunk: {tuple(audio_codes.shape)}")
 
 
@@ -183,33 +195,17 @@ def talker2code2wav_async_chunk(
     left_context_size = max(0, end_index - context_length)
     window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
 
-    # Prepend ref_code as decoder context when the window is undersized.
-    # The FastAPI optimized backend prepends ref_code tail to *every* early chunk
-    # (not just the first) so the decoder always has voice identity context.
-    # Without this, early IC-phase chunks (e.g. 2-4 frames) have no voice
-    # reference, causing audible quality artifacts.
-    # On the first decode use the full ref so we trim all of it (no ref in output)
-    # and the decoder has maximum voice identity; later chunks use capped overlap.
+    # Prepend ref_code as decoder context on every chunk so the vocoder
+    # maintains voice-clone speaker identity throughout the stream.  The HF
+    # reference decodes ref_code + all_codes in one pass; without ref_code
+    # on later chunks the decoder loses speaker identity and produces
+    # distorted audio.  Use .get() (not .pop()) to retain ref_code for
+    # subsequent chunks.
     ref_code = request_payload.get(request_id)
     if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
-        ref_code_frames = ref_code.shape[0]
-        current_window = len(window_frames)
-        is_first_decode = left_context_size == 0 and current_window == length
-        if is_first_decode and ref_code_frames > 0:
-            # First decode: prepend full ref, trim all of it at Code2Wav.
-            target_window = ref_code_frames + context_length
-            n_ref = ref_code_frames
-        else:
-            target_window = left_context_size_config + context_length
-            if current_window < target_window:
-                available_space = target_window - current_window
-                n_ref = min(available_space, ref_code_frames)
-            else:
-                n_ref = 0
-        if current_window < target_window and n_ref > 0:
-            ref_frames = ref_code[-n_ref:].tolist()
-            window_frames = ref_frames + window_frames
-            left_context_size += n_ref
+        ref_frames = ref_code.tolist()
+        window_frames = ref_frames + window_frames
+        left_context_size += len(ref_frames)
 
     # Clean up ref_code when request is done to avoid memory leak.
     if finished and request_id in request_payload:

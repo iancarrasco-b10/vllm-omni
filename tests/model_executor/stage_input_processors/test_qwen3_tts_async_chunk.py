@@ -12,6 +12,7 @@ from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
     max_ic_for_chunk_size,
 )
 from vllm_omni.model_executor.stage_input_processors.qwen3_tts import (
+    _extract_last_frame,
     talker2code2wav,
     talker2code2wav_async_chunk,
 )
@@ -77,7 +78,7 @@ def test_eof_marker_when_finished_empty():
         request=_req("r", finished=True),
         is_finished=True,
     )
-    assert p == {"code_predictor_codes": [], "finished": torch.tensor(True, dtype=torch.bool)}
+    assert p == {"code_predictor_codes": [], "finished": True}
 
 
 def test_flush_on_finish():
@@ -158,24 +159,25 @@ def test_dynamic_ic_adapts_to_load():
 
 
 def test_ic_load_change_mid_request():
-    """IC stateless: load spike mid-request shifts initial_coverage."""
+    """IC is cached per-request: a load spike after the first emit does NOT
+    change IC for an in-flight request, keeping chunk boundaries stable."""
     tm = _tm(chunk_frames=25, left_context=25, max_num_seqs=8)
 
-    # Low load -> IC=2 -> emit at frame 2
+    # Low load -> IC=2, cached for request "r"
     p1 = _call(tm, "r", n_frames=2)
     assert p1 is not None
 
-    # Spike load: 6 others -> IC=16 -> initial_coverage=16
+    # Spike load: 6 others appear. IC for "r" stays cached at 2.
     for i in range(6):
         tm.code_prompt_token_ids[f"other-{i}"] = [[0]] * 10
 
-    # adjusted=25-16=9, 9%25!=0 -> hold
+    # IC=2, initial_coverage=24, adjusted=25-24=1, 1%25!=0 -> hold
     assert _call(tm, "r", n_frames=25) is None
 
-    # First normal emit at 16+25=41
-    p3 = _call(tm, "r", n_frames=41)
+    # IC=2, initial_coverage=24, adjusted=49-24=25, 25%25==0 -> emit
+    p3 = _call(tm, "r", n_frames=49)
     assert p3 is not None
-    assert p3["left_context_size"] == 16
+    assert p3["left_context_size"] == 24
 
 
 @pytest.mark.parametrize(
@@ -227,18 +229,14 @@ def test_first_streaming_chunk_prepends_ref_code_context():
     assert len(payload["code_predictor_codes"]) == _Q * 12
 
 
-def test_ref_code_context_prepended_to_undersized_windows():
-    """ref_code tail is prepended to any chunk where the window is undersized,
-    not just the first chunk.  This matches the FastAPI optimized backend
-    (_add_ref_code_context) and gives the decoder stable voice identity context
-    throughout early generation."""
+def test_ref_code_context_applies_to_all_streaming_chunks():
+    """ref_code is prepended as decoder context on every chunk, not just the first."""
     tm = _tm()
     rid = "r-ref2"
     tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(20)]
     tm.put_req_chunk[rid] = 1
     ref_code = torch.tensor([[9, 9, 9, 9], [8, 8, 8, 8]], dtype=torch.long)
-    # Store ref_code via pooling_output on an earlier call
-    tm.request_payload = {rid: ref_code}
+    tm.request_payload[rid] = ref_code
 
     payload = talker2code2wav_async_chunk(
         transfer_manager=tm,
@@ -248,15 +246,15 @@ def test_ref_code_context_prepended_to_undersized_windows():
     )
 
     assert payload is not None
-    # Window is 20 frames, target is left_context(25)+IC(10)=35, so 2 ref frames prepended
-    assert payload["left_context_size"] == 10 + 2  # 10 left_context + 2 ref_code
-    assert len(payload["code_predictor_codes"]) == _Q * 22  # 20 generated + 2 ref
+    # ref_code (2 frames) prepended as left context on second chunk too
+    assert payload["left_context_size"] == 10 + 2
+    assert len(payload["code_predictor_codes"]) == _Q * (20 + 2)
 
 
 def test_ref_code_context_can_be_buffered_before_first_emit():
     """ref_code is stored on the first pooling_output and persists across chunks.
-    It is prepended as context when the window is undersized, and cleaned up
-    only when the request finishes."""
+    It is prepended as context on every chunk, and cleaned up only when the
+    request finishes."""
     tm = _tm()
     rid = "r-ref-buffered"
     ref_code = torch.tensor([[9, 9, 9, 9], [8, 8, 8, 8]], dtype=torch.long)
@@ -286,11 +284,9 @@ def test_ref_code_context_can_be_buffered_before_first_emit():
     )
 
     assert payload is not None
-    # 10 frames generated, target window = left_context(25)+IC(10)=35
-    # So 2 ref_code frames are prepended as context
+    # ref_code (2 frames) is kept (not popped) for subsequent chunks
     assert payload["left_context_size"] == 2
     assert len(payload["code_predictor_codes"]) == _Q * 12
-    # ref_code persists until request finishes (not popped on first emit)
     assert rid in tm.request_payload
 
     # Verify cleanup on finish
@@ -340,3 +336,69 @@ def test_non_async_processor_prepends_ref_code_and_sets_trim_context():
         4,
         8,
     ]
+
+
+# ---------- Stop-token / out-of-range codec filtering ----------
+
+
+def test_extract_last_frame_filters_stop_token():
+    """Frames with any codec value >= _CODEBOOK_SIZE (2048) are rejected."""
+    stop_frame = torch.tensor([[100, 200, 2150, 50]], dtype=torch.long)
+    assert _extract_last_frame({"audio_codes": stop_frame}) is None
+
+    valid_frame = torch.tensor([[100, 200, 300, 50]], dtype=torch.long)
+    result = _extract_last_frame({"audio_codes": valid_frame})
+    assert result is not None
+    assert result.tolist() == [100, 200, 300, 50]
+
+
+def test_extract_last_frame_filters_stop_token_1d():
+    """1-D fallback path also rejects out-of-range values."""
+    stop_1d = torch.tensor([10, 20, 2048], dtype=torch.long)
+    assert _extract_last_frame({"audio_codes": stop_1d}) is None
+
+    valid_1d = torch.tensor([10, 20, 2047], dtype=torch.long)
+    result = _extract_last_frame({"audio_codes": valid_1d})
+    assert result is not None
+    assert result.tolist() == [10, 20, 2047]
+
+
+def test_non_async_processor_filters_stop_token_frames():
+    """talker2code2wav drops frames where any codec >= _CODEBOOK_SIZE."""
+    audio_codes = torch.tensor(
+        [
+            [1, 2, 3, 4],      # valid
+            [5, 6, 7, 8],      # valid
+            [2150, 0, 0, 0],   # stop token in first codebook
+            [0, 0, 0, 0],      # zero-padded (also filtered)
+        ],
+        dtype=torch.long,
+    )
+    output = SimpleNamespace(multimodal_output={"audio_codes": audio_codes, "ref_code": None})
+    stage = SimpleNamespace(engine_outputs=[SimpleNamespace(outputs=[output])])
+
+    prompts = talker2code2wav(stage_list=[stage], engine_input_source=[0])
+
+    assert len(prompts) == 1
+    prompt = prompts[0]
+    # Only 2 valid frames remain, Q=4, codebook-major: [q0f0, q0f1, q1f0, q1f1, ...]
+    assert prompt["prompt_token_ids"] == [1, 5, 2, 6, 3, 7, 4, 8]
+
+
+def test_async_chunk_drops_stop_token_frame():
+    """Async path skips frames with out-of-range codec values."""
+    tm = _tm(chunk_frames=2, left_context=0, max_num_seqs=1)
+    rid = "stop-tok"
+
+    valid_output = {"audio_codes": torch.tensor([[10, 20, 30, 40]], dtype=torch.long)}
+    talker2code2wav_async_chunk(
+        tm, valid_output, _req(rid, finished=False), is_finished=False,
+    )
+    assert len(tm.code_prompt_token_ids[rid]) == 1
+
+    stop_output = {"audio_codes": torch.tensor([[10, 20, 2150, 40]], dtype=torch.long)}
+    talker2code2wav_async_chunk(
+        tm, stop_output, _req(rid, finished=False), is_finished=False,
+    )
+    # Stop-token frame should have been dropped
+    assert len(tm.code_prompt_token_ids[rid]) == 1

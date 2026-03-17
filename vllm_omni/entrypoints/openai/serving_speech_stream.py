@@ -242,7 +242,6 @@ class OmniStreamingSpeechHandler:
             response_format=response_format,
             speed=config.speed,
             max_new_tokens=config.max_new_tokens,
-            min_tokens=config.min_tokens,
             temperature=config.temperature,
             top_p=config.top_p,
             top_k=config.top_k,
