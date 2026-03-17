@@ -362,6 +362,28 @@ class TestSpeechAPI:
         assert voice_info["file_size"] == len(audio_content)
         response = client.delete("/v1/audio/voices/test_voice")
 
+    def test_upload_voice_m4a_transcodes_to_wav(self, client, mocker: MockerFixture):
+        audio_content = b"fake m4a content"
+        mock_transcode = mocker.patch.object(
+            OmniOpenAIServingSpeech,
+            "_transcode_audio_bytes_to_wav",
+            return_value=b"RIFF" + b"\x00" * 32,
+        )
+        files = {
+            "audio_sample": ("test.m4a", audio_content, "audio/m4a"),
+        }
+        data = {
+            "consent": "user_consent_m4a",
+            "name": "test_voice_m4a",
+        }
+
+        response = client.post("/v1/audio/voices", files=files, data=data)
+        assert response.status_code == 200
+        result = response.json()
+        assert result["voice"]["mime_type"] == "audio/wav"
+        mock_transcode.assert_called_once()
+        client.delete("/v1/audio/voices/test_voice_m4a")
+
     def test_upload_voice_file_too_large(self, client):
         """Test voice upload with file exceeding size limit."""
         # Create a file larger than 10MB
@@ -821,6 +843,21 @@ class TestTTSMethods:
         assert "ref_audio" not in params
         # x_vector_only_mode should not be set when explicit ref_audio is provided
         assert "x_vector_only_mode" not in params
+
+    def test_resolve_ref_audio_falls_back_to_ffmpeg(self, speech_server, mocker: MockerFixture):
+        connector = mocker.MagicMock()
+        connector.fetch_audio_async = AsyncMock(side_effect=RuntimeError("unsupported media container"))
+        mocker.patch("vllm_omni.entrypoints.openai.serving_speech.MediaConnector", return_value=connector)
+        mock_ffmpeg = mocker.patch.object(
+            speech_server,
+            "_resolve_ref_audio_with_ffmpeg",
+            return_value=([0.0, 0.25, -0.25], 16000),
+        )
+
+        result = asyncio.run(speech_server._resolve_ref_audio("data:audio/m4a;base64,ZmFrZQ=="))
+
+        assert result == ([0.0, 0.25, -0.25], 16000)
+        mock_ffmpeg.assert_called_once_with("data:audio/m4a;base64,ZmFrZQ==")
 
     def test_get_uploaded_audio_data(self, speech_server):
         """Test _get_uploaded_audio_data function."""

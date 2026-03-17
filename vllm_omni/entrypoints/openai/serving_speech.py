@@ -5,11 +5,15 @@ import math
 import os
 import re
 import struct
+import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import numpy as np
+import soundfile as sf
 from fastapi import Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from transformers.utils.hub import cached_file
@@ -47,6 +51,42 @@ _TTS_LANGUAGES: set[str] = {
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
 _TTS_MAX_NEW_TOKENS_MIN = 1
 _TTS_MAX_NEW_TOKENS_MAX = 4096
+_AUDIO_MIME_TYPE_ALIASES: dict[str, str] = {
+    "audio/wav": "audio/wav",
+    "audio/x-wav": "audio/wav",
+    "audio/mpeg": "audio/mpeg",
+    "audio/mp3": "audio/mpeg",
+    "audio/flac": "audio/flac",
+    "audio/ogg": "audio/ogg",
+    "audio/oga": "audio/ogg",
+    "audio/aac": "audio/aac",
+    "audio/mp4": "audio/mp4",
+    "audio/m4a": "audio/mp4",
+    "audio/x-m4a": "audio/mp4",
+    "audio/mp4a-latm": "audio/mp4",
+    "audio/webm": "audio/webm",
+}
+_AUDIO_EXT_TO_MIME_TYPE: dict[str, str] = {
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".mpeg": "audio/mpeg",
+    ".flac": "audio/flac",
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".aac": "audio/aac",
+    ".m4a": "audio/mp4",
+    ".mp4": "audio/mp4",
+    ".webm": "audio/webm",
+}
+_AUDIO_MIME_TYPE_TO_EXT: dict[str, str] = {
+    "audio/wav": ".wav",
+    "audio/mpeg": ".mp3",
+    "audio/flac": ".flac",
+    "audio/ogg": ".ogg",
+    "audio/aac": ".aac",
+    "audio/mp4": ".m4a",
+    "audio/webm": ".webm",
+}
 
 
 def _create_wav_header(sample_rate: int, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
@@ -195,6 +235,102 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except Exception:
             pass
         return None
+
+    @staticmethod
+    def _normalize_audio_mime_type(mime_type: str | None, filename: str | None = None) -> str | None:
+        if mime_type:
+            normalized = _AUDIO_MIME_TYPE_ALIASES.get(mime_type.lower())
+            if normalized is not None:
+                return normalized
+        if filename:
+            return _AUDIO_EXT_TO_MIME_TYPE.get(Path(filename).suffix.lower())
+        return None
+
+    @staticmethod
+    def _guess_audio_extension(mime_type: str | None, filename: str | None = None) -> str:
+        normalized = OmniOpenAIServingSpeech._normalize_audio_mime_type(mime_type, filename)
+        if normalized is not None:
+            return _AUDIO_MIME_TYPE_TO_EXT.get(normalized, ".bin")
+        if filename:
+            suffix = Path(filename).suffix.lower()
+            if suffix:
+                return suffix
+        return ".bin"
+
+    @staticmethod
+    def _decode_data_uri(ref_audio_str: str) -> tuple[bytes, str | None]:
+        header, payload = ref_audio_str.split(",", 1)
+        mime_type = None
+        match = re.match(r"data:([^;]+);base64$", header.strip(), flags=re.IGNORECASE)
+        if match:
+            mime_type = match.group(1)
+        return base64.b64decode(payload), mime_type
+
+    def _transcode_audio_bytes_to_wav(self, audio_bytes: bytes, *, filename: str | None, mime_type: str | None) -> bytes:
+        input_suffix = self._guess_audio_extension(mime_type, filename)
+        with tempfile.TemporaryDirectory(prefix="voice-upload-") as tmpdir:
+            input_path = Path(tmpdir) / f"input{input_suffix}"
+            output_path = Path(tmpdir) / "output.wav"
+            input_path.write_bytes(audio_bytes)
+            cmd = [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-y",
+                "-i",
+                str(input_path),
+                "-ac",
+                "1",
+                "-ar",
+                "24000",
+                str(output_path),
+            ]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+            except FileNotFoundError as e:
+                raise ValueError("ffmpeg is required to convert uploaded audio formats such as m4a") from e
+            except subprocess.CalledProcessError as e:
+                stderr = (e.stderr or "").strip()
+                raise ValueError(f"Failed to convert uploaded audio to WAV via ffmpeg: {stderr or e}") from e
+            return output_path.read_bytes()
+
+    def _resolve_ref_audio_with_ffmpeg(self, ref_audio_str: str) -> tuple[list[float], int]:
+        with tempfile.TemporaryDirectory(prefix="ref-audio-") as tmpdir:
+            output_path = Path(tmpdir) / "output.wav"
+            input_arg = ref_audio_str
+
+            if ref_audio_str.startswith("data:"):
+                audio_bytes, mime_type = self._decode_data_uri(ref_audio_str)
+                input_path = Path(tmpdir) / f"input{self._guess_audio_extension(mime_type)}"
+                input_path.write_bytes(audio_bytes)
+                input_arg = str(input_path)
+            elif ref_audio_str.startswith("file://"):
+                input_arg = urlparse(ref_audio_str).path
+
+            cmd = [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-y",
+                "-i",
+                input_arg,
+                "-ac",
+                "1",
+                str(output_path),
+            ]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+            except FileNotFoundError as e:
+                raise ValueError("ffmpeg is required to decode media containers such as m4a for ref_audio") from e
+            except subprocess.CalledProcessError as e:
+                stderr = (e.stderr or "").strip()
+                raise ValueError(f"Failed to decode ref_audio via ffmpeg: {stderr or e}") from e
+
+            audio, sr = sf.read(str(output_path), dtype="float32", always_2d=False)
+            audio_np = np.asarray(audio, dtype=np.float32)
+            if audio_np.ndim > 1:
+                audio_np = np.mean(audio_np, axis=-1)
+            return audio_np.tolist(), int(sr)
 
     def _find_tts_stage(self):
         """Find and return the TTS stage from the stage list, or None if not found."""
@@ -363,33 +499,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if file_size > MAX_FILE_SIZE:
             raise ValueError(f"File size exceeds maximum limit of 10MB. Got {file_size} bytes.")
 
-        # Detect MIME type from filename if content_type is generic
-        mime_type = audio_file.content_type
-        if mime_type == "application/octet-stream":
-            # Simple MIME type detection based on file extension
-            filename_lower = audio_file.filename.lower()
-            if filename_lower.endswith(".wav"):
-                mime_type = "audio/wav"
-            elif filename_lower.endswith((".mp3", ".mpeg")):
-                mime_type = "audio/mpeg"
-            elif filename_lower.endswith(".flac"):
-                mime_type = "audio/flac"
-            elif filename_lower.endswith(".ogg"):
-                mime_type = "audio/ogg"
-            elif filename_lower.endswith(".aac"):
-                mime_type = "audio/aac"
-            elif filename_lower.endswith(".webm"):
-                mime_type = "audio/webm"
-            elif filename_lower.endswith(".mp4"):
-                mime_type = "audio/mp4"
-            else:
-                mime_type = "audio/wav"  # Default
+        # Normalize MIME type so common aliases like audio/m4a are accepted.
+        mime_type = self._normalize_audio_mime_type(audio_file.content_type, audio_file.filename)
+        if mime_type is None:
+            mime_type = "audio/wav"
 
         # Validate MIME type
         allowed_mime_types = {
             "audio/mpeg",
             "audio/wav",
-            "audio/x-wav",
             "audio/ogg",
             "audio/aac",
             "audio/flac",
@@ -413,12 +531,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Generate filename with sanitized inputs
         timestamp = int(time.time())
-        file_suffix = Path(audio_file.filename).suffix
-        file_ext = file_suffix[1:] if file_suffix and len(file_suffix) > 1 else "wav"
-        # Sanitize file extension as well
-        sanitized_ext = _sanitize_filename(file_ext)
-        if not sanitized_ext or sanitized_ext == "file":
+        content = await audio_file.read()
+        if mime_type != "audio/wav":
+            content = self._transcode_audio_bytes_to_wav(content, filename=audio_file.filename, mime_type=mime_type)
+            mime_type = "audio/wav"
             sanitized_ext = "wav"
+        else:
+            file_suffix = Path(audio_file.filename).suffix
+            file_ext = file_suffix[1:] if file_suffix and len(file_suffix) > 1 else "wav"
+            sanitized_ext = _sanitize_filename(file_ext)
+            if not sanitized_ext or sanitized_ext == "file":
+                sanitized_ext = "wav"
 
         filename = f"{sanitized_name}_{sanitized_consent}_{timestamp}.{sanitized_ext}"
         file_path = self.uploaded_speakers_dir / filename
@@ -430,7 +553,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Save audio file
         try:
             with open(file_path, "wb") as f:
-                content = await audio_file.read()
                 f.write(content)
         except Exception as e:
             raise ValueError(f"Failed to save audio file: {e}")
@@ -716,11 +838,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             allowed_local_media_path=model_config.allowed_local_media_path,
             allowed_media_domains=model_config.allowed_media_domains,
         )
-        wav_np, sr = await connector.fetch_audio_async(ref_audio_str)
-        wav_np = np.asarray(wav_np, dtype=np.float32)
-        if wav_np.ndim > 1:
-            wav_np = np.mean(wav_np, axis=-1)
-        result = (wav_np.tolist(), int(sr))
+        try:
+            wav_np, sr = await connector.fetch_audio_async(ref_audio_str)
+            wav_np = np.asarray(wav_np, dtype=np.float32)
+            if wav_np.ndim > 1:
+                wav_np = np.mean(wav_np, axis=-1)
+            result = (wav_np.tolist(), int(sr))
+        except Exception as e:
+            logger.info("MediaConnector failed to decode ref_audio, falling back to ffmpeg: %s", e)
+            result = await asyncio.to_thread(self._resolve_ref_audio_with_ffmpeg, ref_audio_str)
         cache[ref_audio_str] = result
         return result
 
