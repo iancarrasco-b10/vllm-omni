@@ -1,5 +1,4 @@
-# Qwen3-TTS batch_size=4 config (streaming with async_chunk)
-# Enables concurrent request processing with max_inflight=4
+# Qwen3-TTS streaming config (async_chunk)
 # 2-stage pipeline: Talker -> Code2Wav
 async_chunk: true
 stage_args:
@@ -7,7 +6,7 @@ stage_args:
     stage_type: llm
     runtime:
       devices: "0"
-      max_batch_size: 16
+      max_batch_size: 64
     engine_args:
       model_stage: qwen3_tts
       model_arch: Qwen3TTSTalkerForConditionalGeneration
@@ -17,12 +16,12 @@ stage_args:
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       enforce_eager: false
       trust_remote_code: true
-      async_scheduling: false
+      async_scheduling: true
       enable_prefix_caching: false
       engine_output_type: latent
-      gpu_memory_utilization: 0.3
+      gpu_memory_utilization: 0.65
       distributed_executor_backend: "mp"
-      max_num_batched_tokens: 4096
+      max_num_batched_tokens: 8192
       max_model_len: 8192
       custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav_async_chunk
     output_connectors:
@@ -40,7 +39,7 @@ stage_args:
     stage_type: llm
     runtime:
       devices: "0"
-      max_batch_size: 16
+      max_batch_size: 64
     engine_args:
       model_stage: code2wav
       model_arch: Qwen3TTSCode2Wav
@@ -50,10 +49,10 @@ stage_args:
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       enforce_eager: true
       trust_remote_code: true
-      async_scheduling: false
+      async_scheduling: true
       enable_prefix_caching: false
       engine_output_type: audio
-      gpu_memory_utilization: 0.2
+      gpu_memory_utilization: 0.25
       distributed_executor_backend: "mp"
       max_num_batched_tokens: 8192
       max_model_len: 32768
@@ -77,7 +76,7 @@ runtime:
   enabled: true
   defaults:
     window_size: -1
-    max_inflight: 16
+    max_inflight: 64
 
   connectors:
     connector_of_shared_memory:
@@ -90,13 +89,7 @@ runtime:
         connector_get_max_wait: 300
         codec_chunk_frames: 25
         codec_left_context_frames: 25
-        # It can be problematic if codec_chunk_frames and codec_left_context_frames differ.
-        # If codec_left_context_frames is too small compared to chunk size, audio streaming may have artifacts or reduced quality at chunk boundaries,
-        # because the Code2Wav model may not have enough left context to accurately synthesize the current frame.
-        # If codec_left_context_frames is much larger than codec_chunk_frames, it can waste computation and increase latency,
-        # since a bigger overlap than necessary causes more repeated decoding.
-        # For best results and smooth audio, keep codec_left_context_frames equal to or slightly less than codec_chunk_frames.
-        # Setting them equal ensures every chunk is decoded with the maximum available preceding context for that chunk.
+        initial_codec_chunk_frames: 4
 
   edges:
     - from: 0

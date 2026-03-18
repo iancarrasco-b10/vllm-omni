@@ -120,7 +120,7 @@ async def run_one(entry: dict, idx: int) -> dict:
 
     elapsed = time.perf_counter() - t0
     total_secs = total_bytes / (SAMPLE_RATE * BYTES_PER_SAMPLE)
-    rtf = total_secs / elapsed if elapsed > 0 else 0
+    rtf = elapsed / total_secs if total_secs > 0 else 0
     result = {
         "id": entry["id"],
         "label": label,

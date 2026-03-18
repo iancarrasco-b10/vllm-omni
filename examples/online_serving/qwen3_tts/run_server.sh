@@ -52,3 +52,4 @@ vllm-omni serve "$MODEL" \
     --trust-remote-code \
     --chat-template "{% for m in messages %}{{ m['content'] }}{% endfor %}" \
     --omni
+    
