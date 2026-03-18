@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import base64
 import asyncio
 import json
 import time
@@ -87,6 +88,25 @@ def pcm_bytes_to_duration(num_bytes: int, sample_rate: int = 24000, sample_width
     return num_bytes / sample_width / sample_rate
 
 
+def encode_audio_to_data_url(audio_path: str) -> str:
+    path = Path(audio_path)
+    suffix = path.suffix.lower()
+    if suffix == ".wav":
+        mime_type = "audio/wav"
+    elif suffix in {".mp3", ".mpeg"}:
+        mime_type = "audio/mpeg"
+    elif suffix == ".flac":
+        mime_type = "audio/flac"
+    elif suffix == ".ogg":
+        mime_type = "audio/ogg"
+    else:
+        mime_type = "audio/wav"
+
+    audio_bytes = path.read_bytes()
+    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+    return f"data:{mime_type};base64,{audio_b64}"
+
+
 async def send_tts_request(
     session: aiohttp.ClientSession,
     api_url: str,
@@ -96,6 +116,9 @@ async def send_tts_request(
     stream: bool = True,
     pbar: tqdm | None = None,
     task_type: str | None = None,
+    ref_audio: str | None = None,
+    ref_text: str | None = None,
+    x_vector_only_mode: bool = False,
 ) -> RequestResult:
     payload = {
         "input": prompt,
@@ -106,6 +129,12 @@ async def send_tts_request(
     }
     if task_type:
         payload["task_type"] = task_type
+    if ref_audio:
+        payload["ref_audio"] = ref_audio
+    if ref_text:
+        payload["ref_text"] = ref_text
+    if x_vector_only_mode:
+        payload["x_vector_only_mode"] = True
 
     result = RequestResult(prompt=prompt)
     st = time.perf_counter()
@@ -151,6 +180,9 @@ async def run_benchmark(
     language: str = "English",
     stream: bool = True,
     task_type: str | None = None,
+    ref_audio: str | None = None,
+    ref_text: str | None = None,
+    x_vector_only_mode: bool = False,
 ) -> BenchmarkResult:
     api_url = f"http://{host}:{port}/v1/audio/speech"
 
@@ -160,7 +192,18 @@ async def run_benchmark(
     if num_warmups > 0:
         print(f"  Warming up with {num_warmups} requests...")
         warmup_tasks = [
-            send_tts_request(session, api_url, PROMPTS[i % len(PROMPTS)], voice, language, stream, task_type=task_type)
+            send_tts_request(
+                session,
+                api_url,
+                PROMPTS[i % len(PROMPTS)],
+                voice,
+                language,
+                stream,
+                task_type=task_type,
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+                x_vector_only_mode=x_vector_only_mode,
+            )
             for i in range(num_warmups)
         ]
         await asyncio.gather(*warmup_tasks)
@@ -174,7 +217,19 @@ async def run_benchmark(
 
     async def limited_request(prompt):
         async with semaphore:
-            return await send_tts_request(session, api_url, prompt, voice, language, stream, pbar, task_type=task_type)
+            return await send_tts_request(
+                session,
+                api_url,
+                prompt,
+                voice,
+                language,
+                stream,
+                pbar,
+                task_type=task_type,
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+                x_vector_only_mode=x_vector_only_mode,
+            )
 
     start_time = time.perf_counter()
     tasks = [asyncio.create_task(limited_request(p)) for p in request_prompts]
@@ -271,6 +326,9 @@ async def main(args):
             language=args.language,
             stream=args.stream,
             task_type=args.task_type,
+            ref_audio=args.ref_audio,
+            ref_text=args.ref_text,
+            x_vector_only_mode=args.x_vector_only_mode,
         )
         result.config_name = args.config_name
         all_results.append(asdict(result))
@@ -297,9 +355,15 @@ def parse_args():
     parser.add_argument("--stream", action="store_true", default=True)
     parser.add_argument("--no-stream", dest="stream", action="store_false")
     parser.add_argument("--task-type", type=str, default=None, choices=["CustomVoice", "VoiceDesign", "Base"])
+    parser.add_argument("--ref-audio", type=str, default=None)
+    parser.add_argument("--ref-text", type=str, default=None)
+    parser.add_argument("--x-vector-only-mode", action="store_true", default=False)
     parser.add_argument("--config-name", type=str, default="async_chunk_on")
     parser.add_argument("--result-dir", type=str, default="results")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.ref_audio and not args.ref_audio.startswith(("http://", "https://", "data:")):
+        args.ref_audio = encode_audio_to_data_url(args.ref_audio)
+    return args
 
 
 if __name__ == "__main__":

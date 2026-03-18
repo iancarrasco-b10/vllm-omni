@@ -1413,7 +1413,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 speaker_embed = self._extract_speaker_embedding(wav_np, sr).view(1, 1, -1)
 
             # --- Save to voice file cache if we just encoded from ref_audio ---
-            if voice_clone_prompt is None and isinstance(ref_code_t, torch.Tensor):
+            # x-vector-only mode has no ref_code, but it still benefits from a
+            # reusable speaker-embedding cache keyed by voice name.
+            if voice_clone_prompt is None and (isinstance(ref_code_t, torch.Tensor) or xvec_only):
                 _spk_list = info_dict.get("speaker")
                 _voice_name = _spk_list[0] if isinstance(_spk_list, list) and _spk_list else None
                 if _voice_name is not None:
@@ -1429,7 +1431,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                         )["input_ids"]
                         _ref_ids_len = int(_ref_ids.shape[-1])
                     _item = VoiceClonePromptItem(
-                        ref_code=ref_code_t.detach().cpu().contiguous(),
+                        ref_code=ref_code_t.detach().cpu().contiguous() if isinstance(ref_code_t, torch.Tensor) else None,
                         ref_spk_embedding=speaker_embed.detach().cpu().contiguous().view(-1),
                         x_vector_only_mode=xvec_only,
                         icl_mode=in_context_mode,

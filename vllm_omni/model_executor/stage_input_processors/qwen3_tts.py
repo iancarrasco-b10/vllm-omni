@@ -81,6 +81,31 @@ def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
     raise ValueError(f"Invalid audio_codes shape for Qwen3-TTS async_chunk: {tuple(audio_codes.shape)}")
 
 
+def _get_cached_ref_frames(request_payload: dict[str, Any], request_id: str) -> list[list[int]] | None:
+    """Return cached reference frames for *request_id*.
+
+    New entries store a small dict with both the CPU tensor and the Python list
+    representation so later chunks avoid repeated ``ref_code.tolist()`` calls.
+    Keep backward compatibility with older in-memory entries that stored the
+    tensor directly.
+    """
+    payload = request_payload.get(request_id)
+    if isinstance(payload, dict):
+        ref_frames = payload.get("ref_frames")
+        if isinstance(ref_frames, list) and ref_frames:
+            return ref_frames
+        ref_code = payload.get("ref_code")
+    else:
+        ref_code = payload
+
+    if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
+        ref_frames = ref_code.tolist()
+        if isinstance(payload, dict):
+            payload["ref_frames"] = ref_frames
+        return ref_frames
+    return None
+
+
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
     pooling_output: dict[str, Any] | None,
@@ -101,7 +126,11 @@ def talker2code2wav_async_chunk(
             transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
         ref_code = pooling_output.get("ref_code")
         if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0 and request_payload.get(request_id) is None:
-            request_payload[request_id] = ref_code.to(torch.long).cpu().contiguous()
+            ref_code_cpu = ref_code.to(torch.long).cpu().contiguous()
+            request_payload[request_id] = {
+                "ref_code": ref_code_cpu,
+                "ref_frames": ref_code_cpu.tolist(),
+            }
     elif not finished:
         return None
 
@@ -201,9 +230,8 @@ def talker2code2wav_async_chunk(
     # on later chunks the decoder loses speaker identity and produces
     # distorted audio.  Use .get() (not .pop()) to retain ref_code for
     # subsequent chunks.
-    ref_code = request_payload.get(request_id)
-    if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
-        ref_frames = ref_code.tolist()
+    ref_frames = _get_cached_ref_frames(request_payload, request_id)
+    if ref_frames:
         window_frames = ref_frames + window_frames
         left_context_size += len(ref_frames)
 
