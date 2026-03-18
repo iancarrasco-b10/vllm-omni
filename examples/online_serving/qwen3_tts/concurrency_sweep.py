@@ -46,7 +46,7 @@ PROMPTS = [
     "I'm really sorry to hear that. That's a tough situation, and I know it probably doesn't feel like it right now, but things will get better.",
 ]
 
-CONCURRENCY_LEVELS = [1, 2, 4, 8, 16, 32, 64]
+CONCURRENCY_LEVELS = [1, 2, 4, 8, 16, 20, 32, 64]
 MIN_REQUESTS_PER_LEVEL = 16
 STAGGER_S = float(os.environ.get("TTS_STAGGER_S", "0.05"))
 SKIP_WARMUP = os.environ.get("TTS_SKIP_WARMUP", "0") == "1"
