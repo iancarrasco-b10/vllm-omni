@@ -95,6 +95,7 @@ async def send_tts_request(
     language: str = "English",
     stream: bool = True,
     pbar: tqdm | None = None,
+    task_type: str | None = None,
 ) -> RequestResult:
     payload = {
         "input": prompt,
@@ -103,6 +104,8 @@ async def send_tts_request(
         "stream": stream,
         "response_format": "pcm",
     }
+    if task_type:
+        payload["task_type"] = task_type
 
     result = RequestResult(prompt=prompt)
     st = time.perf_counter()
@@ -147,6 +150,7 @@ async def run_benchmark(
     voice: str = "vivian",
     language: str = "English",
     stream: bool = True,
+    task_type: str | None = None,
 ) -> BenchmarkResult:
     api_url = f"http://{host}:{port}/v1/audio/speech"
 
@@ -156,7 +160,7 @@ async def run_benchmark(
     if num_warmups > 0:
         print(f"  Warming up with {num_warmups} requests...")
         warmup_tasks = [
-            send_tts_request(session, api_url, PROMPTS[i % len(PROMPTS)], voice, language, stream)
+            send_tts_request(session, api_url, PROMPTS[i % len(PROMPTS)], voice, language, stream, task_type=task_type)
             for i in range(num_warmups)
         ]
         await asyncio.gather(*warmup_tasks)
@@ -170,7 +174,7 @@ async def run_benchmark(
 
     async def limited_request(prompt):
         async with semaphore:
-            return await send_tts_request(session, api_url, prompt, voice, language, stream, pbar)
+            return await send_tts_request(session, api_url, prompt, voice, language, stream, pbar, task_type=task_type)
 
     start_time = time.perf_counter()
     tasks = [asyncio.create_task(limited_request(p)) for p in request_prompts]
@@ -266,6 +270,7 @@ async def main(args):
             voice=args.voice,
             language=args.language,
             stream=args.stream,
+            task_type=args.task_type,
         )
         result.config_name = args.config_name
         all_results.append(asdict(result))
@@ -291,6 +296,7 @@ def parse_args():
     parser.add_argument("--language", type=str, default="English")
     parser.add_argument("--stream", action="store_true", default=True)
     parser.add_argument("--no-stream", dest="stream", action="store_false")
+    parser.add_argument("--task-type", type=str, default=None, choices=["CustomVoice", "VoiceDesign", "Base"])
     parser.add_argument("--config-name", type=str, default="async_chunk_on")
     parser.add_argument("--result-dir", type=str, default="results")
     return parser.parse_args()
