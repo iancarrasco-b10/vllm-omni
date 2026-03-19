@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 from fastapi import Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from transformers.utils.hub import cached_file
@@ -240,6 +241,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return set()
 
+    @staticmethod
+    def _set_ref_audio_tensor(tts_params: dict[str, Any], wav_np: np.ndarray, sr: int) -> None:
+        """Store ref_audio as a torch tensor + scalar SR for efficient binary serialization.
+
+        Using separate tensor/scalar keys avoids the ~40-100ms overhead of
+        serializing 240K Python floats through msgspec list_data.
+        """
+        tts_params.pop("ref_audio", None)
+        tts_params["ref_audio_wav"] = torch.from_numpy(np.ascontiguousarray(wav_np))
+        tts_params["ref_audio_sr"] = [sr]
+
     def _estimate_ref_code_len(self, ref_audio: object) -> int | None:
         """Estimate ref_code length from ref_audio waveform without running the codec.
 
@@ -307,10 +319,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return 2048
 
     def _get_uploaded_audio_data(self, voice_name: str) -> str | None:
-        """Get base64 encoded audio data for uploaded voice."""
+        """Get base64 encoded audio data for uploaded voice.
+
+        Results are cached in-memory so repeated requests for the same
+        uploaded voice avoid disk I/O and base64 re-encoding.
+        """
         voice_name_lower = voice_name.lower()
         if voice_name_lower not in self.uploaded_speakers:
             return None
+
+        cache = getattr(self, "_uploaded_audio_cache", None)
+        if cache is None:
+            cache = {}
+            self._uploaded_audio_cache: dict[str, str] = cache
+        if voice_name_lower in cache:
+            return cache[voice_name_lower]
 
         speaker_info = self.uploaded_speakers[voice_name_lower]
         file_path = Path(speaker_info["file_path"])
@@ -320,18 +343,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return None
 
         try:
-            # Read audio file
             with open(file_path, "rb") as f:
                 audio_bytes = f.read()
 
-            # Encode to base64
             audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-
-            # Get MIME type from file extension
             mime_type = speaker_info.get("mime_type", "audio/wav")
-
-            # Return as data URL
-            return f"data:{mime_type};base64,{audio_b64}"
+            data_url = f"data:{mime_type};base64,{audio_b64}"
+            cache[voice_name_lower] = data_url
+            return data_url
         except Exception as e:
             logger.error(f"Could not read audio file for voice {voice_name}: {e}")
             return None
@@ -482,11 +501,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             logger.error(f"Failed to delete voice '{name}' from metadata")
             return False
 
-        # Update in-memory cache
+        # Update in-memory caches
         if voice_name_lower in self.uploaded_speakers:
             del self.uploaded_speakers[voice_name_lower]
         if voice_name_lower in self.supported_speakers:
             self.supported_speakers.remove(voice_name_lower)
+        if hasattr(self, "_uploaded_audio_cache"):
+            evicted_uri = self._uploaded_audio_cache.pop(voice_name_lower, None)
+            if evicted_uri is not None and hasattr(self, "_resolved_audio_cache"):
+                self._resolved_audio_cache.pop(evicted_uri, None)
+        elif hasattr(self, "_resolved_audio_cache"):
+            self._resolved_audio_cache.clear()
 
         logger.info(f"Deleted voice '{name}' and associated files")
         return True
@@ -594,8 +619,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return None
 
-    async def _resolve_ref_audio(self, ref_audio_str: str) -> tuple[list[float], int]:
-        """Resolve ref_audio to (wav_samples, sample_rate).
+    async def _resolve_ref_audio(self, ref_audio_str: str) -> tuple[np.ndarray, int]:
+        """Resolve ref_audio to (wav_ndarray, sample_rate).
 
         Delegates to upstream vLLM's MediaConnector which handles http(s)
         URLs, ``data:`` base64 URIs, and ``file:`` local paths (the latter
@@ -610,7 +635,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         wav_np = np.asarray(wav_np, dtype=np.float32)
         if wav_np.ndim > 1:
             wav_np = np.mean(wav_np, axis=-1)
-        return wav_np.tolist(), int(sr)
+        return wav_np, int(sr)
 
     async def _generate_audio_chunks(self, generator, request_id: str, response_format: str = "pcm"):
         """Generate audio chunks for streaming response.
@@ -778,7 +803,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def _build_fish_speech_prompt(
         self,
         request: OpenAICreateSpeechRequest,
-        ref_audio_data: tuple[list[float], int] | None = None,
+        ref_audio_data: tuple[np.ndarray | list[float], int] | None = None,
     ) -> dict[str, Any]:
         """Build prompt for Fish Speech S2 Pro.
 
@@ -873,16 +898,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
             tts_params = self._build_tts_params(request)
             if request.ref_audio is not None:
-                wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
-                tts_params["ref_audio"] = [[wav_list, sr]]
+                wav_np, sr = await self._resolve_ref_audio(request.ref_audio)
+                self._set_ref_audio_tensor(tts_params, wav_np, sr)
             elif "ref_audio" in tts_params and tts_params["ref_audio"]:
-                # Uploaded voice auto-set ref_audio as a data URI string;
-                # resolve it to [[wav_list, sr]] so prompt length estimation
-                # and downstream model code can use it.
                 auto_uri = tts_params["ref_audio"][0]
                 if isinstance(auto_uri, str):
-                    wav_list, sr = await self._resolve_ref_audio(auto_uri)
-                    tts_params["ref_audio"] = [[wav_list, sr]]
+                    cache = getattr(self, "_resolved_audio_cache", None)
+                    if cache is None:
+                        cache = {}
+                        self._resolved_audio_cache: dict[str, tuple[np.ndarray, int]] = cache
+                    cached = cache.get(auto_uri)
+                    if cached is not None:
+                        wav_np, sr = cached
+                    else:
+                        wav_np, sr = await self._resolve_ref_audio(auto_uri)
+                        cache[auto_uri] = (wav_np, sr)
+                    self._set_ref_audio_tensor(tts_params, wav_np, sr)
 
             ph_len = self._estimate_prompt_len(tts_params)
             prompt = {"prompt_token_ids": [1] * ph_len, "additional_information": tts_params}

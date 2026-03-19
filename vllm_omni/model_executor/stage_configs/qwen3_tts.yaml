@@ -16,7 +16,7 @@ stage_args:
       async_scheduling: true
       enable_prefix_caching: false
       engine_output_type: latent
-      gpu_memory_utilization: 0.5
+      gpu_memory_utilization: 0.6
       distributed_executor_backend: "mp"
       max_num_batched_tokens: 512
       max_model_len: 4096
@@ -92,6 +92,10 @@ runtime:
         codec_chunk_frames: 32
         codec_left_context_frames: 32
         initial_codec_chunk_frames: 1
+        # Effective concurrency cap for dynamic IC sizing (decoupled from
+        # max_batch_size which may be much larger).  0 = auto (min of
+        # max_batch_size, 16)).
+        ic_capacity: 16
 
   edges:
     - from: 0

@@ -641,6 +641,13 @@ class Orchestrator:
         original_prompt = req_state.prompt
         if isinstance(original_prompt, dict):
             base_input = copy.deepcopy(original_prompt)
+            # Strip large ref_audio fields that downstream stages never use.
+            # This avoids copying + re-serializing the ~960KB waveform tensor.
+            ai = base_input.get("additional_information")
+            if isinstance(ai, dict):
+                ai.pop("ref_audio_wav", None)
+                ai.pop("ref_audio_sr", None)
+                ai.pop("ref_audio", None)
         else:
             base_input = {}
         base_input["prompt_token_ids"] = [0] * next_prompt_len

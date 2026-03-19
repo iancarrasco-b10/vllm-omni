@@ -265,18 +265,14 @@ class Qwen3TTSCode2Wav(nn.Module):
                 pass
 
         # Decode directly via decoder.chunked_decode(), staying entirely on GPU.
-        # For single request: no padding needed, fast path.
-        # For multiple requests: decode each individually to avoid padding overhead.
+        # Each request is decoded individually to leverage B=1 CUDA graphs,
+        # which are faster than eager batched mode for small chunk sizes
+        # (kernel launch overhead dominates at 32-64 frames).
         wav_tensors: list[torch.Tensor] = []
-        if len(valid_codes_qf) == 1:
-            codes_bqf = valid_codes_qf[0].unsqueeze(0)  # [1, Q, F]
+        for codes_qf in valid_codes_qf:
+            codes_bqf = codes_qf.unsqueeze(0)  # [1, Q, F]
             wav = decoder.chunked_decode(codes_bqf)  # [1, 1, wav_len]
             wav_tensors.append(wav.squeeze(0).squeeze(0))  # [wav_len]
-        else:
-            for codes_qf in valid_codes_qf:
-                codes_bqf = codes_qf.unsqueeze(0)  # [1, Q, F]
-                wav = decoder.chunked_decode(codes_bqf)
-                wav_tensors.append(wav.squeeze(0).squeeze(0))
 
         audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req

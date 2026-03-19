@@ -31,6 +31,14 @@ class OmniTransferAdapterBase:
         # Requests that have successfully saved data
         self._finished_save_reqs = set()
 
+        # Use connector_get_sleep_s from stage connector config if available.
+        extra = {}
+        sc_cfg = getattr(config, "stage_connector_config", None)
+        if isinstance(sc_cfg, dict):
+            extra = sc_cfg.get("extra", {})
+        self._poll_backoff_s: float = float(extra.get("connector_get_sleep_s", 0.001))
+        self._poll_idle_s: float = 0.1
+
         self.stop_event = threading.Event()
         self._recv_cond = threading.Condition()
         self._save_cond = threading.Condition()
@@ -71,12 +79,11 @@ class OmniTransferAdapterBase:
                     self._pending_load_reqs.append(request)
                     logger.warning(f"Error receiving data for {request_id}: {e}")
 
-            # Timeout is the fallback for lock-free append/notify races.
             with self._recv_cond:
                 if not self._pending_load_reqs and not self.stop_event.is_set():
-                    self._recv_cond.wait(timeout=0.1)
+                    self._recv_cond.wait(timeout=self._poll_idle_s)
                 elif not any_success and not self.stop_event.is_set():
-                    self._recv_cond.wait(timeout=0.001)
+                    self._recv_cond.wait(timeout=self._poll_backoff_s)
 
     def save_loop(self):
         """Loop to send outgoing data."""

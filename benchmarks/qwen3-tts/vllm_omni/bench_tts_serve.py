@@ -99,6 +99,7 @@ async def send_tts_request(
     prompt: str,
     voice: str = "vivian",
     language: str = "English",
+    initial_chunk_frames: int | None = None,
     pbar: tqdm | None = None,
 ) -> RequestResult:
     """Send a streaming TTS request and measure latency metrics."""
@@ -109,6 +110,8 @@ async def send_tts_request(
         "stream": True,
         "response_format": "pcm",
     }
+    if initial_chunk_frames is not None:
+        payload["initial_codec_chunk_frames"] = initial_chunk_frames
 
     result = RequestResult(prompt=prompt)
     st = time.perf_counter()
@@ -155,6 +158,7 @@ async def run_benchmark(
     num_warmups: int = 3,
     voice: str = "vivian",
     language: str = "English",
+    initial_chunk_frames: int | None = None,
 ) -> BenchmarkResult:
     """Run benchmark at a given concurrency level."""
     api_url = f"http://{host}:{port}/v1/audio/speech"
@@ -175,7 +179,7 @@ async def run_benchmark(
         warmup_tasks = []
         for i in range(num_warmups):
             prompt = PROMPTS[i % len(PROMPTS)]
-            warmup_tasks.append(send_tts_request(session, api_url, prompt, voice, language))
+            warmup_tasks.append(send_tts_request(session, api_url, prompt, voice, language, initial_chunk_frames))
         await asyncio.gather(*warmup_tasks)
         print("  Warmup done.")
 
@@ -189,7 +193,7 @@ async def run_benchmark(
 
     async def limited_request(prompt):
         async with semaphore:
-            return await send_tts_request(session, api_url, prompt, voice, language, pbar)
+            return await send_tts_request(session, api_url, prompt, voice, language, initial_chunk_frames, pbar)
 
     start_time = time.perf_counter()
     tasks = [asyncio.create_task(limited_request(p)) for p in request_prompts]
@@ -308,6 +312,7 @@ async def main(args):
             num_warmups=args.num_warmups,
             voice=args.voice,
             language=args.language,
+            initial_chunk_frames=args.initial_chunk_frames,
         )
         result.config_name = args.config_name
         all_results.append(asdict(result))
@@ -336,6 +341,10 @@ def parse_args():
     parser.add_argument("--num-warmups", type=int, default=3)
     parser.add_argument("--voice", type=str, default="vivian")
     parser.add_argument("--language", type=str, default="English")
+    parser.add_argument(
+        "--initial-chunk-frames", type=int, default=None,
+        help="Override server-side dynamic IC with a fixed initial codec chunk size (in frames)",
+    )
     parser.add_argument(
         "--config-name", type=str, default="async_chunk", help="Label for this config (used in filenames)"
     )

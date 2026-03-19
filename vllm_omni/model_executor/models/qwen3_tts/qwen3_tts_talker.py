@@ -393,6 +393,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             codec_mask[self._codec_eos_token_id] = True
         self.register_buffer("_codec_allowed_mask", codec_mask, persistent=False)
 
+        # LRU cache for Base voice-clone: (ref_code, speaker_embed) keyed by
+        # speaker name so codec encode + x-vector extract run only once per voice.
+        self._voice_clone_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._voice_clone_cache_max = 32
+
         # Keys that should stay on GPU in model_intermediate_buffer to avoid
         # CPU-to-GPU round-trips on every decode step.
         self.gpu_resident_buffer_keys: set[str] = {
@@ -559,9 +564,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 full_prompt_embeds, tailing_text_hidden, tts_pad_embed, ref_code_len, ref_code = (
                     self._build_prompt_embeds(task_type=task_type, info_dict=info_dict)
                 )
-                # Store full prompt embeddings on CPU (large, prefill-only).
-                # tailing_text_hidden and tts_pad_embed stay on GPU (gpu_resident_buffer_keys).
-                prompt_embeds_cpu = full_prompt_embeds.detach().to("cpu").contiguous()
+                prompt_embeds_cpu = full_prompt_embeds.detach().to("cpu", non_blocking=True).contiguous()
                 info_update: dict[str, Any] = {
                     "talker_prompt_embeds": prompt_embeds_cpu,
                     "tailing_text_hidden": tailing_text_hidden.detach(),
@@ -570,7 +573,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     "codec_streaming": codec_streaming,
                 }
                 if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
-                    info_update["ref_code"] = ref_code.detach().to("cpu").contiguous()
+                    info_update["ref_code"] = ref_code.detach().to("cpu", non_blocking=True).contiguous()
                 if ref_code_len is not None:
                     info_update["ref_code_len"] = int(ref_code_len)
                 # Always return a span_len slice; if the scheduled placeholder is longer, pad with tts_pad_embed.
@@ -795,7 +798,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                         ref_code_len = None
 
                 if ref_code_len is None and estimate_ref_code_len is not None:
-                    ref_code_len = estimate_ref_code_len(info.get("ref_audio"))
+                    ref_audio_arg = info.get("ref_audio")
+                    if ref_audio_arg is None:
+                        wav_t = info.get("ref_audio_wav")
+                        sr_l = info.get("ref_audio_sr")
+                        if wav_t is not None and sr_l is not None:
+                            sr_val = sr_l[0] if isinstance(sr_l, list) else sr_l
+                            ref_audio_arg = [[wav_t, sr_val]]
+                    ref_code_len = estimate_ref_code_len(ref_audio_arg)
                 if ref_code_len is None:
                     raise ValueError(
                         "Base in-context voice cloning requires either `voice_clone_prompt.ref_code` "
@@ -1348,29 +1358,60 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     ref_code_t = ref_code_t[0]
                 ref_code_t = ref_code_t.to(device=input_ids.device, dtype=torch.long)
                 ref_code_len = int(ref_code_t.shape[0])
-            elif in_context_mode:
-                # Compute ref_code from ref_audio if not provided.
-                ref_audio_list = info_dict.get("ref_audio")
-                if not isinstance(ref_audio_list, list) or not ref_audio_list:
-                    raise ValueError("Base requires `ref_audio`.")
-                wav_np, sr = self._normalize_ref_audio(ref_audio_list[0])
-                ref_code_t = self._encode_ref_audio_to_code(wav_np, sr).to(device=input_ids.device)
-                ref_code_len = int(ref_code_t.shape[0])
-            if isinstance(ref_code_t, torch.Tensor):
-                ref_code_prompt = ref_code_t
 
-            # Speaker embedding: use prompt embed if provided; otherwise extract from audio.
+            # Speaker embedding: use prompt embed if provided.
             spk = None
             if voice_clone_prompt is not None:
                 spk = _as_singleton(voice_clone_prompt.get("ref_spk_embedding"))
             if isinstance(spk, torch.Tensor):
                 speaker_embed = spk.to(device=input_ids.device, dtype=torch.bfloat16).view(1, 1, -1)
-            else:
-                ref_audio_list = info_dict.get("ref_audio")
-                if not isinstance(ref_audio_list, list) or not ref_audio_list:
-                    raise ValueError("Base requires `ref_audio`.")
-                wav_np, sr = self._normalize_ref_audio(ref_audio_list[0])
-                speaker_embed = self._extract_speaker_embedding(wav_np, sr).view(1, 1, -1)
+
+            # Fall back to ref_audio for ref_code and/or speaker_embed,
+            # using an in-memory cache keyed by speaker name to avoid
+            # re-running the codec encoder and x-vector extractor.
+            need_ref_code = ref_code_t is None and in_context_mode
+            need_spk_embed = spk is None or not isinstance(spk, torch.Tensor)
+            if need_ref_code or need_spk_embed:
+                speaker_name = _as_singleton(info_dict.get("speaker"))
+                cache_key = speaker_name.lower() if isinstance(speaker_name, str) else None
+                cached = self._voice_clone_cache.get(cache_key) if cache_key else None
+
+                if cached is not None:
+                    cached_rc, cached_se = cached
+                    if need_ref_code:
+                        ref_code_t = cached_rc.to(device=input_ids.device, dtype=torch.long)
+                        ref_code_len = int(ref_code_t.shape[0])
+                    if need_spk_embed:
+                        speaker_embed = cached_se.to(device=input_ids.device, dtype=torch.bfloat16).view(1, 1, -1)
+                else:
+                    ref_audio_list = info_dict.get("ref_audio")
+                    wav_tensor = info_dict.get("ref_audio_wav")
+                    sr_entry = info_dict.get("ref_audio_sr")
+                    if isinstance(wav_tensor, torch.Tensor) and sr_entry is not None:
+                        wav_np = wav_tensor.numpy() if wav_tensor.is_cpu else wav_tensor.cpu().numpy()
+                        sr = int(sr_entry[0] if isinstance(sr_entry, list) else sr_entry)
+                    elif isinstance(ref_audio_list, list) and ref_audio_list:
+                        wav_np, sr = self._normalize_ref_audio(ref_audio_list[0])
+                    else:
+                        raise ValueError("Base requires `ref_audio`.")
+                    if need_ref_code:
+                        ref_code_t = self._encode_ref_audio_to_code(wav_np, sr).to(device=input_ids.device)
+                        ref_code_len = int(ref_code_t.shape[0])
+                    if need_spk_embed:
+                        speaker_embed = self._extract_speaker_embedding(wav_np, sr).view(1, 1, -1)
+                    if cache_key is not None:
+                        if len(self._voice_clone_cache) >= self._voice_clone_cache_max:
+                            self._voice_clone_cache.pop(next(iter(self._voice_clone_cache)))
+                        # non_blocking=True avoids stalling the GPU pipeline;
+                        # the cache tensors will be fully materialized before
+                        # the next request reads them (prefill is long enough).
+                        self._voice_clone_cache[cache_key] = (
+                            ref_code_t.detach().to("cpu", non_blocking=True) if ref_code_t is not None else torch.empty(0),
+                            speaker_embed.detach().to("cpu", non_blocking=True),
+                        )
+
+            if isinstance(ref_code_t, torch.Tensor):
+                ref_code_prompt = ref_code_t
 
             codec_input = torch.cat([codec_input_0, speaker_embed, codec_input_1], dim=1)
 

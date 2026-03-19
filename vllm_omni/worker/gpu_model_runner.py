@@ -23,6 +23,19 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
+_NUMPY_TO_TORCH_DTYPE: dict[str, torch.dtype] = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float64": torch.float64,
+    "int64": torch.int64,
+    "int32": torch.int32,
+    "int16": torch.int16,
+    "int8": torch.int8,
+    "uint8": torch.uint8,
+    "bool": torch.bool,
+}
+
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 else:
@@ -346,10 +359,15 @@ class OmniGPUModelRunner(GPUModelRunner):
                         if isinstance(payload_info, AdditionalInformationPayload):
                             for k, entry in payload_info.entries.items():
                                 if entry.tensor_data is not None:
-                                    dt = np.dtype(getattr(entry, "tensor_dtype", "float32"))
-                                    arr = np.frombuffer(entry.tensor_data, dtype=dt)
-                                    arr = arr.reshape(entry.tensor_shape)
-                                    info_dict[k] = torch.from_numpy(arr.copy())
+                                    dt_str = getattr(entry, "tensor_dtype", "float32")
+                                    torch_dt = _NUMPY_TO_TORCH_DTYPE.get(dt_str)
+                                    if torch_dt is not None:
+                                        t = torch.frombuffer(bytearray(entry.tensor_data), dtype=torch_dt)
+                                        info_dict[k] = t.reshape(entry.tensor_shape)
+                                    else:
+                                        dt = np.dtype(dt_str)
+                                        arr = np.frombuffer(entry.tensor_data, dtype=dt).reshape(entry.tensor_shape)
+                                        info_dict[k] = torch.from_numpy(arr.copy())
                                 else:
                                     info_dict[k] = entry.list_data
                     if info_dict:
@@ -911,10 +929,16 @@ class OmniGPUModelRunner(GPUModelRunner):
             for k, entry in entries.items():
                 tensor_data = getattr(entry, "tensor_data", None)
                 if tensor_data is not None:
-                    dt = np.dtype(getattr(entry, "tensor_dtype", "float32"))
-                    arr = np.frombuffer(tensor_data, dtype=dt)
-                    arr = arr.reshape(getattr(entry, "tensor_shape", ()))
-                    info[k] = torch.from_numpy(arr.copy())
+                    dt_str = getattr(entry, "tensor_dtype", "float32")
+                    torch_dt = _NUMPY_TO_TORCH_DTYPE.get(dt_str)
+                    shape = getattr(entry, "tensor_shape", ())
+                    if torch_dt is not None:
+                        t = torch.frombuffer(bytearray(tensor_data), dtype=torch_dt)
+                        info[k] = t.reshape(shape)
+                    else:
+                        dt = np.dtype(dt_str)
+                        arr = np.frombuffer(tensor_data, dtype=dt).reshape(shape)
+                        info[k] = torch.from_numpy(arr.copy())
                 else:
                     info[k] = getattr(entry, "list_data", None)
             return info

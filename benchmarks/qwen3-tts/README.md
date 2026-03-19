@@ -81,6 +81,56 @@ python plot_results.py \
     --output results/comparison.png
 ```
 
+## Base Voice Clone Benchmark
+
+Benchmark the Base (voice clone) task type, which uses a reference audio + transcript to clone a speaker's voice.
+
+### Quick Start
+
+```bash
+cd benchmarks/qwen3-tts
+bash run_benchmark_base.sh
+```
+
+### Options
+
+```bash
+# x-vector only mode (faster, no in-context learning)
+bash run_benchmark_base.sh --xvec-only
+
+# Use 0.6B model
+MODEL=Qwen/Qwen3-TTS-12Hz-0.6B-Base bash run_benchmark_base.sh
+
+# Custom reference audio
+REF_AUDIO="https://example.com/my_voice.wav" \
+REF_TEXT="Transcript of the reference audio." \
+bash run_benchmark_base.sh
+
+# Custom GPU, prompt count, concurrency
+GPU_DEVICE=1 NUM_PROMPTS=20 CONCURRENCY="1 4" bash run_benchmark_base.sh
+```
+
+### Manual Steps (Base)
+
+```bash
+# 1) Start the server with a Base model
+CUDA_VISIBLE_DEVICES=0 python -m vllm_omni.entrypoints.cli.main serve \
+    "Qwen/Qwen3-TTS-12Hz-1.7B-Base" \
+    --omni --host 127.0.0.1 --port 8000 \
+    --stage-configs-path benchmarks/qwen3-tts/vllm_omni/configs/qwen3_tts_bs1.yaml \
+    --trust-remote-code
+
+# 2) Run the Base benchmark client
+python vllm_omni/bench_tts_base_serve.py \
+    --port 8000 \
+    --num-prompts 50 \
+    --max-concurrency 1 4 10 \
+    --ref-audio "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav" \
+    --ref-text "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you." \
+    --config-name "base_icl" \
+    --result-dir results/
+```
+
 ## Stage Configs
 
 | Config | Batch Size | Description |

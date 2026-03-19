@@ -127,8 +127,12 @@ def talker2code2wav_async_chunk(
         if request_id not in _ic_cache:
             max_ic = max_ic_for_chunk_size(chunk_size)
             active = sum(1 for v in transfer_manager.code_prompt_token_ids.values() if len(v) > 0)
-            capacity = getattr(transfer_manager, "scheduler_max_num_seqs", 1)
-            _ic_cache[request_id] = compute_dynamic_initial_chunk_size(active, capacity, max_ic)
+            # ic_capacity decouples IC sizing from max_batch_size (scheduler_max_num_seqs),
+            # which can be much larger than typical concurrency, collapsing IC to tiny values.
+            ic_capacity = int(cfg.get("ic_capacity", 0))
+            if ic_capacity <= 0:
+                ic_capacity = min(getattr(transfer_manager, "scheduler_max_num_seqs", 1), 16)
+            _ic_cache[request_id] = compute_dynamic_initial_chunk_size(active, ic_capacity, max_ic)
         initial_chunk_size = _ic_cache[request_id]
 
     if chunk_size <= 0 or left_context_size_config < 0 or initial_chunk_size < 0:
@@ -180,24 +184,47 @@ def talker2code2wav_async_chunk(
     left_context_size = max(0, end_index - context_length)
     window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
 
-    # Prepend ref_code as decoder context for every chunk so the vocoder
-    # maintains voice-clone speaker identity throughout the stream.  The HF
-    # reference decodes ref_code + all_codes in one pass; without ref_code
-    # context on later chunks the decoder loses speaker identity and produces
-    # distorted audio.  Use `.get()` (not `.pop()`) to keep ref_code for
-    # subsequent chunks.
+    # Build ref_code context.  To avoid re-serializing ref_code (which can be
+    # 120+ frames × 16 quantizers) through SHM on every chunk, we send it only
+    # once on the first chunk as a separate field.  The receiving side caches
+    # it and prepends locally for Code2Wav decoding.
     ref_code = request_payload.get(request_id)
+    ref_code_payload: list[int] | None = None
+    ref_code_num_frames = 0
     if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
-        ref_frames = ref_code.tolist()
-        window_frames = ref_frames + window_frames
-        left_context_size += len(ref_frames)
+        _ref_list_cache = getattr(transfer_manager, "_ref_code_list_cache", None)
+        if _ref_list_cache is None:
+            _ref_list_cache = {}
+            transfer_manager._ref_code_list_cache = _ref_list_cache
+        ref_frames = _ref_list_cache.get(request_id)
+        if ref_frames is None:
+            ref_frames = ref_code.tolist()
+            _ref_list_cache[request_id] = ref_frames
+        ref_code_num_frames = len(ref_frames)
+        left_context_size += ref_code_num_frames
+
+        _sent = getattr(transfer_manager, "_ref_code_sent", None)
+        if _sent is None:
+            _sent = set()
+            transfer_manager._ref_code_sent = _sent
+        if request_id not in _sent:
+            # First chunk: include ref_code as a flat codebook-major list.
+            num_q = len(ref_frames[0])
+            ref_code_payload = [ref_frames[f][q_] for q_ in range(num_q) for f in range(ref_code_num_frames)]
+            _sent.add(request_id)
 
     num_quantizers = len(window_frames[0])
     num_frames = len(window_frames)
     code_predictor_codes = [window_frames[f][q] for q in range(num_quantizers) for f in range(num_frames)]
 
-    return {
+    result: dict[str, Any] = {
         "code_predictor_codes": code_predictor_codes,
         "left_context_size": left_context_size,
         "finished": finished,
     }
+    if ref_code_payload is not None:
+        result["ref_code_data"] = ref_code_payload
+        result["ref_code_num_frames"] = ref_code_num_frames
+    elif ref_code_num_frames > 0:
+        result["ref_code_num_frames"] = ref_code_num_frames
+    return result
