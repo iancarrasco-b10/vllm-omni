@@ -158,22 +158,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     self.finished_requests.add(req_id)
 
                 new_ids = payload_data.get("code_predictor_codes", [])
-
-                # Cache ref_code on first chunk; prepend locally on all chunks.
-                ref_data = payload_data.get("ref_code_data")
-                if ref_data is not None:
-                    _rc_cache = getattr(self, "_recv_ref_code_cache", None)
-                    if _rc_cache is None:
-                        _rc_cache = {}
-                        self._recv_ref_code_cache = _rc_cache
-                    _rc_cache[external_req_id] = ref_data
-                    new_ids = ref_data + new_ids
-                else:
-                    _rc_cache = getattr(self, "_recv_ref_code_cache", None)
-                    cached_rc = _rc_cache.get(external_req_id) if _rc_cache else None
-                    if cached_rc is not None:
-                        new_ids = cached_rc + new_ids
-
                 request.prompt_token_ids = new_ids
                 request.additional_information = {}
                 if "left_context_size" in payload_data:
@@ -262,9 +246,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             ref_list_cache = getattr(self, "_ref_code_list_cache", None)
             if ref_list_cache is not None:
                 ref_list_cache.pop(request_id, None)
-            ref_sent = getattr(self, "_ref_code_sent", None)
-            if ref_sent is not None:
-                ref_sent.discard(request_id)
 
     ########################################################################
     # Cleanup
@@ -306,12 +287,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         ref_list_cache = getattr(self, "_ref_code_list_cache", None)
         if ref_list_cache is not None:
             ref_list_cache.pop(external_req_id, None)
-        ref_sent = getattr(self, "_ref_code_sent", None)
-        if ref_sent is not None:
-            ref_sent.discard(external_req_id)
-        recv_rc = getattr(self, "_recv_ref_code_cache", None)
-        if recv_rc is not None:
-            recv_rc.pop(external_req_id, None)
 
     ########################################################################
     # Schedule Helper
