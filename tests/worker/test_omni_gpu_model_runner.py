@@ -116,58 +116,6 @@ def _make_runner_for_mimo(req_id="r_mimo"):
     return runner
 
 
-def test_talker_mtp_forward_cpu_updates_inputs_and_info(monkeypatch):
-    # Patch the module-level `set_forward_context` symbol used inside
-    # OmniGPUModelRunner._talker_mtp_forward.
-    import vllm_omni.worker.gpu_model_runner as mod  # Must be the same module that defines OmniGPUModelRunner
-
-    monkeypatch.setattr(mod, "set_forward_context", _noop_forward_context)
-
-    runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
-
-    def fake_determine(self, num_tokens, num_reqs, num_scheduled_tokens_np, max_num_scheduled_tokens, use_cascade_attn):
-        batch_desc = SimpleNamespace(num_tokens=int(num_tokens))
-        return (False, batch_desc, None, None, None)
-
-    monkeypatch.setattr(runner, "_determine_batch_execution_and_padding", fake_determine.__get__(runner, type(runner)))
-
-    # Initialize per-request embeds (batch-major inside talker_mtp_inputs_embeds)
-    runner.talker_mtp_inputs_embeds.gpu[0] = torch.tensor([1.0, 2.0, 3.0, 4.0])
-    runner.talker_mtp_inputs_embeds.gpu[1] = torch.tensor([10.0, 20.0, 30.0, 40.0])
-
-    # Flattened `inputs_embeds`: offsets 0 and 3 will be overwritten
-    inputs_embeds = torch.zeros((6, 4), dtype=torch.float32)
-
-    # Call the original implementation from OmniGPUModelRunner (no re-implementation)
-    OmniGPUModelRunner._talker_mtp_forward(runner, ["r1", "r2"], inputs_embeds)
-
-    # Validate embeds were written back (+1)
-    assert torch.allclose(inputs_embeds[0], torch.tensor([2.0, 3.0, 4.0, 5.0]))
-    assert torch.allclose(inputs_embeds[3], torch.tensor([11.0, 21.0, 31.0, 41.0]))
-
-    # Validate per-request additional_information_cpu was updated
-    info_r1 = runner.requests["r1"].additional_information_cpu
-    info_r2 = runner.requests["r2"].additional_information_cpu
-    assert int(info_r1["code_predictor_codes"][0, 0]) == 0
-    assert int(info_r2["code_predictor_codes"][0, 0]) == 1
-
-
-def test_talker_mtp_forward_cpu_empty_batch_noop(monkeypatch):
-    import vllm_omni.worker.gpu_model_runner as mod
-
-    monkeypatch.setattr(mod, "set_forward_context", _noop_forward_context)
-
-    runner = _make_runner(req_ids=("r1",), hidden_size=4)
-
-    inputs_embeds = torch.randn((2, 4))
-    before = inputs_embeds.clone()
-
-    OmniGPUModelRunner._talker_mtp_forward(runner, [], inputs_embeds)
-
-    # Ensure no changes were made
-    assert torch.allclose(inputs_embeds, before)
-
-
 def test_update_intermediate_buffer_writes_to_buffer_and_setattr(monkeypatch):
     """Validate that _update_intermediate_buffer writes to model_intermediate_buffer
     (forward path) and mirrors to additional_information_cpu setattr (backward compat)."""

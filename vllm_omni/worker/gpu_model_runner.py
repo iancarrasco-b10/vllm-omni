@@ -1249,7 +1249,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         if hasattr(self.model, "has_preprocess") and self.model.has_preprocess:
             # Overlay custom prompt_embeds per request for the prompt portion;
             # collect additional_information (tensor/list) for prefill portion only
-            decode_req_ids = []
             for req_index, req_id in enumerate(self.input_batch.req_ids):
                 req_infos = self.model_intermediate_buffer.get(req_id, {})
 
@@ -1276,12 +1275,11 @@ class OmniGPUModelRunner(GPUModelRunner):
 
                 if hasattr(self.model, "talker_mtp") and span_len == 1:
                     last_talker_hidden, text_step = update_dict.pop("mtp_inputs")
-                    decode_slice = slice(len(decode_req_ids), len(decode_req_ids) + 1)
-                    self.talker_mtp_input_ids.gpu[decode_slice].copy_(req_input_ids)
-                    self.talker_mtp_inputs_embeds.gpu[decode_slice].copy_(req_embeds)
-                    self.last_talker_hidden.gpu[decode_slice].copy_(last_talker_hidden)
-                    self.text_step.gpu[decode_slice].copy_(text_step)
-                    decode_req_ids.append(req_id)
+                    req_embeds, code_predictor_codes = self.model.talker_mtp(
+                        req_input_ids, req_embeds, last_talker_hidden, text_step
+                    )
+                    out_key = getattr(self.model, "talker_mtp_output_key", "code_predictor_codes")
+                    update_dict[out_key] = code_predictor_codes
 
                 # TODO(Peiqi): the merge stage could move out from the critical path
                 self._merge_additional_information_update(req_id, update_dict)
@@ -1292,10 +1290,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                 if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == seg_len:
                     input_ids[s : s + seg_len] = req_input_ids
 
-            # run talker mtp decode
-            if hasattr(self.model, "talker_mtp"):
-                self._talker_mtp_forward(decode_req_ids, inputs_embeds)
-
         return (
             input_ids,
             inputs_embeds,
@@ -1304,41 +1298,6 @@ class OmniGPUModelRunner(GPUModelRunner):
             model_kwargs,
             ec_connector_output,
         )
-
-    def _talker_mtp_forward(self, decode_req_ids: list[str], inputs_embeds: torch.Tensor) -> None:
-        decode_batch_size = len(decode_req_ids)
-        if decode_batch_size == 0:
-            return
-        _cudagraph_mode, batch_desc, _, _, _ = self._determine_batch_execution_and_padding(
-            num_tokens=decode_batch_size,
-            num_reqs=decode_batch_size,
-            num_scheduled_tokens_np=np.ones(decode_batch_size, dtype=np.int32),
-            max_num_scheduled_tokens=1,
-            use_cascade_attn=False,
-        )
-        # Force eager for unwrapped code predictors (AR loops / multinomial).
-        if not isinstance(self.talker_mtp, CUDAGraphWrapper):
-            _cudagraph_mode = CUDAGraphMode.NONE
-        num_tokens_padded = batch_desc.num_tokens
-        req_input_ids = self.talker_mtp_input_ids.gpu[:num_tokens_padded]
-        req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]
-        last_talker_hidden = self.last_talker_hidden.gpu[:num_tokens_padded]
-        text_step = self.text_step.gpu[:num_tokens_padded]
-        with set_forward_context(
-            None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
-        ):
-            req_embeds, code_predictor_codes = self.talker_mtp(req_input_ids, req_embeds, last_talker_hidden, text_step)
-        # code_predictor_codes stays on GPU here; _update_intermediate_buffer
-        # keeps it device-resident when the key is in gpu_resident_buffer_keys.
-        # D2H is deferred to sample_tokens where hidden_states.to("cpu") already
-        # syncs the stream, avoiding a per-step cudaStreamSynchronize.
-        out_key = getattr(self.model, "talker_mtp_output_key", "code_predictor_codes")
-        for idx, req_id in enumerate(decode_req_ids):
-            req_index = self.input_batch.req_ids.index(req_id)
-            start_offset = int(self.query_start_loc.cpu[req_index])
-            inputs_embeds[start_offset : start_offset + 1] = req_embeds[idx : idx + 1]
-            update_dict = {out_key: code_predictor_codes[idx : idx + 1]}
-            self._merge_additional_information_update(req_id, update_dict)
 
     def _model_forward(
         self,
