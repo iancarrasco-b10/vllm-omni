@@ -5,7 +5,7 @@ stage_args:
     is_comprehension: true
     runtime:
       devices: "0"
-      max_batch_size: 16
+      max_batch_size: 64
     engine_args:
       model_stage: qwen3_tts
       model_arch: Qwen3TTSTalkerForConditionalGeneration
@@ -16,7 +16,7 @@ stage_args:
       async_scheduling: true
       enable_prefix_caching: false
       engine_output_type: latent
-      gpu_memory_utilization: 0.3
+      gpu_memory_utilization: 0.5
       distributed_executor_backend: "mp"
       max_num_batched_tokens: 512
       max_model_len: 4096
@@ -37,7 +37,7 @@ stage_args:
     stage_type: llm
     runtime:
       devices: "0"
-      max_batch_size: 16
+      max_batch_size: 64
     engine_args:
       model_stage: code2wav
       model_arch: Qwen3TTSCode2Wav
@@ -75,7 +75,7 @@ runtime:
   enabled: true
   defaults:
     window_size: -1
-    max_inflight: 16
+    max_inflight: 64
 
   connectors:
     connector_of_shared_memory:
