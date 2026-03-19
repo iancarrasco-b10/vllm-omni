@@ -74,10 +74,16 @@ class OmniStreamingSpeechHandler:
         await websocket.accept()
 
         try:
-            # 1. Wait for session.config
-            config = await self._receive_config(websocket)
-            if config is None:
+            initial_message = await self._receive_initial_message(websocket)
+            if initial_message is None:
                 return  # Error already sent, connection closing
+
+            if isinstance(initial_message, dict):
+                await self._handle_voice_delete(websocket, initial_message)
+                return
+
+            config = initial_message
+            await self._register_uploaded_voice_if_needed(websocket, config)
 
             # Validate model if specified
             if config.model and hasattr(self._speech_service, "_check_model"):
@@ -160,8 +166,11 @@ class OmniStreamingSpeechHandler:
             except Exception:
                 logger.debug("Failed to send error to streaming speech client", exc_info=True)
 
-    async def _receive_config(self, websocket: WebSocket) -> StreamingSpeechSessionConfig | None:
-        """Wait for and validate the session.config message."""
+    async def _receive_initial_message(
+        self,
+        websocket: WebSocket,
+    ) -> StreamingSpeechSessionConfig | dict[str, str] | None:
+        """Wait for and validate the first client message."""
         try:
             raw = await asyncio.wait_for(
                 websocket.receive_text(),
@@ -185,10 +194,18 @@ class OmniStreamingSpeechHandler:
             await self._send_error(websocket, "session.config must be a JSON object")
             return None
 
-        if msg.get("type") != "session.config":
+        msg_type = msg.get("type")
+        if msg_type == "voice.delete":
+            voice_name = msg.get("voice_name")
+            if not isinstance(voice_name, str) or not voice_name.strip():
+                await self._send_error(websocket, "voice.delete requires a non-empty 'voice_name'")
+                return None
+            return {"type": "voice.delete", "voice_name": voice_name}
+
+        if msg_type != "session.config":
             await self._send_error(
                 websocket,
-                f"Expected session.config, got: {msg.get('type')}",
+                f"Expected session.config, got: {msg_type}",
             )
             return None
 
@@ -199,6 +216,42 @@ class OmniStreamingSpeechHandler:
             return None
 
         return config
+
+    async def _register_uploaded_voice_if_needed(
+        self,
+        websocket: WebSocket,
+        config: StreamingSpeechSessionConfig,
+    ) -> None:
+        """Persist a cloned voice for later sessions when requested by the client."""
+        voice_name = config.voice_name
+        if not voice_name or config.ref_audio is None:
+            return
+
+        voice_key = voice_name.lower()
+        if voice_key not in self._speech_service.uploaded_speakers:
+            await self._speech_service.upload_voice_from_data_uri(config.ref_audio, voice_name)
+
+        await websocket.send_json(
+            {
+                "type": "voice.registered",
+                "voice_name": voice_name,
+            }
+        )
+
+    async def _handle_voice_delete(self, websocket: WebSocket, msg: dict[str, str]) -> None:
+        """Delete a stored uploaded voice and acknowledge the result."""
+        voice_name = msg["voice_name"]
+        deleted = await self._speech_service.delete_voice(voice_name)
+        if not deleted:
+            await self._send_error(websocket, f"Voice '{voice_name}' not found")
+            return
+
+        await websocket.send_json(
+            {
+                "type": "voice.deleted",
+                "voice_name": voice_name,
+            }
+        )
 
     async def _generate_and_send(
         self,

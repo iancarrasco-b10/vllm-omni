@@ -107,6 +107,10 @@ class StreamingSpeechSessionConfig(BaseModel):
 
     model: str | None = None
     voice: str | None = None
+    voice_name: str | None = Field(
+        default=None,
+        description="Alias for voice used by voice-cloning WebSocket clients.",
+    )
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
     language: str | None = None
     instructions: str | None = None
@@ -138,6 +142,11 @@ class StreamingSpeechSessionConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "StreamingSpeechSessionConfig":
+        if self.voice_name is not None:
+            if self.voice is not None and self.voice != self.voice_name:
+                raise ValueError("If both 'voice' and 'voice_name' are provided, they must match.")
+            self.voice = self.voice_name
+
         if self.stream_audio:
             if self.response_format != "pcm":
                 raise ValueError(

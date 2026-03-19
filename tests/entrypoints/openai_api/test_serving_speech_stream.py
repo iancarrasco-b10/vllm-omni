@@ -18,12 +18,17 @@ def _build_test_app(speech_service=None, *, idle_timeout=30.0, config_timeout=10
         speech_service = MagicMock(spec=OmniOpenAIServingSpeech)
         speech_service._generate_audio_bytes = AsyncMock(return_value=(b"RIFF" + b"\x00" * 32, "audio/wav"))
         speech_service._prepare_speech_generation = AsyncMock(return_value=("req-1", object(), {}))
+        speech_service.upload_voice_from_data_uri = AsyncMock(
+            return_value={"name": "test_voice", "consent": "websocket_stream"}
+        )
+        speech_service.delete_voice = AsyncMock(return_value=True)
+        speech_service.uploaded_speakers = {}
 
-        async def mock_generate_pcm_chunks(_generator, _request_id):
+        async def mock_generate_audio_chunks(_generator, _request_id):
             for chunk in (b"\x01\x02", b"\x03\x04\x05"):
                 yield chunk
 
-        speech_service._generate_pcm_chunks = mock_generate_pcm_chunks
+        speech_service._generate_audio_chunks = mock_generate_audio_chunks
         speech_service.engine_client = MagicMock()
         speech_service.engine_client.abort = AsyncMock()
 
@@ -68,13 +73,22 @@ class TestStreamingSpeechWebSocket:
 
         assert speech_service._generate_audio_bytes.await_count == 1
 
-    def test_streaming_multiple_binary_frames(self):
+    def test_voice_name_registration_and_alias(self):
         captured_requests = []
 
         speech_service = MagicMock(spec=OmniOpenAIServingSpeech)
-        speech_service._generate_audio_bytes = AsyncMock(return_value=(b"", "audio/wav"))
+        async def mock_generate_audio_bytes(request):
+            captured_requests.append(request)
+            return b"RIFF" + b"\x00" * 32, "audio/wav"
+
+        speech_service._generate_audio_bytes = mock_generate_audio_bytes
         speech_service.engine_client = MagicMock()
         speech_service.engine_client.abort = AsyncMock()
+        speech_service.upload_voice_from_data_uri = AsyncMock(
+            return_value={"name": "test_voice", "consent": "websocket_stream"}
+        )
+        speech_service.delete_voice = AsyncMock(return_value=True)
+        speech_service.uploaded_speakers = {}
 
         async def mock_prepare_speech_generation(request):
             captured_requests.append(request)
@@ -82,11 +96,11 @@ class TestStreamingSpeechWebSocket:
 
         speech_service._prepare_speech_generation = mock_prepare_speech_generation
 
-        async def mock_generate_pcm_chunks(_generator, _request_id):
+        async def mock_generate_audio_chunks(_generator, _request_id):
             for chunk in (b"\x01\x02", b"\x03\x04\x05", b"\x06"):
                 yield chunk
 
-        speech_service._generate_pcm_chunks = mock_generate_pcm_chunks
+        speech_service._generate_audio_chunks = mock_generate_audio_chunks
         app, _ = _build_test_app(speech_service)
 
         with TestClient(app) as client:
@@ -94,14 +108,106 @@ class TestStreamingSpeechWebSocket:
                 ws.send_json(
                     {
                         "type": "session.config",
-                        "voice": "Vivian",
-                        "stream_audio": True,
-                        "response_format": "pcm",
-                        "initial_codec_chunk_frames": 12,
+                        "voice_name": "my_voice",
+                        "task_type": "Base",
+                        "ref_audio": "data:audio/wav;base64,Zm9v",
+                        "ref_text": "hello there",
                     }
                 )
                 ws.send_json({"type": "input.text", "text": "Hello world. "})
 
+                registered = ws.receive_json()
+                assert registered == {"type": "voice.registered", "voice_name": "my_voice"}
+
+                start = ws.receive_json()
+                assert start["type"] == "audio.start"
+                audio = ws.receive_bytes()
+                assert audio.startswith(b"RIFF")
+                assert ws.receive_json() == {
+                    "type": "audio.done",
+                    "sentence_index": 0,
+                    "total_bytes": len(audio),
+                    "error": False,
+                }
+
+                ws.send_json({"type": "input.done"})
+                assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
+
+        speech_service.upload_voice_from_data_uri.assert_awaited_once_with(
+            "data:audio/wav;base64,Zm9v",
+            "my_voice",
+        )
+        assert len(captured_requests) == 1
+        assert captured_requests[0].voice == "my_voice"
+        assert captured_requests[0].task_type == "Base"
+        assert captured_requests[0].ref_audio == "data:audio/wav;base64,Zm9v"
+
+    def test_voice_delete_one_shot(self):
+        speech_service = MagicMock(spec=OmniOpenAIServingSpeech)
+        speech_service._generate_audio_bytes = AsyncMock(return_value=(b"", "audio/wav"))
+        speech_service._prepare_speech_generation = AsyncMock(return_value=("req-delete", object(), {}))
+        speech_service.upload_voice_from_data_uri = AsyncMock(
+            return_value={"name": "test_voice", "consent": "websocket_stream"}
+        )
+        speech_service.delete_voice = AsyncMock(return_value=True)
+        speech_service.uploaded_speakers = {"my_voice": {"name": "my_voice"}}
+        speech_service.engine_client = MagicMock()
+        speech_service.engine_client.abort = AsyncMock()
+        app, _ = _build_test_app(speech_service)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "voice.delete",
+                        "voice_name": "my_voice",
+                    }
+                )
+                assert ws.receive_json() == {
+                    "type": "voice.deleted",
+                    "voice_name": "my_voice",
+                }
+
+        speech_service.delete_voice.assert_awaited_once_with("my_voice")
+
+    def test_streaming_multiple_binary_frames(self):
+        captured_requests = []
+
+        speech_service = MagicMock(spec=OmniOpenAIServingSpeech)
+        speech_service._generate_audio_bytes = AsyncMock(return_value=(b"", "audio/wav"))
+        speech_service.engine_client = MagicMock()
+        speech_service.engine_client.abort = AsyncMock()
+        speech_service.upload_voice_from_data_uri = AsyncMock(
+            return_value={"name": "test_voice", "consent": "websocket_stream"}
+        )
+        speech_service.delete_voice = AsyncMock(return_value=True)
+        speech_service.uploaded_speakers = {}
+
+        async def mock_prepare_speech_generation(request):
+            captured_requests.append(request)
+            return "req-stream", object(), {}
+
+        speech_service._prepare_speech_generation = mock_prepare_speech_generation
+
+        async def mock_generate_audio_chunks(_generator, _request_id):
+            for chunk in (b"\x01\x02", b"\x03\x04\x05", b"\x06"):
+                yield chunk
+
+        speech_service._generate_audio_chunks = mock_generate_audio_chunks
+        app, _ = _build_test_app(speech_service)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "stream_audio": True,
+                        "response_format": "pcm",
+                        "initial_codec_chunk_frames": 12,
+                        "voice": "Vivian",
+                    }
+                )
+                ws.send_json({"type": "input.text", "text": "Hello world. "})
                 start = ws.receive_json()
                 assert start["type"] == "audio.start"
                 assert start["format"] == "pcm"
@@ -239,7 +345,12 @@ class TestStreamingSpeechWebSocket:
         speech_service = MagicMock(spec=OmniOpenAIServingSpeech)
         speech_service._generate_audio_bytes = AsyncMock(side_effect=RuntimeError("boom"))
         speech_service._prepare_speech_generation = AsyncMock(return_value=("req-err", object(), {}))
-        speech_service._generate_pcm_chunks = AsyncMock()
+        speech_service._generate_audio_chunks = AsyncMock()
+        speech_service.upload_voice_from_data_uri = AsyncMock(
+            return_value={"name": "test_voice", "consent": "websocket_stream"}
+        )
+        speech_service.delete_voice = AsyncMock(return_value=True)
+        speech_service.uploaded_speakers = {}
         speech_service.engine_client = MagicMock()
         speech_service.engine_client.abort = AsyncMock()
         app, _ = _build_test_app(speech_service)
@@ -260,14 +371,19 @@ class TestStreamingSpeechWebSocket:
         speech_service = MagicMock(spec=OmniOpenAIServingSpeech)
         speech_service._generate_audio_bytes = AsyncMock(return_value=(b"", "audio/wav"))
         speech_service._prepare_speech_generation = AsyncMock(return_value=("req-stream-err", object(), {}))
+        speech_service.upload_voice_from_data_uri = AsyncMock(
+            return_value={"name": "test_voice", "consent": "websocket_stream"}
+        )
+        speech_service.delete_voice = AsyncMock(return_value=True)
+        speech_service.uploaded_speakers = {}
         speech_service.engine_client = MagicMock()
         speech_service.engine_client.abort = AsyncMock()
 
-        async def mock_generate_pcm_chunks(_generator, _request_id):
+        async def mock_generate_audio_chunks(_generator, _request_id):
             yield b"\x01\x02"
             raise RuntimeError("stream boom")
 
-        speech_service._generate_pcm_chunks = mock_generate_pcm_chunks
+        speech_service._generate_audio_chunks = mock_generate_audio_chunks
         app, _ = _build_test_app(speech_service)
 
         with TestClient(app) as client:
@@ -352,13 +468,18 @@ class TestStreamingSpeechWebSocket:
         speech_service = MagicMock(spec=OmniOpenAIServingSpeech)
         speech_service._generate_audio_bytes = AsyncMock(return_value=(b"", "audio/wav"))
         speech_service._prepare_speech_generation = AsyncMock(return_value=("req-abort", object(), {}))
+        speech_service.upload_voice_from_data_uri = AsyncMock(
+            return_value={"name": "test_voice", "consent": "websocket_stream"}
+        )
+        speech_service.delete_voice = AsyncMock(return_value=True)
+        speech_service.uploaded_speakers = {}
         speech_service.engine_client = MagicMock()
         speech_service.engine_client.abort = AsyncMock()
 
-        async def mock_generate_pcm_chunks(_generator, _request_id):
+        async def mock_generate_audio_chunks(_generator, _request_id):
             yield b"\x01\x02"
 
-        speech_service._generate_pcm_chunks = mock_generate_pcm_chunks
+        speech_service._generate_audio_chunks = mock_generate_audio_chunks
         handler = OmniStreamingSpeechHandler(speech_service=speech_service)
 
         websocket = MagicMock()
@@ -368,6 +489,7 @@ class TestStreamingSpeechWebSocket:
         config = MagicMock()
         config.model = None
         config.voice = "Vivian"
+        config.voice_name = None
         config.task_type = None
         config.language = None
         config.instructions = None

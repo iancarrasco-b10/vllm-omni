@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import binascii
+import io
 import json
 import math
 import os
@@ -13,6 +15,7 @@ import numpy as np
 import torch
 from fastapi import Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
+from starlette.datastructures import Headers
 from transformers.utils.hub import cached_file
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
 from vllm.logger import init_logger
@@ -48,6 +51,7 @@ _TTS_LANGUAGES: set[str] = {
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
 _TTS_MAX_NEW_TOKENS_MIN = 1
 _TTS_MAX_NEW_TOKENS_MAX = 4096
+_WEBSOCKET_UPLOAD_CONSENT = "websocket_stream"
 
 
 def _create_wav_header(sample_rate: int, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
@@ -357,20 +361,82 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     async def upload_voice(self, audio_file: UploadFile, consent: str, name: str) -> dict:
         """Upload a new voice sample."""
-        # Validate file size (max 10MB)
-        MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
         audio_file.file.seek(0, 2)  # Seek to end
         file_size = audio_file.file.tell()
         audio_file.file.seek(0)  # Reset to beginning
+        content = await audio_file.read()
+        return self._store_uploaded_voice_bytes(
+            audio_bytes=content,
+            filename=audio_file.filename or f"{_sanitize_filename(name)}.wav",
+            mime_type=audio_file.content_type,
+            consent=consent,
+            name=name,
+            file_size=file_size,
+        )
 
-        if file_size > MAX_FILE_SIZE:
+    async def upload_voice_from_data_uri(
+        self,
+        ref_audio: str,
+        name: str,
+        consent: str = _WEBSOCKET_UPLOAD_CONSENT,
+    ) -> dict[str, Any]:
+        """Upload a voice sample carried inline as a data URI."""
+        if not isinstance(ref_audio, str) or not ref_audio.startswith("data:"):
+            raise ValueError("WebSocket voice upload requires 'ref_audio' to be a base64 data URL.")
+
+        try:
+            header, b64_data = ref_audio.split(",", 1)
+        except ValueError as exc:
+            raise ValueError("Invalid ref_audio data URL.") from exc
+
+        if ";base64" not in header:
+            raise ValueError("WebSocket voice upload requires base64-encoded ref_audio data URLs.")
+
+        mime_type = header[5:].split(";", 1)[0] or "audio/wav"
+        try:
+            audio_bytes = base64.b64decode(b64_data, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError("Invalid base64 payload in ref_audio.") from exc
+
+        extension_map = {
+            "audio/wav": ".wav",
+            "audio/x-wav": ".wav",
+            "audio/mpeg": ".mp3",
+            "audio/flac": ".flac",
+            "audio/ogg": ".ogg",
+            "audio/aac": ".aac",
+            "audio/webm": ".webm",
+            "audio/mp4": ".mp4",
+        }
+        filename = f"{_sanitize_filename(name)}{extension_map.get(mime_type, '.wav')}"
+        upload = UploadFile(
+            file=io.BytesIO(audio_bytes),
+            filename=filename,
+            headers=Headers({"content-type": mime_type}),
+        )
+        return await self.upload_voice(upload, consent=consent, name=name)
+
+    def _store_uploaded_voice_bytes(
+        self,
+        *,
+        audio_bytes: bytes,
+        filename: str,
+        mime_type: str | None,
+        consent: str,
+        name: str,
+        file_size: int | None = None,
+    ) -> dict[str, Any]:
+        """Persist an uploaded voice sample and register it in metadata."""
+        # Validate file size (max 10MB)
+        max_file_size = 10 * 1024 * 1024  # 10MB
+        file_size = len(audio_bytes) if file_size is None else file_size
+        if file_size > max_file_size:
             raise ValueError(f"File size exceeds maximum limit of 10MB. Got {file_size} bytes.")
 
         # Detect MIME type from filename if content_type is generic
-        mime_type = audio_file.content_type
+        mime_type = mime_type or "application/octet-stream"
         if mime_type == "application/octet-stream":
-            # Simple MIME type detection based on file extension
-            filename_lower = audio_file.filename.lower()
+            filename_lower = filename.lower()
             if filename_lower.endswith(".wav"):
                 mime_type = "audio/wav"
             elif filename_lower.endswith((".mp3", ".mpeg")):
@@ -386,9 +452,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             elif filename_lower.endswith(".mp4"):
                 mime_type = "audio/mp4"
             else:
-                mime_type = "audio/wav"  # Default
+                mime_type = "audio/wav"
 
-        # Validate MIME type
         allowed_mime_types = {
             "audio/mpeg",
             "audio/wav",
@@ -399,76 +464,58 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "audio/webm",
             "audio/mp4",
         }
-
         if mime_type not in allowed_mime_types:
             raise ValueError(f"Unsupported MIME type: {mime_type}. Allowed: {allowed_mime_types}")
 
-        # Normalize voice name
         voice_name_lower = name.lower()
-
-        # Check if voice already exists
         if voice_name_lower in self.uploaded_speakers:
             raise ValueError(f"Voice '{name}' already exists")
 
-        # Sanitize name and consent to prevent path traversal
         sanitized_name = _sanitize_filename(name)
         sanitized_consent = _sanitize_filename(consent)
-
-        # Generate filename with sanitized inputs
         timestamp = int(time.time())
-        file_suffix = Path(audio_file.filename).suffix
+        file_suffix = Path(filename).suffix
         file_ext = file_suffix[1:] if file_suffix and len(file_suffix) > 1 else "wav"
-        # Sanitize file extension as well
         sanitized_ext = _sanitize_filename(file_ext)
         if not sanitized_ext or sanitized_ext == "file":
             sanitized_ext = "wav"
 
-        filename = f"{sanitized_name}_{sanitized_consent}_{timestamp}.{sanitized_ext}"
-        file_path = self.uploaded_speakers_dir / filename
-
-        # Double-check that the path is within the upload directory
+        stored_filename = f"{sanitized_name}_{sanitized_consent}_{timestamp}.{sanitized_ext}"
+        file_path = self.uploaded_speakers_dir / stored_filename
         if not _validate_path_within_directory(file_path, self.uploaded_speakers_dir):
             raise ValueError("Invalid file path: potential path traversal attack detected")
 
-        # Save audio file
         try:
             with open(file_path, "wb") as f:
-                content = await audio_file.read()
-                f.write(content)
+                f.write(audio_bytes)
         except Exception as e:
             raise ValueError(f"Failed to save audio file: {e}")
 
-        # Create speaker data
         speaker_data = {
             "name": name,
             "consent": consent,
             "file_path": str(file_path),
             "created_at": timestamp,
             "mime_type": mime_type,
-            "original_filename": audio_file.filename,
+            "original_filename": filename,
             "file_size": file_size,
-            "cache_status": "pending",  # The initial cache state is pending.
-            "cache_file": None,  # The initial cache file is empty.
-            "cache_generated_at": None,  # The initial cache generation time is empty.
+            "cache_status": "pending",
+            "cache_file": None,
+            "cache_generated_at": None,
         }
 
-        # Save metadata using metadata manager (concurrency safe)
         success = self.metadata_manager.create_speaker(voice_name_lower, speaker_data)
         if not success:
-            # Clean up the saved file if metadata creation failed
             try:
                 file_path.unlink()
             except Exception:
                 pass
             raise ValueError(f"Failed to create metadata for voice '{name}' (possibly already exists)")
 
-        # Update in-memory cache
         self.uploaded_speakers[voice_name_lower] = speaker_data
         self.supported_speakers.add(voice_name_lower)
 
         logger.info(f"Uploaded new voice '{name}' with consent ID '{consent}'")
-
-        # Return voice information without exposing the server file path
         return {
             "name": name,
             "consent": consent,
