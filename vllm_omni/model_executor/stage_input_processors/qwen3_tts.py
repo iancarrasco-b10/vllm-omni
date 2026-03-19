@@ -87,11 +87,13 @@ def talker2code2wav_async_chunk(
     if isinstance(pooling_output, dict):
         frame = _extract_last_frame(pooling_output)
         if frame is not None:
-            codec_codes = frame.cpu().tolist()
+            # frame is already on CPU (batch-copied in sample_tokens); .tolist() is cheap.
+            codec_codes = frame.tolist()
             transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
         ref_code = pooling_output.get("ref_code")
         if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0 and request_payload.get(request_id) is None:
-            request_payload[request_id] = ref_code.to(torch.long).cpu().contiguous()
+            # ref_code is already on CPU from _update_intermediate_buffer.
+            request_payload[request_id] = ref_code.to(torch.long).contiguous()
     elif not finished:
         return None
 

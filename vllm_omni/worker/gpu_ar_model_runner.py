@@ -561,23 +561,31 @@ class GPUARModelRunner(OmniGPUModelRunner):
 
         # Pre-copy multimodal tensors to CPU once (not per-request) to avoid
         # redundant D2H transfers when gpu_resident_buffer_keys keeps them on GPU.
+        # Tensors already on CPU (e.g. ref_code_len, codec_streaming) are kept
+        # as-is to avoid redundant .to("cpu") overhead.
         mm_cpu: dict[str, object] = {}
         if isinstance(multimodal_outputs, dict) and multimodal_outputs:
             for k, v in multimodal_outputs.items():
                 try:
                     if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
-                        mm_cpu[k] = v.detach().to("cpu").contiguous()
+                        mm_cpu[k] = v.detach().to("cpu").contiguous() if v.is_cuda else v.detach().contiguous()
                     elif isinstance(v, dict):
                         sub_dict: dict[str, torch.Tensor] = {}
                         for sk, sv in v.items():
                             if isinstance(sv, torch.Tensor) and sv.shape[0] == hidden_states_cpu.shape[0]:
-                                sub_dict[str(sk)] = sv.detach().to("cpu").contiguous()
+                                sub_dict[str(sk)] = (
+                                    sv.detach().to("cpu").contiguous() if sv.is_cuda else sv.detach().contiguous()
+                                )
                         if sub_dict:
                             mm_cpu[k] = sub_dict
                     elif isinstance(v, list):
                         element = v[0]
                         if isinstance(element, torch.Tensor):
-                            element = element.detach().to("cpu").contiguous()
+                            element = (
+                                element.detach().to("cpu").contiguous()
+                                if element.is_cuda
+                                else element.detach().contiguous()
+                            )
                         mm_cpu[k] = element
                 except Exception as e:
                     logger.error(f"Error in merge multimodal outputs: {e}")

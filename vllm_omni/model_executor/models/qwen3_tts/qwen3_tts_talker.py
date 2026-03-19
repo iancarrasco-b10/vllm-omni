@@ -466,8 +466,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 audio_codes_list.append(ac)
                 cs = info.get("codec_streaming")
                 if isinstance(cs, bool):
+                    # Create on CPU: these are metadata that only need to reach
+                    # the async_chunk callback, avoiding a GPU alloc + D2H copy.
                     codec_streaming_list.append(
-                        torch.full((int(ac.shape[0]),), int(cs), dtype=torch.int8, device=ac.device)
+                        torch.full((int(ac.shape[0]),), int(cs), dtype=torch.int8, device="cpu")
                     )
             ref_code = info.get("ref_code")
             if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
@@ -487,8 +489,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 ref_len_val = int(ref_len)
             if isinstance(ac, torch.Tensor):
                 # Emit ref_code_len per-token span for runner slicing (consumer takes the last value).
+                # Create on CPU: only metadata for the async_chunk callback.
                 ref_code_len_list.append(
-                    torch.full((int(ac.shape[0]),), ref_len_val, dtype=torch.int32, device=ac.device)
+                    torch.full((int(ac.shape[0]),), ref_len_val, dtype=torch.int32, device="cpu")
                 )
 
         if not audio_codes_list:
