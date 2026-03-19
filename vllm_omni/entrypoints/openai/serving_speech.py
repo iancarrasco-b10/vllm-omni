@@ -875,6 +875,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if request.ref_audio is not None:
                 wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
                 tts_params["ref_audio"] = [[wav_list, sr]]
+            elif "ref_audio" in tts_params and tts_params["ref_audio"]:
+                # Uploaded voice auto-set ref_audio as a data URI string;
+                # resolve it to [[wav_list, sr]] so prompt length estimation
+                # and downstream model code can use it.
+                auto_uri = tts_params["ref_audio"][0]
+                if isinstance(auto_uri, str):
+                    wav_list, sr = await self._resolve_ref_audio(auto_uri)
+                    tts_params["ref_audio"] = [[wav_list, sr]]
 
             ph_len = self._estimate_prompt_len(tts_params)
             prompt = {"prompt_token_ids": [1] * ph_len, "additional_information": tts_params}
