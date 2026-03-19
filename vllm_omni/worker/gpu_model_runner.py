@@ -93,12 +93,18 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.talker_mtp = talker_mtp  # type: ignore[assignment]
             cudagraph_mode = self.compilation_config.cudagraph_mode
             assert cudagraph_mode is not None
-            # Only wrap talker_mtp in CUDAGraphWrapper for Omni models that
-            # have a separate .talker sub-module.  TTS models' code predictor
-            # has internal AR loops / torch.multinomial — not graph-safe.
+            # Omni models with a separate .talker sub-module use vLLM's
+            # CUDAGraphWrapper.  TTS models use a model-specific graph
+            # implementation that captures the MTP pipeline directly.
             has_separate_talker = getattr(self.model, "talker", None) is not None
-            if cudagraph_mode.has_full_cudagraphs() and has_separate_talker:
-                self.talker_mtp = CUDAGraphWrapper(talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
+            if cudagraph_mode.has_full_cudagraphs():
+                if has_separate_talker:
+                    self.talker_mtp = CUDAGraphWrapper(talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
+                elif hasattr(self.model, "enable_cudagraph"):
+                    try:
+                        self.model.enable_cudagraph()
+                    except Exception:
+                        logger.warning("Failed to enable CUDA graph for TTS talker", exc_info=True)
             # TTS exposes mtp_hidden_size; Omni uses hf_text_config.hidden_size.
             hidden_size = int(
                 getattr(self.model, "mtp_hidden_size", 0) or getattr(self.model_config.hf_text_config, "hidden_size")

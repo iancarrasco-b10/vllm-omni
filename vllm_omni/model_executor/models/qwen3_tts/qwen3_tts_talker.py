@@ -411,6 +411,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self._tokenizer = None
         self._speech_tokenizer: Qwen3TTSTokenizer | None = None
 
+        # CUDA Graph support for MTP (multi-token prediction)
+        self._cudagraph_enabled = False
+        self._cudagraph_wrapper = None
+
     # -------------------- vLLM required hooks --------------------
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
@@ -1613,10 +1617,41 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         logger.info("Loaded %d weights for Qwen3TTSTalkerForConditionalGeneration", len(loaded))
         return loaded
 
+    def enable_cudagraph(self, device: torch.device | None = None):
+        """Capture Talker MTP as CUDA graphs for fast decode."""
+        from .cuda_graph_talker_wrapper import TalkerMTPCudaGraphWrapper
+
+        if device is None:
+            device = next(self.model.parameters()).device
+        if device.type != "cuda":
+            logger.warning("Cannot enable CUDA Graph: talker is not on a CUDA device (got %s)", device)
+            return
+
+        self._cudagraph_wrapper = TalkerMTPCudaGraphWrapper(
+            talker_model=self,
+            talker_config=self.talker_config,
+            enabled=True,
+        )
+        self._cudagraph_wrapper.warmup(device)
+        self._cudagraph_enabled = True
+        logger.info("CUDA Graph enabled for TTS talker MTP")
+
     # -------------------- GPU-side MTP fast-path --------------------
 
-    @torch.inference_mode()
     def talker_mtp(
+        self,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor,
+        last_talker_hidden: torch.Tensor,
+        text_step: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run talker MTP via CUDA graph if available, else eager fallback."""
+        if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
+            return self._cudagraph_wrapper(input_ids, input_embeds, last_talker_hidden, text_step)
+        return self._talker_mtp_eager(input_ids, input_embeds, last_talker_hidden, text_step)
+
+    @torch.inference_mode()
+    def _talker_mtp_eager(
         self,
         input_ids: torch.Tensor,
         input_embeds: torch.Tensor,
@@ -1634,13 +1669,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         past_hidden = last_talker_hidden.reshape(bsz, 1, -1).to(dtype=torch.bfloat16, device=dev)
         text_step = text_step.reshape(bsz, 1, -1).to(dtype=torch.bfloat16, device=dev)
 
-        # Residual predictor runs fixed-length (Q-1) steps via the vLLM-native code_predictor.
         max_steps = q - 1
         if max_steps <= 0:
             audio_codes = input_ids.reshape(bsz, 1)
             return (last_id_hidden + text_step).reshape(bsz, -1), audio_codes
 
-        # Predict residual codes (1..Q-1) with HF reference sampling params.
         audio_codes = self.code_predictor(
             layer0_code=input_ids.reshape(bsz, 1),
             layer0_embed=last_id_hidden,
@@ -1651,12 +1684,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             top_p=1.0,
         )  # [B, Q]
 
-        # Map invalid layer-0 ids (e.g. EOS) to PAD=0 so SpeechTokenizer sees only real codes.
         layer0 = audio_codes[:, :1]
         invalid0 = (layer0 < 0) | (layer0 >= int(self._codebook_vocab_size))
         audio_codes = torch.where(invalid0.expand_as(audio_codes), torch.zeros_like(audio_codes), audio_codes)
 
-        # Sum embeddings of all code groups, then add the current text step.
         residual_ids_t = audio_codes[:, 1:]
         embeds: list[torch.Tensor] = [last_id_hidden]
         for i in range(max_steps):
