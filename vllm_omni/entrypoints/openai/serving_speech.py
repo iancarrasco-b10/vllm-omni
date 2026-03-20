@@ -407,6 +407,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "audio/aac": ".aac",
             "audio/webm": ".webm",
             "audio/mp4": ".mp4",
+            "audio/x-m4a": ".m4a",
+            "audio/m4a": ".m4a",
         }
         filename = f"{_sanitize_filename(name)}{extension_map.get(mime_type, '.wav')}"
         upload = UploadFile(
@@ -451,6 +453,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 mime_type = "audio/webm"
             elif filename_lower.endswith(".mp4"):
                 mime_type = "audio/mp4"
+            elif filename_lower.endswith(".m4a"):
+                mime_type = "audio/x-m4a"
             else:
                 mime_type = "audio/wav"
 
@@ -463,6 +467,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "audio/flac",
             "audio/webm",
             "audio/mp4",
+            "audio/x-m4a",
+            "audio/m4a",
         }
         if mime_type not in allowed_mime_types:
             raise ValueError(f"Unsupported MIME type: {mime_type}. Allowed: {allowed_mime_types}")
@@ -666,23 +672,80 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return None
 
+    @staticmethod
+    def _load_audio_bytes_ffmpeg(data: bytes) -> tuple[np.ndarray, int]:
+        """Load audio from raw bytes, with ffmpeg fallback for non-PCM formats (m4a, aac, etc.)."""
+        import soundfile as sf
+
+        try:
+            with io.BytesIO(data) as f:
+                audio, sr = sf.read(f, dtype="float32", always_2d=False)
+            return audio, int(sr)
+        except Exception:
+            pass
+        import subprocess
+
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", "pipe:0", "-f", "wav", "-acodec", "pcm_f32le", "-ac", "1", "pipe:1"],
+            input=data,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed to decode audio: {result.stderr.decode(errors='replace')}")
+        with io.BytesIO(result.stdout) as f:
+            audio, sr = sf.read(f, dtype="float32", always_2d=False)
+        return audio, int(sr)
+
     async def _resolve_ref_audio(self, ref_audio_str: str) -> tuple[np.ndarray, int]:
         """Resolve ref_audio to (wav_ndarray, sample_rate).
 
         Delegates to upstream vLLM's MediaConnector which handles http(s)
         URLs, ``data:`` base64 URIs, and ``file:`` local paths (the latter
         gated by ``--allowed-local-media-path``).
+
+        Falls back to ffmpeg for formats that soundfile/librosa cannot decode
+        from in-memory bytes (e.g. m4a, aac).
         """
         model_config = self.model_config
         connector = MediaConnector(
             allowed_local_media_path=model_config.allowed_local_media_path,
             allowed_media_domains=model_config.allowed_media_domains,
         )
-        wav_np, sr = await connector.fetch_audio_async(ref_audio_str)
+        try:
+            wav_np, sr = await connector.fetch_audio_async(ref_audio_str)
+        except Exception:
+            wav_np, sr = await self._resolve_ref_audio_ffmpeg_fallback(ref_audio_str, connector)
         wav_np = np.asarray(wav_np, dtype=np.float32)
         if wav_np.ndim > 1:
             wav_np = np.mean(wav_np, axis=-1)
         return wav_np, int(sr)
+
+    async def _resolve_ref_audio_ffmpeg_fallback(
+        self, ref_audio_str: str, connector: MediaConnector
+    ) -> tuple[np.ndarray, int]:
+        """Fetch raw audio bytes and decode via ffmpeg when MediaConnector fails."""
+        import base64 as b64mod
+
+        if ref_audio_str.startswith("data:"):
+            _, payload = ref_audio_str.split(",", 1)
+            audio_bytes = b64mod.b64decode(payload)
+        elif ref_audio_str.startswith(("http://", "https://")):
+            import aiohttp
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(ref_audio_str) as resp:
+                    resp.raise_for_status()
+                    audio_bytes = await resp.read()
+        elif ref_audio_str.startswith("file://"):
+            import asyncio
+            from pathlib import Path
+
+            file_path = Path(ref_audio_str.removeprefix("file://"))
+            audio_bytes = await asyncio.get_event_loop().run_in_executor(None, file_path.read_bytes)
+        else:
+            raise ValueError(f"Unsupported ref_audio URI scheme: {ref_audio_str[:30]}")
+
+        return self._load_audio_bytes_ffmpeg(audio_bytes)
 
     async def _generate_audio_chunks(self, generator, request_id: str, response_format: str = "pcm"):
         """Generate audio chunks for streaming response.

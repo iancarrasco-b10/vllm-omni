@@ -222,14 +222,33 @@ class OmniStreamingSpeechHandler:
         websocket: WebSocket,
         config: StreamingSpeechSessionConfig,
     ) -> None:
-        """Persist a cloned voice for later sessions when requested by the client."""
+        """Persist a cloned voice for later sessions when requested by the client.
+
+        Accepts ref_audio as a data URI (base64), http(s) URL, or file:// URI.
+        Non-data-URI sources are resolved to audio bytes and re-encoded as a
+        data URI before uploading, so the voice cache always stores PCM/WAV data
+        that soundfile can read back reliably.
+        """
         voice_name = config.voice_name
         if not voice_name or config.ref_audio is None:
             return
 
         voice_key = voice_name.lower()
         if voice_key not in self._speech_service.uploaded_speakers:
-            await self._speech_service.upload_voice_from_data_uri(config.ref_audio, voice_name)
+            ref_audio_str = config.ref_audio
+            if ref_audio_str.startswith("data:"):
+                await self._speech_service.upload_voice_from_data_uri(ref_audio_str, voice_name)
+            else:
+                import base64 as b64mod
+                import io
+                import soundfile as sf
+
+                wav_np, sr = await self._speech_service._resolve_ref_audio(ref_audio_str)
+                buf = io.BytesIO()
+                sf.write(buf, wav_np, sr, format="WAV")
+                wav_b64 = b64mod.b64encode(buf.getvalue()).decode("utf-8")
+                data_uri = f"data:audio/wav;base64,{wav_b64}"
+                await self._speech_service.upload_voice_from_data_uri(data_uri, voice_name)
 
         await websocket.send_json(
             {

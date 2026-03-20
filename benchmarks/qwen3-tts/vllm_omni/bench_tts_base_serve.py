@@ -66,8 +66,7 @@ PROMPTS = [
 
 REF_AUDIO_URL = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
 REF_TEXT = (
-    "Okay. Yeah. I resent you. I love you. I respect you. "
-    "But you know what? You blew it! And thanks to you."
+    "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
 )
 
 

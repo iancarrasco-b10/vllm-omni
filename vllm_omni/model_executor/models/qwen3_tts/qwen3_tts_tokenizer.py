@@ -126,6 +126,28 @@ class Qwen3TTSTokenizer:
             b64 = b64.split(",", 1)[1]
         return base64.b64decode(b64)
 
+    @staticmethod
+    def _load_audio_bytes(data: bytes) -> tuple[np.ndarray, int]:
+        """Load audio from raw bytes, with ffmpeg fallback for non-PCM formats (m4a, aac, etc.)."""
+        try:
+            with io.BytesIO(data) as f:
+                audio, sr = sf.read(f, dtype="float32", always_2d=False)
+            return audio, int(sr)
+        except Exception:
+            pass
+        import subprocess
+
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", "pipe:0", "-f", "wav", "-acodec", "pcm_f32le", "-ac", "1", "pipe:1"],
+            input=data,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed to decode audio: {result.stderr.decode(errors='replace')}")
+        with io.BytesIO(result.stdout) as f:
+            audio, sr = sf.read(f, dtype="float32", always_2d=False)
+        return audio, int(sr)
+
     def load_audio(
         self,
         x: str,
@@ -147,12 +169,10 @@ class Qwen3TTSTokenizer:
         if self._is_url(x):
             with urllib.request.urlopen(x) as resp:
                 audio_bytes = resp.read()
-            with io.BytesIO(audio_bytes) as f:
-                audio, sr = sf.read(f, dtype="float32", always_2d=False)
+            audio, sr = self._load_audio_bytes(audio_bytes)
         elif self._is_probably_base64(x):
             wav_bytes = self._decode_base64_to_wav_bytes(x)
-            with io.BytesIO(wav_bytes) as f:
-                audio, sr = sf.read(f, dtype="float32", always_2d=False)
+            audio, sr = self._load_audio_bytes(wav_bytes)
         else:
             audio, sr = librosa.load(x, sr=None, mono=True)
 

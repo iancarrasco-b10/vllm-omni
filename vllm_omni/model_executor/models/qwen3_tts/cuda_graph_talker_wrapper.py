@@ -135,6 +135,14 @@ class TalkerMTPCudaGraphWrapper:
         self.device = device
         self.device_index = device.index or 0
 
+        # Pre-allocate code predictor internal buffers (_proj_buf, _pos_ids)
+        # for the largest batch size BEFORE capturing any graphs. Without this,
+        # _ensure_buffers() reallocates for each increasing batch size during
+        # capture, invalidating the memory addresses baked into earlier graphs
+        # (use-after-free on replay).
+        max_bs = max(self.capture_batch_sizes)
+        self.code_predictor._ensure_buffers(max_bs, device, torch.bfloat16)
+
         logger.info(
             "TalkerMTPCudaGraphWrapper: capturing graphs for batch sizes %s",
             self.capture_batch_sizes,
