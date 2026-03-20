@@ -17,7 +17,7 @@ stage_args:
       enable_prefix_caching: false
       engine_output_type: latent
       gpu_memory_utilization: 0.6
-      distributed_executor_backend: "mp"
+      distributed_executor_backend: "uni"
       max_num_batched_tokens: 2048
       max_model_len: 4096
       custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav_async_chunk
@@ -49,7 +49,7 @@ stage_args:
       enable_prefix_caching: false
       engine_output_type: audio
       gpu_memory_utilization: 0.3
-      distributed_executor_backend: "mp"
+      distributed_executor_backend: "uni"
       # Must be divisible by num_code_groups and cover (left_context + chunk).
       max_num_batched_tokens: 8192
       # async_chunk appends windows per step; max_model_len must cover accumulated stream.
@@ -85,7 +85,7 @@ runtime:
         # Frame-aligned codec streaming transport.
         codec_streaming: true
         # Connector polling / timeout (unit: loop count, sleep interval in seconds).
-        connector_get_sleep_s: 0.002
+        connector_get_sleep_s: 0.0005
         connector_get_max_wait_first_chunk: 3000
         connector_get_max_wait: 300
         # Align with Omni: small chunks with sufficient context overlap.

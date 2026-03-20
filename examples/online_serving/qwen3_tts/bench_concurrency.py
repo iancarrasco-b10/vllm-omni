@@ -61,6 +61,7 @@ def main():
     parser.add_argument("--runs", type=int, default=6, help="Min requests per level")
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--cooldown", type=float, default=3.0, help="Seconds between levels")
+    parser.add_argument("--x-vector-only", action="store_true", help="Use x-vector only mode (no ICL)")
     args = parser.parse_args()
 
     url = f"{args.base_url}/v1/audio/speech"
@@ -70,6 +71,9 @@ def main():
         "voice": args.voice,
         "response_format": "wav",
     }
+    if args.x_vector_only:
+        payload["x_vector_only_mode"] = True
+        payload["task_type"] = "Base"
 
     # Warmup
     print(f"Warming up ({args.warmup} sequential requests)...")
