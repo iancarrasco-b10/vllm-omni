@@ -640,10 +640,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     if not file_path.exists():
                         return f"Audio file for uploaded speaker '{request.voice}' not found on disk"
                 else:
-                    # need ref_audio for built-in speaker
                     if request.ref_audio is None:
                         return (
-                            f"Base task with built-in speaker '{request.voice}' requires 'ref_audio' for voice cloning"
+                            f"Voice '{request.voice}' is not registered on this server. "
+                            f"Either register it first via POST /v1/audio/voices, "
+                            f"or provide 'ref_audio' (and 'ref_text') inline."
                         )
                     # Validate ref_audio format for built-in speaker
                     if not (
@@ -1006,20 +1007,33 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         }
 
     async def _resolve_voice_name(self, request: OpenAICreateSpeechRequest) -> None:
-        """Handle voice_name: register new voice clones or resolve cached ones.
+        """Handle voice registration and cached voice resolution.
 
-        When voice_name is provided with ref_audio, the voice is registered
-        (saved to disk with ref_text metadata) so future requests with just
-        voice_name reuse it.  If ref_text was provided, ICL mode is used on
-        reuse; otherwise x_vector_only mode is used.
+        Works with either voice_name or voice field. When ref_audio is
+        provided alongside a name, the voice is registered (saved to disk
+        with ref_text metadata) so future requests reuse it automatically.
 
         Mutates request in-place: sets voice, task_type, and clears
         ref_audio/ref_text so the downstream pipeline uses the cache.
         """
-        if not request.voice_name:
+        name = request.voice_name or request.voice
+        if not name:
             return
 
-        voice_key = request.voice_name.lower()
+        # When only voice is set (no voice_name), auto-register if ref_audio
+        # is provided, or resolve from cache if already registered.
+        # Skip if voice is a known built-in speaker and no ref_audio given.
+        if not request.voice_name:
+            voice_lower = name.lower()
+            has_ref = request.ref_audio is not None
+            is_uploaded = voice_lower in self.uploaded_speakers
+            is_builtin = voice_lower in self._load_supported_speakers()
+            if not has_ref and not is_uploaded:
+                return
+            if is_builtin and not has_ref and not is_uploaded:
+                return
+
+        voice_key = name.lower()
 
         if request.ref_audio:
             if voice_key not in self.uploaded_speakers:
@@ -1035,18 +1049,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
                 await self.upload_voice_from_data_uri(
                     ref_audio=audio_data_uri,
-                    name=request.voice_name,
+                    name=name,
                     ref_text=request.ref_text,
                 )
             stored_mode = "ICL" if request.ref_text else "x_vector_only"
             logger.info(
                 "Registered voice '%s' via /v1/audio/speech (stored_mode=%s, has_ref_text=%s)",
-                request.voice_name, stored_mode, bool(request.ref_text),
+                name, stored_mode, bool(request.ref_text),
             )
         else:
             if voice_key not in self.uploaded_speakers:
                 raise ValueError(
-                    f"Voice '{request.voice_name}' is not cached. "
+                    f"Voice '{name}' is not registered. "
                     "Provide ref_audio (and optionally ref_text) to register it first."
                 )
             speaker_info = self.uploaded_speakers[voice_key]
@@ -1054,7 +1068,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             stored_mode = "ICL" if has_ref_text else "x_vector_only"
             logger.info(
                 "Reusing cached voice '%s' (stored_mode=%s, has_ref_text=%s)",
-                request.voice_name, stored_mode, has_ref_text,
+                name, stored_mode, has_ref_text,
             )
 
         # Allow per-request override: x_vector_only_mode=true forces
@@ -1065,10 +1079,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if effective_mode != stored_mode:
             logger.info(
                 "Voice '%s' effective_mode=%s (user override from stored_mode=%s)",
-                request.voice_name, effective_mode, stored_mode,
+                name, effective_mode, stored_mode,
             )
 
-        request.voice = request.voice_name
+        request.voice = name
         request.task_type = "Base"
         request.ref_audio = None
         request.ref_text = None
