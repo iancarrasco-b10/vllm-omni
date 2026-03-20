@@ -60,6 +60,16 @@ class OpenAICreateSpeechRequest(BaseModel):
         ge=0,
         description="Per-request initial chunk size override. If null, computed dynamically based on server load.",
     )
+    voice_name: str | None = Field(
+        default=None,
+        description="Name for caching/reusing a voice clone. On first use, provide "
+        "ref_audio (and optionally ref_text) to register; subsequent requests "
+        "with the same voice_name reuse the cached embeddings automatically. "
+        "When ref_text is provided during registration, ICL mode is used by "
+        "default; otherwise x_vector_only mode is used. You can override to "
+        "x_vector_only on any request by setting x_vector_only_mode=true, "
+        "even for voices registered with ref_text.",
+    )
 
     @field_validator("stream_format")
     @classmethod

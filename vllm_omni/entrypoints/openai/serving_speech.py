@@ -1005,12 +1005,82 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "additional_information": additional_information,
         }
 
+    async def _resolve_voice_name(self, request: OpenAICreateSpeechRequest) -> None:
+        """Handle voice_name: register new voice clones or resolve cached ones.
+
+        When voice_name is provided with ref_audio, the voice is registered
+        (saved to disk with ref_text metadata) so future requests with just
+        voice_name reuse it.  If ref_text was provided, ICL mode is used on
+        reuse; otherwise x_vector_only mode is used.
+
+        Mutates request in-place: sets voice, task_type, and clears
+        ref_audio/ref_text so the downstream pipeline uses the cache.
+        """
+        if not request.voice_name:
+            return
+
+        voice_key = request.voice_name.lower()
+
+        if request.ref_audio:
+            if voice_key not in self.uploaded_speakers:
+                audio_data_uri = request.ref_audio
+                if not request.ref_audio.startswith("data:"):
+                    import soundfile as sf
+
+                    wav_np, sr = await self._resolve_ref_audio(request.ref_audio)
+                    buf = io.BytesIO()
+                    sf.write(buf, wav_np, sr, format="WAV")
+                    audio_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                    audio_data_uri = f"data:audio/wav;base64,{audio_b64}"
+
+                await self.upload_voice_from_data_uri(
+                    ref_audio=audio_data_uri,
+                    name=request.voice_name,
+                    ref_text=request.ref_text,
+                )
+            stored_mode = "ICL" if request.ref_text else "x_vector_only"
+            logger.info(
+                "Registered voice '%s' via /v1/audio/speech (stored_mode=%s, has_ref_text=%s)",
+                request.voice_name, stored_mode, bool(request.ref_text),
+            )
+        else:
+            if voice_key not in self.uploaded_speakers:
+                raise ValueError(
+                    f"Voice '{request.voice_name}' is not cached. "
+                    "Provide ref_audio (and optionally ref_text) to register it first."
+                )
+            speaker_info = self.uploaded_speakers[voice_key]
+            has_ref_text = bool(speaker_info.get("ref_text"))
+            stored_mode = "ICL" if has_ref_text else "x_vector_only"
+            logger.info(
+                "Reusing cached voice '%s' (stored_mode=%s, has_ref_text=%s)",
+                request.voice_name, stored_mode, has_ref_text,
+            )
+
+        # Allow per-request override: x_vector_only_mode=true forces
+        # x_vector_only even for a voice registered with ref_text (ICL).
+        effective_mode = stored_mode
+        if request.x_vector_only_mode is True:
+            effective_mode = "x_vector_only (override)"
+        if effective_mode != stored_mode:
+            logger.info(
+                "Voice '%s' effective_mode=%s (user override from stored_mode=%s)",
+                request.voice_name, effective_mode, stored_mode,
+            )
+
+        request.voice = request.voice_name
+        request.task_type = "Base"
+        request.ref_audio = None
+        request.ref_text = None
+
     async def _prepare_speech_generation(
         self,
         request: OpenAICreateSpeechRequest,
     ) -> tuple[str, Any, dict[str, Any]]:
         if self.engine_client.errored:
             raise self.engine_client.dead_error
+
+        await self._resolve_voice_name(request)
 
         if self._is_fish_speech:
             if not request.input or not request.input.strip():
