@@ -183,12 +183,16 @@ def run_streaming(args, payload: dict) -> None:
     audio_duration = len(pcm_data) / (sample_rate * 2)
     _write_wav(args.output, pcm_data, sample_rate)
 
+    text_len = len(args.text) if hasattr(args, "text") else len(payload.get("input", ""))
+    cps = text_len / t_total if t_total > 0 else 0
+
     print(f"\nSaved {args.output} ({len(pcm_data)} PCM bytes, {audio_duration:.2f}s audio)")
     if ttfa is not None:
         print(f"  TTFA:       {ttfa * 1000:.1f} ms")
     print(f"  Total time: {t_total * 1000:.1f} ms")
     if audio_duration > 0:
         print(f"  RTF:        {t_total / audio_duration:.2f}x")
+    print(f"  Chars/sec:  {cps:.1f} ({text_len} chars)")
 
     if is_wav and args.play and HAS_PLAYBACK:
         print("  Playing audio...")
@@ -237,10 +241,14 @@ def run_non_streaming(args, payload: dict) -> None:
     audio_duration = len(pcm_data) / (sample_rate * 2)
     _write_wav(args.output, pcm_data, sample_rate)
 
+    text_len = len(args.text) if hasattr(args, "text") else len(payload.get("input", ""))
+    cps = text_len / t_total if t_total > 0 else 0
+
     print(f"\nSaved {args.output} ({len(pcm_data)} PCM bytes, {audio_duration:.2f}s audio)")
     print(f"  Total time: {t_total * 1000:.1f} ms")
     if audio_duration > 0:
         print(f"  RTF:        {t_total / audio_duration:.2f}x")
+    print(f"  Chars/sec:  {cps:.1f} ({text_len} chars)")
 
     if args.play and HAS_PLAYBACK:
         print("  Playing audio...")
@@ -449,6 +457,7 @@ def main():
     if args.no_stream:
         run_non_streaming(args, payload)
     else:
+        payload["stream"] = True
         run_streaming(args, payload)
 
 

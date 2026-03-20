@@ -884,6 +884,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 audio_data = self._get_uploaded_audio_data(request.voice)
                 if audio_data:
                     params["ref_audio"] = [audio_data]
+                    params["task_type"] = ["Base"]
                     has_ref_text = request.ref_text is not None and request.ref_text.strip()
                     if not has_ref_text:
                         stored_ref_text = self.uploaded_speakers[request.voice.lower()].get("ref_text")

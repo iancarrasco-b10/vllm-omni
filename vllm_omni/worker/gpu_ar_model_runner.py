@@ -546,7 +546,15 @@ class GPUARModelRunner(OmniGPUModelRunner):
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
-        hidden_states_cpu = hidden_states.detach().to("cpu").contiguous()
+        _skip_hidden_copy = self.vllm_config.model_config.engine_output_type != "text"
+        num_tokens = hidden_states.shape[0]
+
+        torch.cuda.synchronize()
+
+        if _skip_hidden_copy:
+            hidden_states_cpu = None
+        else:
+            hidden_states_cpu = hidden_states.detach().to("cpu").contiguous()
         num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
         if num_scheduled_tokens_np is None:
             req_ids = self.input_batch.req_ids
@@ -559,36 +567,39 @@ class GPUARModelRunner(OmniGPUModelRunner):
             hidden_states, multimodal_outputs, num_scheduled_tokens_np, scheduler_output
         )
 
-        # Pre-copy multimodal tensors to CPU once (not per-request) to avoid
-        # redundant D2H transfers when gpu_resident_buffer_keys keeps them on GPU.
-        # Tensors already on CPU (e.g. ref_code_len, codec_streaming) are kept
-        # as-is to avoid redundant .to("cpu") overhead.
         mm_cpu: dict[str, object] = {}
         if isinstance(multimodal_outputs, dict) and multimodal_outputs:
             for k, v in multimodal_outputs.items():
                 try:
-                    if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
-                        mm_cpu[k] = v.detach().to("cpu").contiguous() if v.is_cuda else v.detach().contiguous()
+                    if isinstance(v, torch.Tensor) and v.shape[0] == num_tokens:
+                        if v.is_cuda:
+                            mm_cpu[k] = v.detach().to("cpu", non_blocking=True)
+                        else:
+                            mm_cpu[k] = v.detach()
                     elif isinstance(v, dict):
                         sub_dict: dict[str, torch.Tensor] = {}
                         for sk, sv in v.items():
-                            if isinstance(sv, torch.Tensor) and sv.shape[0] == hidden_states_cpu.shape[0]:
-                                sub_dict[str(sk)] = (
-                                    sv.detach().to("cpu").contiguous() if sv.is_cuda else sv.detach().contiguous()
-                                )
+                            if isinstance(sv, torch.Tensor) and sv.shape[0] == num_tokens:
+                                if sv.is_cuda:
+                                    sub_dict[str(sk)] = sv.detach().to("cpu", non_blocking=True)
+                                else:
+                                    sub_dict[str(sk)] = sv.detach()
                         if sub_dict:
                             mm_cpu[k] = sub_dict
                     elif isinstance(v, list):
                         element = v[0]
                         if isinstance(element, torch.Tensor):
-                            element = (
-                                element.detach().to("cpu").contiguous()
-                                if element.is_cuda
-                                else element.detach().contiguous()
-                            )
+                            if element.is_cuda:
+                                element = element.detach().to("cpu", non_blocking=True)
+                            else:
+                                element = element.detach()
                         mm_cpu[k] = element
                 except Exception as e:
                     logger.error(f"Error in merge multimodal outputs: {e}")
+
+        # Sync the non_blocking copies before reading
+        if mm_cpu:
+            torch.cuda.synchronize()
 
         pooler_output: list[dict[str, object]] = []
         for rid in req_ids_output_copy:
@@ -596,23 +607,25 @@ class GPUARModelRunner(OmniGPUModelRunner):
             start = int(self.query_start_loc.cpu[idx])
             sched = int(num_scheduled_tokens_np[idx])
             end = start + sched
-            hidden_slice = hidden_states_cpu[start:end]
-            payload: dict[str, object] = {"hidden": hidden_slice}
+            if _skip_hidden_copy:
+                payload: dict[str, object] = {}
+            else:
+                hidden_slice = hidden_states_cpu[start:end]
+                payload: dict[str, object] = {"hidden": hidden_slice}
             if mm_cpu:
                 mm_payload: dict[str, object] = {}
                 for k, v in mm_cpu.items():
-                    if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
+                    if isinstance(v, torch.Tensor) and v.shape[0] == num_tokens:
                         mm_payload[k] = v[start:end].contiguous()
                     elif isinstance(v, dict):
                         mm_payload[k] = {sk: sv[start:end].contiguous() for sk, sv in v.items()}
                     elif isinstance(v, torch.Tensor):
-                        # List-derived tensor payloads are request-invariant; clone to
-                        # avoid accidental cross-request aliasing on downstream mutation.
                         mm_payload[k] = v.clone()
                     else:
                         mm_payload[k] = v
                 payload.update(mm_payload)
             pooler_output.append(payload)
+
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.model_config.enable_return_routed_experts:
                 capturer = RoutedExpertsCapturer.get_instance()

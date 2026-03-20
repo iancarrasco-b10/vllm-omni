@@ -44,13 +44,14 @@ fi
 
 echo "Starting Qwen3-TTS server with model: $MODEL"
 
+STAGE_CONFIG="${STAGE_CONFIG:-vllm_omni/model_executor/stage_configs/qwen3_tts.yaml}"
+
 vllm-omni serve "$MODEL" \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
+    --stage-configs-path "$STAGE_CONFIG" \
     --host 0.0.0.0 \
     --port 8091 \
     --gpu-memory-utilization 0.9 \
     --trust-remote-code \
     --chat-template "{% for m in messages %}{{ m['content'] }}{% endfor %}" \
-    --enforce-eager \
     --omni
     

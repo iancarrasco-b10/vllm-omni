@@ -213,7 +213,10 @@ class Qwen3TTSCode2Wav(nn.Module):
                 if i >= len(left_context_size):
                     break
                 if "left_context_size" in info:
-                    left_context_size[i] = info["left_context_size"]
+                    val = info["left_context_size"]
+                    if isinstance(val, (list, tuple)):
+                        val = val[0] if val else 0
+                    left_context_size[i] = int(val)
         for i, req_ids in enumerate(request_ids_list):
             if req_ids.numel() < 1:
                 parsed.append((0, 0))

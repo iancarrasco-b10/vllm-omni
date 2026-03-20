@@ -246,6 +246,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             ref_list_cache = getattr(self, "_ref_code_list_cache", None)
             if ref_list_cache is not None:
                 ref_list_cache.pop(request_id, None)
+            self.cleanup(request.request_id, request_id)
 
     ########################################################################
     # Cleanup
