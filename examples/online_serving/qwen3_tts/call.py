@@ -416,6 +416,9 @@ def main():
     if args.x_vector_only_mode:
         config["x_vector_only_mode"] = True
 
+    config["stream_audio"] = True
+    config["response_format"] = "pcm"
+
     try:
         asyncio.run(
             stream_tts(

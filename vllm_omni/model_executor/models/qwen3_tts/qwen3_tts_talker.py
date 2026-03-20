@@ -1399,12 +1399,16 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
                 if cached is not None:
                     cached_rc, cached_se = cached
-                    if need_ref_code:
+                    cache_has_valid_rc = isinstance(cached_rc, torch.Tensor) and cached_rc.ndim == 2 and cached_rc.numel() > 0
+                    if need_ref_code and cache_has_valid_rc:
                         ref_code_t = cached_rc.to(device=input_ids.device, dtype=torch.long)
                         ref_code_len = int(ref_code_t.shape[0])
+                        need_ref_code = False
                     if need_spk_embed:
                         speaker_embed = cached_se.to(device=input_ids.device, dtype=torch.bfloat16).view(1, 1, -1)
-                else:
+                        need_spk_embed = False
+
+                if need_ref_code or need_spk_embed:
                     ref_audio_list = info_dict.get("ref_audio")
                     wav_tensor = info_dict.get("ref_audio_wav")
                     sr_entry = info_dict.get("ref_audio_sr")

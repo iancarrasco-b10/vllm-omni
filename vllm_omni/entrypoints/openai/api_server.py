@@ -959,6 +959,7 @@ async def list_voices(raw_request: Request):
                     "created_at": info.get("created_at", 0),
                     "file_size": info.get("file_size", 0),
                     "mime_type": info.get("mime_type", ""),
+                    "has_ref_text": bool(info.get("ref_text")),
                 }
             )
 
@@ -978,6 +979,7 @@ async def upload_voice(
     audio_sample: UploadFile = File(...),
     consent: str = Form(...),
     name: str = Form(...),
+    ref_text: str | None = Form(None),
 ):
     """Upload a new voice sample for voice cloning.
 
@@ -989,6 +991,7 @@ async def upload_voice(
         audio_sample: Audio file (max 10MB)
         consent: Consent recording ID
         name: Name for the new voice
+        ref_text: Optional transcript of the reference audio (enables ICL mode)
         raw_request: Raw FastAPI request
 
     Returns:
@@ -1000,7 +1003,7 @@ async def upload_voice(
 
     try:
         # Upload the voice
-        result = await handler.upload_voice(audio_sample, consent, name)
+        result = await handler.upload_voice(audio_sample, consent, name, ref_text=ref_text)
 
         return JSONResponse(content={"success": True, "voice": result})
 

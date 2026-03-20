@@ -359,7 +359,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             logger.error(f"Could not read audio file for voice {voice_name}: {e}")
             return None
 
-    async def upload_voice(self, audio_file: UploadFile, consent: str, name: str) -> dict:
+    async def upload_voice(
+        self, audio_file: UploadFile, consent: str, name: str, *, ref_text: str | None = None
+    ) -> dict:
         """Upload a new voice sample."""
         audio_file.file.seek(0, 2)  # Seek to end
         file_size = audio_file.file.tell()
@@ -372,6 +374,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             consent=consent,
             name=name,
             file_size=file_size,
+            ref_text=ref_text,
         )
 
     async def upload_voice_from_data_uri(
@@ -379,6 +382,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         ref_audio: str,
         name: str,
         consent: str = _WEBSOCKET_UPLOAD_CONSENT,
+        *,
+        ref_text: str | None = None,
     ) -> dict[str, Any]:
         """Upload a voice sample carried inline as a data URI."""
         if not isinstance(ref_audio, str) or not ref_audio.startswith("data:"):
@@ -416,7 +421,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             filename=filename,
             headers=Headers({"content-type": mime_type}),
         )
-        return await self.upload_voice(upload, consent=consent, name=name)
+        return await self.upload_voice(upload, consent=consent, name=name, ref_text=ref_text)
 
     def _store_uploaded_voice_bytes(
         self,
@@ -427,6 +432,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         consent: str,
         name: str,
         file_size: int | None = None,
+        ref_text: str | None = None,
     ) -> dict[str, Any]:
         """Persist an uploaded voice sample and register it in metadata."""
         # Validate file size (max 10MB)
@@ -508,6 +514,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "cache_status": "pending",
             "cache_file": None,
             "cache_generated_at": None,
+            "ref_text": ref_text.strip() if isinstance(ref_text, str) and ref_text.strip() else None,
         }
 
         success = self.metadata_manager.create_speaker(voice_name_lower, speaker_data)
@@ -869,13 +876,27 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if request.voice is not None:
             params["speaker"] = [request.voice]
 
-            # If voice is an uploaded speaker and no ref_audio provided, auto-set it
+            # If voice is an uploaded speaker and no ref_audio provided, auto-set it.
+            # Also auto-set ref_text from stored metadata if the request doesn't provide one.
+            # Use x_vector_only when no ref_text is available (no ICL possible);
+            # when ref_text is available, leave ICL enabled for better voice similarity.
             if request.voice.lower() in self.uploaded_speakers and request.ref_audio is None:
                 audio_data = self._get_uploaded_audio_data(request.voice)
                 if audio_data:
                     params["ref_audio"] = [audio_data]
-                    params["x_vector_only_mode"] = [True]
-                    logger.info(f"Auto-set ref_audio for uploaded voice: {request.voice}")
+                    has_ref_text = request.ref_text is not None and request.ref_text.strip()
+                    if not has_ref_text:
+                        stored_ref_text = self.uploaded_speakers[request.voice.lower()].get("ref_text")
+                        if isinstance(stored_ref_text, str) and stored_ref_text.strip():
+                            params["ref_text"] = [stored_ref_text.strip()]
+                            has_ref_text = True
+                    if not has_ref_text:
+                        params["x_vector_only_mode"] = [True]
+                    logger.info(
+                        "Auto-set ref_audio for uploaded voice: %s (x_vector_only=%s)",
+                        request.voice,
+                        not has_ref_text,
+                    )
                 else:
                     raise ValueError(f"Audio file for uploaded voice '{request.voice}' is missing or corrupted")
 

@@ -234,10 +234,13 @@ class OmniStreamingSpeechHandler:
             return
 
         voice_key = voice_name.lower()
+        ref_text = getattr(config, "ref_text", None)
         if voice_key not in self._speech_service.uploaded_speakers:
             ref_audio_str = config.ref_audio
             if ref_audio_str.startswith("data:"):
-                await self._speech_service.upload_voice_from_data_uri(ref_audio_str, voice_name)
+                await self._speech_service.upload_voice_from_data_uri(
+                    ref_audio_str, voice_name, ref_text=ref_text
+                )
             else:
                 import base64 as b64mod
                 import io
@@ -248,7 +251,9 @@ class OmniStreamingSpeechHandler:
                 sf.write(buf, wav_np, sr, format="WAV")
                 wav_b64 = b64mod.b64encode(buf.getvalue()).decode("utf-8")
                 data_uri = f"data:audio/wav;base64,{wav_b64}"
-                await self._speech_service.upload_voice_from_data_uri(data_uri, voice_name)
+                await self._speech_service.upload_voice_from_data_uri(
+                    data_uri, voice_name, ref_text=ref_text
+                )
 
         await websocket.send_json(
             {
