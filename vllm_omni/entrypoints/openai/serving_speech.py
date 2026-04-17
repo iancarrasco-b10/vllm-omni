@@ -787,6 +787,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 class _AudioOutputWrapper:
                     multimodal_output = {"model_outputs": all_audio_chunks, "sr": torch.tensor(sample_rate_val, dtype=torch.int32)}
                 final_output = _AudioOutputWrapper()
+
+        audio_chunk = self._extract_audio_from_output(final_output)
         if audio_chunk is None:
             raise ValueError("TTS model did not produce audio output.")
 
