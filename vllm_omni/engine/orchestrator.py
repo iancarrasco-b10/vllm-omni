@@ -1336,8 +1336,17 @@ class Orchestrator:
         new_text = msg.new_text
         finished = msg.finished
 
+        # The client extends by the base API request id (e.g. "speech-<uuid>"),
+        # but the orchestrator tracks requests (and the worker keys its model
+        # buffer) under a per-request global/stage id that appends a suffix
+        # ("speech-<uuid>-<hex>"). Resolve the tracked id so the update lands on
+        # the right request instead of being silently dropped.
         if request_id not in self.request_states:
-            return
+            prefix = request_id + "-"
+            resolved = next((k for k in self.request_states if k.startswith(prefix)), None)
+            if resolved is None:
+                return
+            request_id = resolved
 
         state_update: dict[str, Any] = {}
         if new_text:
