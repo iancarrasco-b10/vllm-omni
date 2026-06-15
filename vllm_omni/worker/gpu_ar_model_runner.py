@@ -834,7 +834,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     )
                 except TypeError:
                     logits = self.model.compute_logits(sample_hidden_states)
-                self._suppress_streaming_text_eos(logits)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -858,7 +857,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         )
                     except TypeError:
                         logits = self.model.compute_logits(sample_hidden_states)
-                    self._suppress_streaming_text_eos(logits)
 
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:
@@ -893,40 +891,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             self._omni_routed_experts_d2h(scheduler_output)
 
         return None
-
-    def _suppress_streaming_text_eos(self, logits: torch.Tensor | None) -> None:
-        """Mask the codec EOS for token-level streaming requests still feeding text.
-
-        While a ``streaming_text_input`` request has not been marked finished,
-        the talker must not autoregressively sample the codec EOS token: doing so
-        ends the request before the rest of the (incrementally arriving) text has
-        been synthesized. Once the client signals ``input.done``
-        (``streaming_text_finished``) the EOS is injected on the text side and the
-        request is allowed to terminate normally, so masking is dropped here.
-
-        Rows align with ``input_batch.req_ids`` for the requests sampled this
-        step (the steady-state decode case where premature EOS occurs).
-        """
-        if logits is None:
-            return
-        eos_id = getattr(self.model, "_codec_eos_token_id", -1)
-        if not (isinstance(eos_id, int) and 0 <= eos_id < logits.shape[-1]):
-            return
-        buffer = getattr(self, "model_intermediate_buffer", None)
-        if not buffer:
-            return
-        rows: list[int] = []
-        for i, req_id in enumerate(self.input_batch.req_ids):
-            if i >= logits.shape[0]:
-                break
-            buf = buffer.get(req_id)
-            if not buf:
-                continue
-            meta = buf.get("meta") or {}
-            if meta.get("streaming_text_input") and not buf.get("streaming_text_finished"):
-                rows.append(i)
-        if rows:
-            logits[rows, eos_id] = float("-inf")
 
     def _sample(
         self,
