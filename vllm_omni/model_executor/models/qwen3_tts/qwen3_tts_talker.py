@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
@@ -421,6 +422,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             codec_mask[self._codec_eos_token_id] = True
         self.register_buffer("_codec_disallowed_mask", ~codec_mask, persistent=False)
 
+        # Silence-region codec tokens (#4966). The talker has real probability mass on
+        # these in the opening decode frames; how many it draws is a sampling outcome,
+        # which is the source of both the leading silence and its seed-to-seed variance.
+        # The vocabulary is checkpoint-specific, so it is derived at load time in
+        # :meth:`_init_silence_mask`; this is only the placeholder.
+        self._silence_ban_frames = int(os.environ.get("VLLM_OMNI_SILENCE_BAN_FRAMES", "0"))
+        self.register_buffer("_silence_mask", torch.zeros((vocab,), dtype=torch.bool), persistent=False)
+
         # Keys that should stay on GPU in model_intermediate_buffer to avoid
         # CPU-to-GPU round-trips on every decode step.
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
@@ -559,6 +568,16 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         # Mask out invalid codec ids using the pre-built constant buffer.
         logits = logits.masked_fill(self._codec_disallowed_mask, float("-inf"))
+
+        # Suppress silence-region tokens for the first N decode frames (#4966). The
+        # per-request decode step is the length of its generated-token history.
+        ban_n = getattr(self, "_silence_ban_frames", 0)
+        if ban_n > 0 and sampling_metadata is not None:
+            oti = getattr(sampling_metadata, "output_token_ids", None)
+            if oti and len(oti) == logits.shape[0]:
+                steps = torch.tensor([len(t) for t in oti], device=logits.device, dtype=torch.int32)
+                early = (steps < ban_n).unsqueeze(1)
+                logits = logits.masked_fill(early & self._silence_mask, float("-inf"))
 
         return logits
 
@@ -1042,6 +1061,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self.encoder.to(device=device, dtype=torch.bfloat16)
 
         self._init_runtime_buffers()
+        self._init_silence_mask()
 
         logger.info("Loaded %d weights for Qwen3TTSTalkerForConditionalGeneration", len(loaded))
         self._build_stacked_codec_embed()
@@ -1054,6 +1074,49 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         w = embeds[0].weight
         self._stacked_codec_embed = torch.stack([e.weight.detach() for e in embeds], dim=0).to(
             device=w.device, dtype=w.dtype
+        )
+
+    @torch.no_grad()
+    def _init_silence_mask(self) -> None:
+        """Derive the silence-region codec vocabulary from the checkpoint.
+
+        Encodes silence at several durations and amplitudes and collects the
+        codebook-0 ids the tokenizer emits. These are the tokens the talker draws
+        when it produces leading silence (#4966). Derived rather than hardcoded
+        because the codec vocabulary is checkpoint-specific.
+        """
+        if self._silence_ban_frames <= 0:
+            return
+        device = next(self.parameters()).device
+        sr = 24000
+        try:
+            rng = np.random.RandomState(0)
+            wavs = [
+                (amp * rng.randn(int(dur * sr))).astype(np.float32)
+                for amp in (0.0, 1e-5, 1e-4, 1e-3)
+                for dur in (0.3, 0.5, 1.0)
+            ]
+            codes = self._encode_ref_audio_batch(wavs, sr, device=device)
+            ids: set[int] = set()
+            for code in codes:
+                code = code.detach().cpu()
+                cb0 = code[:, 0] if code.ndim == 2 else code
+                ids.update(int(t) for t in cb0.tolist())
+        except Exception as exc:
+            logger.warning("Could not derive the silence codec vocabulary; disabling the ban: %s", exc)
+            self._silence_ban_frames = 0
+            return
+        vocab = int(self.talker_config.vocab_size)
+        mask = torch.zeros((vocab,), dtype=torch.bool)
+        for token in ids:
+            if 0 <= token < vocab:
+                mask[token] = True
+        self._silence_mask.copy_(mask.to(self._silence_mask.device))
+        logger.info(
+            "Derived %d silence codec tokens, suppressed for the first %d decode frames: %s",
+            int(mask.sum()),
+            self._silence_ban_frames,
+            sorted(t for t in ids if 0 <= t < vocab),
         )
 
     @torch.no_grad()
