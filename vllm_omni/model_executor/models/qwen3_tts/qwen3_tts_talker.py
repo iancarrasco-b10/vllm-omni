@@ -571,13 +571,29 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         # Suppress silence-region tokens for the first N decode frames (#4966). The
         # per-request decode step is the length of its generated-token history.
-        ban_n = getattr(self, "_silence_ban_frames", 0)
+        ban_n = self._silence_ban_frames
         if ban_n > 0 and sampling_metadata is not None:
-            oti = getattr(sampling_metadata, "output_token_ids", None)
-            if oti and len(oti) == logits.shape[0]:
-                steps = torch.tensor([len(t) for t in oti], device=logits.device, dtype=torch.int32)
-                early = (steps < ban_n).unsqueeze(1)
-                logits = logits.masked_fill(early & self._silence_mask, float("-inf"))
+            output_token_ids = getattr(sampling_metadata, "output_token_ids", None)
+            if output_token_ids is None or len(output_token_ids) != logits.shape[0]:
+                logger.warning_once(
+                    "Silence ban is enabled but output_token_ids (%s) does not match the "
+                    "logits batch (%d); the ban will not take effect.",
+                    "None" if output_token_ids is None else len(output_token_ids),
+                    logits.shape[0],
+                )
+            else:
+                # The step gate is a tiny [B] check, so keep it on CPU. Once every
+                # request in the batch is past the window the ban is a no-op, so skip
+                # the device work rather than paying a host-to-device copy and a
+                # [B, vocab] mask on every decode frame.
+                steps = [len(t) for t in output_token_ids]
+                if min(steps) < ban_n:
+                    early = torch.tensor(
+                        [step < ban_n for step in steps],
+                        device=logits.device,
+                        dtype=torch.bool,
+                    ).unsqueeze(1)
+                    logits = logits.masked_fill(early & self._silence_mask, float("-inf"))
 
         return logits
 
