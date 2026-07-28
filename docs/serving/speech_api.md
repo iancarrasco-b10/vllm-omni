@@ -276,9 +276,10 @@ Client -> Server:
 
 | Message | Description |
 |---------|-------------|
-| `{"type": "session.config", ...}` | Session configuration (sent once, first message) |
+| `{"type": "session.config", ...}` | Session configuration (first message; may be resent between utterances to change it) |
 | `{"type": "input.text", "text": "..."}` | Text chunk |
-| `{"type": "input.done"}` | End of input, flushes remaining buffer |
+| `{"type": "input.done"}` | End of utterance: flushes the buffer and keeps the connection open |
+| `{"type": "session.close"}` | End of connection |
 
 Server -> Client:
 
@@ -287,8 +288,26 @@ Server -> Client:
 | `{"type": "audio.start", "sentence_index": 0, "sentence_text": "...", "format": "pcm", "sample_rate": 24000}` | Audio generation starting for the buffered input |
 | Binary frame | Raw audio bytes (one or more PCM chunks when `stream_audio=true`) |
 | `{"type": "audio.done", "sentence_index": 0, "total_bytes": 96000, "error": false}` | Audio complete for the buffered input |
-| `{"type": "session.done", "total_sentences": N}` | Session complete |
+| `{"type": "session.done", "total_sentences": N}` | Flushed utterance complete |
 | `{"type": "error", "message": "..."}` | Non-fatal error |
+
+### Flushing vs. Closing
+
+`input.done` is a flush, not a disconnect. The server synthesizes the buffered
+text, emits `session.done`, and then waits on the same connection for the next
+utterance, so a client that speaks repeatedly (for example one driven by an
+upstream LLM) pays the WebSocket handshake once instead of once per utterance.
+
+* The session config is sticky. Send `input.text` again straight after
+  `session.done` to reuse it, or send another `session.config` first to change
+  voice, format, or reference audio. A `session.config` sent while text is
+  still buffered is rejected so no pending input is silently dropped.
+* `sentence_index` keeps counting up across the utterances of one connection;
+  `total_sentences` counts the utterance that was just flushed (`1`, or `0`
+  when the buffer was empty).
+* End the connection with `session.close`, or by closing the socket. An idle
+  connection is still closed after the server's idle timeout, which now also
+  applies to the gap between utterances.
 
 ### Session Config Parameters
 
