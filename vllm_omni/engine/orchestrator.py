@@ -2013,6 +2013,19 @@ class Orchestrator:
                 # execute before that conditioning payload arrives.
                 continue
 
+            if next_stage_id in req_state.stage_submit_ts and getattr(stage0_request, "resumable", False):
+                # Already prewarmed and this is a non-terminal streaming
+                # update. The downstream stage is fed real payloads by the
+                # chunk connector, not by these updates; re-submitting the
+                # placeholder request would queue stale StreamingUpdates on
+                # the downstream session, which resurrect it after its
+                # terminal stop and double-enqueue it into the waiting
+                # queues (duplicate scheduled_new_reqs -> engine crash).
+                # The terminal (resumable=False) update must still go
+                # through: it delivers the finished sentinel that lets the
+                # downstream session complete.
+                continue
+
             req_state.stage_submit_ts[next_stage_id] = _time.time()
             _t_submit_start = _time.perf_counter()
 
