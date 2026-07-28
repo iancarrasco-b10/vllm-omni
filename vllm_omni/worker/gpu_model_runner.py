@@ -1623,6 +1623,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             decode_start_offsets = []
             decode_batch_items = []
             batch_decode_preprocess = getattr(self.model, "preprocess_decode_batch", None)
+            can_preprocess_decode_batch = getattr(self.model, "can_preprocess_decode_batch", None)
 
             def flush_decode_batch() -> None:
                 nonlocal inputs_embeds
@@ -1682,7 +1683,16 @@ class OmniGPUModelRunner(GPUModelRunner):
                 req_infos["_omni_prompt_len"] = prompt_len
                 req_infos["_omni_num_computed_tokens"] = num_computed_tokens
                 req_infos["_omni_is_prefill"] = is_prefill
-                if callable(batch_decode_preprocess) and self.has_talker_mtp and span_len == 1 and not is_prefill:
+                batch_decode_allowed = not callable(can_preprocess_decode_batch) or can_preprocess_decode_batch(
+                    req_infos
+                )
+                if (
+                    callable(batch_decode_preprocess)
+                    and batch_decode_allowed
+                    and self.has_talker_mtp
+                    and span_len == 1
+                    and not is_prefill
+                ):
                     decode_batch_items.append((req_id, s, req_infos))
                     continue
 

@@ -207,10 +207,13 @@ curl -X POST http://localhost:8091/v1/audio/voices \
 
 ## Streaming Text Input (WebSocket)
 
-The `/v1/audio/speech/stream` WebSocket endpoint accepts text incrementally and generates audio per sentence as boundaries are detected.
+The `/v1/audio/speech/stream` WebSocket endpoint accepts text incrementally. It can generate
+separate requests at sentence boundaries or keep one request alive across explicit sentence commits.
 
-> Note: text input is always streamed incrementally. Audio output remains sentence-scoped:
-> use `stream_audio=false` for one binary frame per sentence, or `stream_audio=true` for one or more PCM chunks per sentence.
+> In the default `sentence` mode, audio output remains sentence-scoped: use
+> `stream_audio=false` for one binary frame per sentence, or `stream_audio=true`
+> for one or more PCM chunks per sentence. Single-request modes emit one
+> continuous PCM stream.
 
 ### WebSocket Protocol
 
@@ -220,6 +223,7 @@ Client -> Server:
 |---------|-------------|
 | `{"type": "session.config", ...}` | Session configuration (sent once, first message) |
 | `{"type": "input.text", "text": "..."}` | Text chunk |
+| `{"type": "input.commit", "commit_id": "optional-id"}` | Commit buffered text in `sentence_commit` mode |
 | `{"type": "input.done"}` | End of input, flushes remaining buffer |
 
 Server -> Client:
@@ -229,6 +233,7 @@ Server -> Client:
 | `{"type": "audio.start", "sentence_index": 0, "sentence_text": "...", "format": "pcm", "sample_rate": 24000}` | Audio generation starting for a sentence |
 | Binary frame | Raw audio bytes (one or more PCM chunks when `stream_audio=true`) |
 | `{"type": "audio.done", "sentence_index": 0, "total_bytes": 96000, "error": false}` | Audio complete for a sentence |
+| `{"type": "input.committed", "commit_id": "optional-id", "sentence_index": 0, "chars_committed": 42}` | Buffered text was accepted by the persistent request |
 | `{"type": "session.done", "total_sentences": N}` | Session complete |
 | `{"type": "error", "message": "..."}` | Non-fatal error |
 
@@ -240,8 +245,8 @@ All REST API parameters are supported, plus:
 |-----------|------|---------|-------------|
 | `stream_audio` | bool | false | Stream one or more PCM chunks per sentence over WebSocket |
 | `split_granularity` | string | "sentence" | Text splitting granularity |
-| `streaming_mode` | string | "sentence" | `"sentence"` waits for sentence boundaries before submitting to TTS; `"token_level"` feeds text incrementally into a single TTS request (see below) |
-| `streaming_drain_max_steps` | int | 100 | token_level only: max decode steps after text + EOS are fully consumed before the runtime force-finishes the request |
+| `streaming_mode` | string | "sentence" | `"sentence"` creates one request per sentence; `"token_level"` appends every text chunk to one request; `"sentence_commit"` appends explicitly committed text to one request |
+| `streaming_drain_max_steps` | int | 100 | Single-request modes only: max decode steps after text + EOS are consumed before force-finishing |
 
 ## Token-Level Streaming Text Input (WebSocket)
 
@@ -314,6 +319,37 @@ asyncio.run(main())
 
 A runnable version with incremental-feed timing is at
 `examples/online_serving/text_to_speech/qwen3_tts/token_level_streaming_client.py`.
+
+## Persistent Sentence Commits (WebSocket)
+
+`streaming_mode="sentence_commit"` gives the client explicit control over when enough text
+has accumulated to start or resume synthesis. It uses one WebSocket and one engine request
+for the full utterance, so the talker's KV cache, codec state, speaker conditioning, and
+positions survive sentence boundaries.
+
+The client buffers text with `input.text`, then sends `input.commit`. The first commit starts
+generation; later commits append text to the same request. A commit does not append EOS.
+When generation catches up with committed text, the request pauses until the next commit.
+Only `input.done` appends EOS and releases the request after audio drains.
+
+```json
+{"type": "session.config", "streaming_mode": "sentence_commit", "response_format": "pcm", "voice": "vivian"}
+{"type": "input.text", "text": "The first sentence is ready."}
+{"type": "input.commit", "commit_id": "sentence-1"}
+{"type": "input.text", "text": " The next sentence arrived later."}
+{"type": "input.commit", "commit_id": "sentence-2"}
+{"type": "input.done"}
+```
+
+Each accepted commit produces `input.committed`. The optional `commit_id` is echoed so a
+client can correlate acknowledgements. Audio is one continuous PCM stream: there is one
+`audio.start` for the first commit and one `audio.done` after `input.done`, not per commit.
+If `input.done` arrives with uncommitted buffered text, the server commits that text before
+finalizing.
+
+The mode has the same deployment opt-in and PCM/speed constraints as `token_level`. See
+`examples/online_serving/text_to_speech/qwen3_tts/sentence_commit_streaming_client.py`
+for a runnable client.
 
 ```bash
 DELETE /v1/audio/voices/{name}

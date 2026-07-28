@@ -860,6 +860,20 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 info_update["meta"]["streaming_drain_step"] = int(meta.get("streaming_drain_step", 0) or 0) + 1
         return input_ids, inputs_embeds_out, info_update
 
+    @staticmethod
+    def can_preprocess_decode_batch(info_dict: dict[str, Any]) -> bool:
+        """Return whether decode can use the non-pausing batched fast path.
+
+        Streaming-text requests must use ``preprocess`` so an empty text tail
+        can return ``None`` and pause before the model advances its state.
+        """
+        additional_information = info_dict.get("additional_information")
+        if isinstance(additional_information, dict):
+            meta = additional_information.get("meta", {})
+        else:
+            meta = info_dict.get("meta", {})
+        return not bool(meta.get("streaming_text_input"))
+
     def preprocess_decode_batch(
         self,
         *,

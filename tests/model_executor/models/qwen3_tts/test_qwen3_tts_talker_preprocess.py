@@ -252,6 +252,39 @@ def test_decode_compacts_long_trailing_text_after_large_offset():
     assert torch.equal(update["hidden_states"]["trailing_text"], trailing_text[65:])
 
 
+def test_streaming_text_starvation_pauses_before_decode():
+    model = _make_minimal_talker()
+
+    out_ids, out_embeds, update = model.preprocess(
+        input_ids=torch.tensor([123], dtype=torch.long),
+        input_embeds=None,
+        text=["hello"],
+        task_type=["CustomVoice"],
+        hidden_states={
+            "trailing_text": torch.empty((0, 4), dtype=torch.bfloat16),
+            "last": torch.ones((4,), dtype=torch.bfloat16),
+        },
+        meta={"streaming_text_input": True, "talker_text_offset": 0},
+        streaming_text_finished=False,
+        _omni_is_prefill=False,
+        _omni_num_computed_tokens=2,
+        _omni_prompt_len=2,
+    )
+
+    assert out_ids.tolist() == [123]
+    assert out_embeds is None
+    assert update["meta"]["streaming_wait_for_input"] is True
+    assert update["streaming_text_new_text"] is None
+
+
+def test_streaming_text_requests_bypass_decode_batch_fast_path():
+    model = _make_minimal_talker()
+
+    assert model.can_preprocess_decode_batch({"meta": {"streaming_text_input": False}})
+    assert not model.can_preprocess_decode_batch({"meta": {"streaming_text_input": True}})
+    assert not model.can_preprocess_decode_batch({"additional_information": {"meta": {"streaming_text_input": True}}})
+
+
 def test_decode_batch_preprocess_matches_decode_state_updates():
     tts_pad = torch.full((1, 4), -1.0, dtype=torch.bfloat16)
     model = _make_minimal_talker(tts_pad_embed=tts_pad)

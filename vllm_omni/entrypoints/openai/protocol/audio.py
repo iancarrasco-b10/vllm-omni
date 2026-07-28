@@ -429,6 +429,22 @@ class BatchSpeechResponse(BaseModel):
     failed: int
 
 
+class StreamingSpeechInputCommit(BaseModel):
+    """Commit buffered text to a persistent streaming speech request."""
+
+    type: Literal["input.commit"]
+    commit_id: str | None = None
+
+
+class StreamingSpeechInputCommitted(BaseModel):
+    """Acknowledgement that a text commit was accepted by the engine."""
+
+    type: Literal["input.committed"] = "input.committed"
+    commit_id: str | None = None
+    sentence_index: int = Field(ge=0)
+    chars_committed: int = Field(ge=1)
+
+
 class StreamingSpeechSessionConfig(BaseModel):
     """Configuration sent as the first WebSocket message for streaming TTS."""
 
@@ -475,12 +491,13 @@ class StreamingSpeechSessionConfig(BaseModel):
             "'clause' also splits on CJK commas ， and semicolons ；."
         ),
     )
-    streaming_mode: Literal["sentence", "token_level"] = Field(
+    streaming_mode: Literal["sentence", "token_level", "sentence_commit"] = Field(
         default="sentence",
         description=(
             "Text input streaming mode: 'sentence' (default) waits for sentence boundaries "
             "before submitting to TTS; 'token_level' feeds text incrementally to a single "
-            "TTS request via engine-level streaming updates."
+            "TTS request; 'sentence_commit' buffers input.text messages until input.commit, "
+            "then appends each commit to one persistent TTS request."
         ),
     )
     streaming_drain_max_steps: int = Field(
@@ -488,21 +505,21 @@ class StreamingSpeechSessionConfig(BaseModel):
         ge=0,
         description=(
             "Max decode steps after text + EOS are fully consumed before "
-            "runtime force-finishes the request. Only used in token_level mode."
+            "runtime force-finishes the request. Used in token_level and sentence_commit modes."
         ),
     )
 
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "StreamingSpeechSessionConfig":
-        if self.streaming_mode == "token_level":
+        if self.streaming_mode in ("token_level", "sentence_commit"):
             if self.response_format != "pcm":
                 raise ValueError(
-                    "token_level streaming requires response_format='pcm'. "
+                    f"{self.streaming_mode} streaming requires response_format='pcm'. "
                     f"Got response_format='{self.response_format}'."
                 )
             self.stream_audio = True
             if self.speed is not None and self.speed != 1.0:
-                raise ValueError("Speed adjustment is not supported in token_level mode.")
+                raise ValueError(f"Speed adjustment is not supported in {self.streaming_mode} mode.")
             self.speed = 1.0
         if self.stream_audio:
             if self.response_format != "pcm":
