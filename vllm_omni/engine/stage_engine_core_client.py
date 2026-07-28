@@ -412,35 +412,6 @@ class StageEngineCoreClientBase(StageClientBase):
             raise ValueError(f"engine_input_source empty for stage {self.stage_id}")
         return _default_process_engine_inputs(source_outputs, prompt, self.requires_multimodal_data)
 
-    async def call_request_utility_async(self, request_id: str, method: str, *args: Any) -> Any:
-        """Call an engine-core utility on the DP engine owning a request."""
-        requests_in_flight = getattr(self, "reqs_in_flight", None)
-        if requests_in_flight is None:
-            return await self.call_utility_async(method, *args)
-        engine = requests_in_flight.get(request_id)
-        call_utility = getattr(self, "_call_utility_async", None)
-        if engine is None or not callable(call_utility):
-            return False
-        return await call_utility(method, *args, engine=engine)
-
-    async def collective_rpc_for_request_async(
-        self,
-        request_id: str,
-        method: str,
-        timeout: float | None = None,
-        args: tuple[Any, ...] = (),
-        kwargs: dict[str, Any] | None = None,
-    ) -> Any:
-        """Run a worker collective on the DP engine owning a request."""
-        return await self.call_request_utility_async(
-            request_id,
-            "collective_rpc",
-            method,
-            timeout,
-            args,
-            kwargs,
-        )
-
     async def collective_rpc_async(
         self,
         method: str,

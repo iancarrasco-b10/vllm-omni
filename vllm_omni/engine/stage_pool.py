@@ -1188,32 +1188,6 @@ class StagePool:
         if all_aborted and self._output_processor is not None:
             self._output_processor.abort_requests(all_aborted, internal=True)
 
-    async def resume_streaming_text_request(self, request_id: str, update_id: str) -> bool:
-        """Wake a request paused by streaming-text starvation."""
-        replica_id = self.get_bound_replica_id(request_id)
-        if replica_id is None:
-            return False
-        client = self.clients[replica_id]
-        if client is None:
-            return False
-        try:
-            return bool(
-                await client.call_request_utility_async(
-                    request_id,
-                    "resume_streaming_text_request",
-                    request_id,
-                    update_id,
-                )
-            )
-        except Exception:
-            logger.exception(
-                "[StagePool] failed to resume streaming text request: stage=%s replica=%s req=%s",
-                self.stage_id,
-                replica_id,
-                request_id,
-            )
-            return False
-
     async def collective_rpc(
         self,
         replica_id: int,
@@ -1248,42 +1222,6 @@ class StagePool:
                 "supported": False,
                 "error": str(exc),
             }
-
-    async def collective_rpc_for_request(
-        self,
-        request_id: str,
-        method: str,
-        timeout: float | None = None,
-        args: tuple[Any, ...] = (),
-        kwargs: dict[str, Any] | None = None,
-    ) -> dict[str, Any] | Any:
-        """Dispatch a worker RPC to the DP engine owning a bound request."""
-        replica_id = self.get_bound_replica_id(request_id)
-        if replica_id is None:
-            return {"supported": False, "error": f"request {request_id} is not bound"}
-        client = self.clients[replica_id]
-        if client is None:
-            return {
-                "supported": False,
-                "error": f"stage {self.stage_id} replica {replica_id} is not attached",
-            }
-        try:
-            return await client.collective_rpc_for_request_async(
-                request_id=request_id,
-                method=method,
-                timeout=timeout,
-                args=args,
-                kwargs=dict(kwargs or {}),
-            )
-        except Exception as exc:
-            logger.exception(
-                "[StagePool] request collective_rpc failed: stage=%s replica=%s req=%s method=%s",
-                self.stage_id,
-                replica_id,
-                request_id,
-                method,
-            )
-            return {"supported": False, "error": str(exc)}
 
     def shutdown_replica(self, replica_id: int) -> None:
         """Shutdown one backend handle in this stage pool."""

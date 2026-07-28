@@ -836,12 +836,10 @@ class Qwen3TTSPromptEmbedsBuilder:
         tts_pad_embed: torch.Tensor,
         tts_eos_embed: torch.Tensor,
         non_streaming_mode: bool,
-        append_text_eos: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Port of the official ``Qwen3TTSForConditionalGeneration.generate_icl_prompt``."""
         text_embed = self._text_projection(self._text_embedding(torch.cat([ref_id, text_id], dim=-1)))
-        if append_text_eos:
-            text_embed = torch.cat([text_embed, tts_eos_embed], dim=1)
+        text_embed = torch.cat([text_embed, tts_eos_embed], dim=1)
 
         # codec embed (codec bos + codec) 1 T2 D
         residual_embeds = self._residual_code_embeddings()
@@ -880,6 +878,40 @@ class Qwen3TTSPromptEmbedsBuilder:
             return text_embed[:, :codec_lens] + codec_embed_sum, text_embed[:, codec_lens:]
         text_embed = torch.cat([text_embed] + [tts_pad_embed] * (codec_lens - text_lens), dim=1)
         return text_embed + codec_embed_sum, tts_pad_embed
+
+    def build_streaming_text_update(self, text: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build the one-row prefill and decode tail for a resumable text update."""
+        if not text:
+            raise ValueError("Qwen3-TTS streaming text updates cannot be empty.")
+
+        tokenizer = self.get_text_tokenizer()
+        device = self._device()
+        wrapped_ids = tokenizer(
+            build_assistant_text(text),
+            return_tensors="pt",
+            padding=False,
+        )["input_ids"].to(device=device)
+        text_ids = wrapped_ids[:, 3:-5]
+        if text_ids.numel() == 0:
+            raise ValueError("Qwen3-TTS streaming text update produced no text tokens.")
+
+        text_embed = self._text_projection(self._text_embedding(text_ids))
+        eos_id = torch.tensor(
+            [[self._config.tts_eos_token_id]],
+            device=device,
+            dtype=text_ids.dtype,
+        )
+        eos_embed = self._text_projection(self._text_embedding(eos_id))
+        codec_bos = self._codec_embed(
+            torch.tensor(
+                [[self._talker_config.codec_bos_id]],
+                device=device,
+                dtype=torch.long,
+            )
+        )
+        first_row = text_embed[:, :1] + codec_bos
+        trailing_text = torch.cat((text_embed[:, 1:], eos_embed), dim=1)
+        return first_row.squeeze(0), trailing_text.squeeze(0)
 
     # -------------------- main entry point --------------------
 
@@ -932,11 +964,6 @@ class Qwen3TTSPromptEmbedsBuilder:
             # - CustomVoice/VoiceDesign: non_streaming_mode=True
             # - Base: non_streaming_mode=False
             non_streaming_mode = task_type in ("CustomVoice", "VoiceDesign")
-        streaming_text_input_val = info_dict.get("streaming_text_input")
-        if isinstance(streaming_text_input_val, list):
-            streaming_text_input = bool(streaming_text_input_val[0]) if streaming_text_input_val else False
-        else:
-            streaming_text_input = bool(streaming_text_input_val)
 
         # Text ids for assistant template (always).
         tok = self.get_text_tokenizer()
@@ -1277,7 +1304,6 @@ class Qwen3TTSPromptEmbedsBuilder:
                     tts_pad_embed=tts_pad_embed,
                     tts_eos_embed=tts_eos_embed,
                     non_streaming_mode=non_streaming_mode,
-                    append_text_eos=not streaming_text_input,
                 )
                 talker_prompt = torch.cat([talker_prompt, icl_input_embed], dim=1)
             else:
@@ -1306,9 +1332,13 @@ class Qwen3TTSPromptEmbedsBuilder:
                 else:
                     first_text = text_projection(text_embedding(input_ids[:, 3:4])) + codec_input[:, -1:]
                     talker_prompt = torch.cat([talker_prompt, first_text], dim=1)
-                    trailing_text_hidden = text_projection(text_embedding(input_ids[:, 4:-5]))
-                    if not streaming_text_input:
-                        trailing_text_hidden = torch.cat((trailing_text_hidden, tts_eos_embed), dim=1)
+                    trailing_text_hidden = torch.cat(
+                        (
+                            text_projection(text_embedding(input_ids[:, 4:-5])),
+                            tts_eos_embed,
+                        ),
+                        dim=1,
+                    )
 
         elif task_type == "CustomVoice":
             _speaker_raw = info_dict.get("speaker") or [""]
@@ -1356,9 +1386,13 @@ class Qwen3TTSPromptEmbedsBuilder:
             else:
                 first_text = text_projection(text_embedding(input_ids[:, 3:4])) + codec_input[:, -1:]
                 talker_prompt = torch.cat([talker_prompt, first_text], dim=1)
-                trailing_text_hidden = text_projection(text_embedding(input_ids[:, 4:-5]))
-                if not streaming_text_input:
-                    trailing_text_hidden = torch.cat((trailing_text_hidden, tts_eos_embed), dim=1)
+                trailing_text_hidden = torch.cat(
+                    (
+                        text_projection(text_embedding(input_ids[:, 4:-5])),
+                        tts_eos_embed,
+                    ),
+                    dim=1,
+                )
 
         elif task_type == "VoiceDesign":
             # No known speaker identity; only codec tags + text.
@@ -1391,9 +1425,13 @@ class Qwen3TTSPromptEmbedsBuilder:
             else:
                 first_text = text_projection(text_embedding(input_ids[:, 3:4])) + codec_input[:, -1:]
                 talker_prompt = torch.cat([talker_prompt, first_text], dim=1)
-                trailing_text_hidden = text_projection(text_embedding(input_ids[:, 4:-5]))
-                if not streaming_text_input:
-                    trailing_text_hidden = torch.cat((trailing_text_hidden, tts_eos_embed), dim=1)
+                trailing_text_hidden = torch.cat(
+                    (
+                        text_projection(text_embedding(input_ids[:, 4:-5])),
+                        tts_eos_embed,
+                    ),
+                    dim=1,
+                )
         else:
             raise ValueError(f"Unsupported task_type={task_type}")
 

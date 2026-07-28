@@ -22,6 +22,7 @@ def _make_minimal_talker(
     tts_pad_embed: torch.Tensor | None = None,
     *,
     build_prompt_embeds=None,
+    build_streaming_text_update=None,
 ):
     """Construct a bare ``Qwen3TTSTalkerForConditionalGeneration`` for preprocess tests.
 
@@ -45,6 +46,9 @@ def _make_minimal_talker(
     model._embedding_dtype = torch.bfloat16
     model._prompt_builder = SimpleNamespace(
         build_prompt_embeds=build_prompt_embeds if build_prompt_embeds is not None else _default_raise,
+        build_streaming_text_update=(
+            build_streaming_text_update if build_streaming_text_update is not None else _default_raise
+        ),
     )
     return model
 
@@ -100,26 +104,27 @@ def _make_minimal_builder(
     return builder
 
 
-def test_streaming_icl_prompt_does_not_append_text_eos():
+def test_streaming_text_update_builds_one_prefill_row_and_eos_tail():
     builder = _make_minimal_builder()
-    builder._text_embedding = lambda ids: ids.unsqueeze(-1).expand(*ids.shape, 4).to(torch.float32)
-    builder._residual_code_embeddings = lambda: [
-        lambda ids: torch.zeros((*ids.shape, 4), dtype=torch.float32, device=ids.device)
-    ]
-    kwargs = {
-        "text_id": torch.tensor([[3, 4]]),
-        "ref_id": torch.tensor([[1, 2]]),
-        "ref_code": torch.tensor([[5, 6]]),
-        "tts_pad_embed": torch.zeros((1, 1, 4)),
-        "tts_eos_embed": torch.full((1, 1, 4), 101.0),
-        "non_streaming_mode": False,
-    }
+    builder._device = lambda: torch.device("cpu")
+    builder._text_tokenizer = lambda *_args, **_kwargs: {"input_ids": torch.tensor([[1, 2, 3, 21, 22, 4, 5, 6, 7, 8]])}
+    builder._text_embedding = lambda ids: ids.to(torch.float32).unsqueeze(-1).expand(*ids.shape, 4)
+    builder._text_projection = lambda embeds: embeds
+    builder._codec_embed = lambda ids: ids.to(torch.float32).unsqueeze(-1).expand(*ids.shape, 4)
 
-    _, streaming_tail = builder._generate_icl_prompt(**kwargs, append_text_eos=False)
-    _, complete_tail = builder._generate_icl_prompt(**kwargs, append_text_eos=True)
+    first_row, trailing_text = builder.build_streaming_text_update("hello")
 
-    assert streaming_tail.shape[1] + 1 == complete_tail.shape[1]
-    assert torch.equal(complete_tail[:, -1:], kwargs["tts_eos_embed"])
+    assert first_row.shape == (1, 4)
+    assert torch.equal(first_row, torch.full((1, 4), 29.0))
+    assert torch.equal(
+        trailing_text,
+        torch.tensor(
+            [
+                [22.0, 22.0, 22.0, 22.0],
+                [101.0, 101.0, 101.0, 101.0],
+            ]
+        ),
+    )
 
 
 def test_single_token_prefill_uses_prefill_path():
@@ -178,6 +183,43 @@ def test_single_token_prefill_can_be_inferred_from_token_progress():
     assert out_ids.tolist() == [7]
     assert torch.equal(out_embeds.cpu(), full_prompt_embeds[:1].to(torch.bfloat16))
     assert update["meta"]["talker_prefill_offset"] == 1
+
+
+def test_resumable_text_update_bypasses_stale_prefill_embeddings():
+    continuation = torch.full((1, 4), 3.0, dtype=torch.float32)
+    trailing_text = torch.full((2, 4), 4.0, dtype=torch.float32)
+
+    def fake_build_streaming_text_update(text):
+        assert text == "next sentence"
+        return continuation, trailing_text
+
+    model = _make_minimal_talker(
+        build_streaming_text_update=fake_build_streaming_text_update,
+    )
+    stale_prefill = torch.full((8, 4), -1.0, dtype=torch.float32)
+    last_hidden = torch.full((4,), 2.0, dtype=torch.float32)
+
+    out_ids, out_embeds, update = model.preprocess(
+        input_ids=torch.tensor([123], dtype=torch.long),
+        input_embeds=None,
+        text=["next sentence"],
+        task_type=["CustomVoice"],
+        embed={"prefill": stale_prefill},
+        hidden_states={"last": last_hidden},
+        meta={
+            "qwen3_tts_streaming_update": True,
+            "talker_prefill_offset": 8,
+        },
+        _omni_is_prefill=True,
+    )
+
+    assert out_ids.tolist() == [7]
+    assert torch.equal(out_embeds, continuation.to(torch.bfloat16))
+    assert torch.equal(update["hidden_states"]["trailing_text"], trailing_text)
+    assert update["meta"]["qwen3_tts_streaming_update"] is False
+    assert update["meta"]["talker_text_offset"] == 0
+    assert update["codes"]["audio"].shape == (1, 16)
+    assert not update["codes"]["audio"].any()
 
 
 def test_decode_advances_trailing_text_by_offset_without_rewriting_tail():
@@ -306,39 +348,6 @@ def test_decode_replay_span_embeds_all_tokens_without_mutating_decode_state():
         torch.tensor([[101.0] * 4, [202.0] * 4, [303.0] * 4], dtype=torch.bfloat16),
     )
     assert update == {"meta": {"codec_streaming": True}}
-
-
-def test_streaming_text_starvation_pauses_before_decode():
-    model = _make_minimal_talker()
-
-    out_ids, out_embeds, update = model.preprocess(
-        input_ids=torch.tensor([123], dtype=torch.long),
-        input_embeds=None,
-        text=["hello"],
-        task_type=["CustomVoice"],
-        hidden_states={
-            "trailing_text": torch.empty((0, 4), dtype=torch.bfloat16),
-            "last": torch.ones((4,), dtype=torch.bfloat16),
-        },
-        meta={"streaming_text_input": True, "talker_text_offset": 0},
-        streaming_text_finished=False,
-        _omni_is_prefill=False,
-        _omni_num_computed_tokens=2,
-        _omni_prompt_len=2,
-    )
-
-    assert out_ids.tolist() == [123]
-    assert out_embeds is None
-    assert update["meta"]["streaming_wait_for_input"] is True
-    assert update["streaming_text_new_text"] is None
-
-
-def test_streaming_text_requests_bypass_decode_batch_fast_path():
-    model = _make_minimal_talker()
-
-    assert model.can_preprocess_decode_batch({"meta": {"streaming_text_input": False}})
-    assert not model.can_preprocess_decode_batch({"meta": {"streaming_text_input": True}})
-    assert not model.can_preprocess_decode_batch({"additional_information": {"meta": {"streaming_text_input": True}}})
 
 
 def test_decode_batch_preprocess_matches_decode_state_updates():

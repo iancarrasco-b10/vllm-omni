@@ -4,13 +4,10 @@
 
 Demonstrates ``streaming_mode="token_level"`` over the WebSocket speech
 endpoint ``/v1/audio/speech/stream``: a single TTS request is started from an
-initial text buffer and extended with later ``input.text`` chunks via
-engine-level streaming, so audio for the start of an utterance begins before
-the rest of the text has been sent (e.g. while an upstream LLM is still
-producing tokens), without rebuilding the request.
-
-Server must be launched with ``streaming_text_enabled: true`` in the deploy
-YAML (``vllm_omni/deploy/qwen3_tts.yaml`` ships with it on).
+initial text fragment and extended with later ``input.text`` chunks through
+the engine's native resumable-input path. Audio for the start of an utterance
+can begin before the rest of the text has been sent (e.g. while an upstream
+LLM is still producing tokens), without rebuilding the request.
 
 Usage:
     python token_level_streaming_client.py \

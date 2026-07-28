@@ -191,45 +191,6 @@ def test_duplex_control_client_uses_engine_owned_correlated_transport():
         engine._correlated_rpc_client.close()
 
 
-def test_confirmed_streaming_text_uses_correlated_transport(mocker: MockerFixture):
-    request_q = queue.Queue()
-    rpc_q = queue.Queue()
-    engine = object.__new__(AsyncOmniEngine)
-    engine.request_queue = SimpleNamespace(sync_q=request_q)
-    engine._correlated_rpc_client = CorrelatedRpcClient(request_q, rpc_q)
-    mocker.patch(
-        "vllm_omni.engine.async_omni_engine.uuid.uuid4",
-        side_effect=[
-            SimpleNamespace(hex="stream-rpc"),
-            SimpleNamespace(hex="stream-update"),
-        ],
-    )
-
-    try:
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            pending = executor.submit(
-                engine.extend_streaming_text_confirmed,
-                "request-1",
-                new_text="hello",
-                finished=False,
-                timeout=1,
-            )
-            msg = request_q.get(timeout=1)
-            assert msg.rpc_id == "stream-rpc"
-            assert msg.update_id == "stream-update"
-            rpc_q.put(
-                CollectiveRPCResultMessage(
-                    rpc_id="stream-rpc",
-                    method="streaming_text_extend",
-                    stage_ids=[0],
-                    results=[True],
-                )
-            )
-            assert pending.result(timeout=1) is True
-    finally:
-        engine._correlated_rpc_client.close()
-
-
 def test_duplex_control_api_requires_explicit_fence():
     engine = object.__new__(AsyncOmniEngine)
 

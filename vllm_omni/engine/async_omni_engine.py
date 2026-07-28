@@ -57,7 +57,6 @@ from vllm_omni.engine.messages import (
     ErrorMessage,
     InteractionMessage,
     StageSubmissionMessage,
-    StreamingTextExtendMessage,
 )
 from vllm_omni.engine.orchestrator import Orchestrator
 from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
@@ -1359,71 +1358,6 @@ class AsyncOmniEngine:
             data_parallel_rank=data_parallel_rank,
             reasoning_ended=reasoning_ended,
             resumable=resumable,
-        )
-
-    def extend_streaming_text(self, request_id: str, *, new_text: str, finished: bool) -> None:
-        if self.request_queue is None:
-            raise RuntimeError("request_queue is not initialized")
-        self.request_queue.sync_q.put_nowait(
-            StreamingTextExtendMessage(
-                request_id=request_id,
-                new_text=new_text,
-                finished=finished,
-                update_id=uuid.uuid4().hex,
-            )
-        )
-
-    def extend_streaming_text_confirmed(
-        self,
-        request_id: str,
-        *,
-        new_text: str,
-        finished: bool,
-        timeout: float = 10.0,
-    ) -> bool:
-        """Extend streaming text and wait for orchestrator/worker acceptance."""
-        transport = self._correlated_rpc_client
-        if transport is None:
-            raise RuntimeError("correlated RPC client is not initialized")
-        rpc_id = uuid.uuid4().hex
-        msg = StreamingTextExtendMessage(
-            request_id=request_id,
-            new_text=new_text,
-            finished=finished,
-            rpc_id=rpc_id,
-            update_id=uuid.uuid4().hex,
-        )
-        result_msg = transport.execute(
-            ("collective", rpc_id),
-            msg,
-            timeout=timeout,
-            timeout_message=f"streaming_text_extend timed out after {timeout} seconds",
-        )
-        if not isinstance(result_msg, CollectiveRPCResultMessage):
-            raise RuntimeError(
-                "streaming_text_extend received unexpected response "
-                f"{getattr(result_msg, 'type', type(result_msg).__name__)}"
-            )
-        return bool(result_msg.results and result_msg.results[0])
-
-    async def extend_streaming_text_confirmed_async(
-        self,
-        request_id: str,
-        *,
-        new_text: str,
-        finished: bool,
-        timeout: float = 10.0,
-    ) -> bool:
-        """Async wrapper for a confirmed streaming text extension."""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None,
-            lambda: self.extend_streaming_text_confirmed(
-                request_id,
-                new_text=new_text,
-                finished=finished,
-                timeout=timeout,
-            ),
         )
 
     def add_streaming_update(

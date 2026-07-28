@@ -25,21 +25,6 @@ from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-class _RequestQueue:
-    def __init__(self) -> None:
-        self.requests: list[Request] = []
-
-    def __contains__(self, request: Request) -> bool:
-        return request in self.requests
-
-    def add_request(self, request: Request) -> None:
-        self.requests.append(request)
-
-    def remove_requests(self, requests) -> None:
-        for request in requests:
-            self.requests.remove(request)
-
-
 def _make_scheduler(*, stage_id: int = 0) -> OmniARScheduler:
     sched = OmniARScheduler.__new__(OmniARScheduler)
     sched._new_prompt_len_snapshot = {}
@@ -47,10 +32,7 @@ def _make_scheduler(*, stage_id: int = 0) -> OmniARScheduler:
     sched.num_waiting_for_streaming_input = 0
     sched.log_stats = False
     sched.chunk_transfer_adapter = None
-    sched.requests = {}
-    sched.waiting = _RequestQueue()
-    sched.skipped_waiting = _RequestQueue()
-    sched.prev_step_scheduled_req_ids = set()
+    sched.skipped_waiting = set()
     return sched
 
 
@@ -286,46 +268,3 @@ def test_explicit_streaming_payload_replaces_placeholder_prompt() -> None:
     assert session.prompt_token_ids == [10, 20]
     assert session.additional_information == update.additional_information
     assert session.status == RequestStatus.WAITING
-
-
-def test_streaming_text_starvation_pauses_and_resumes_without_resetting_request() -> None:
-    sched = _make_scheduler()
-    request = _make_request()
-    request.status = RequestStatus.RUNNING
-    request.num_computed_tokens = 5
-    sched.requests[request.request_id] = request
-    sched.prev_step_scheduled_req_ids.add(request.request_id)
-
-    assert sched._pause_streaming_text_input(request) is True
-    assert request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
-    assert request in sched.skipped_waiting
-    assert sched.num_waiting_for_streaming_input == 1
-    assert request.num_computed_tokens == 5
-    assert request.request_id not in sched.prev_step_scheduled_req_ids
-
-    assert sched.resume_streaming_text_input(request.request_id, "commit-1") is True
-    assert request.status == RequestStatus.PREEMPTED
-    assert request not in sched.skipped_waiting
-    assert request in sched.waiting
-    assert sched.num_waiting_for_streaming_input == 0
-    assert request.num_computed_tokens == 5
-
-
-def test_streaming_text_wake_supersedes_stale_async_starvation() -> None:
-    sched = _make_scheduler()
-    request = _make_request()
-    request.status = RequestStatus.RUNNING
-    sched.requests[request.request_id] = request
-
-    assert sched.resume_streaming_text_input(request.request_id, "commit-2") is True
-
-    assert sched._is_stale_streaming_text_starvation(
-        request.request_id,
-        "commit-1",
-        sched._streaming_text_wake_epochs,
-    )
-    assert not sched._is_stale_streaming_text_starvation(
-        request.request_id,
-        "commit-2",
-        sched._streaming_text_wake_epochs,
-    )

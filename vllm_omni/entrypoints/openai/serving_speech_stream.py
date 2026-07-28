@@ -1,19 +1,16 @@
 """WebSocket handler for streaming text input TTS.
 
-Accepts text incrementally via WebSocket and supports buffered generation,
-token-level extension, or explicit sentence commits to one persistent TTS
-request.
+Accepts buffered or resumable text input. Resumable modes feed fragments
+through the engine's native streaming-input path so one request retains state.
 
 Protocol:
     Client -> Server:
         {"type": "session.config", ...}   # Session config (sent once first)
         {"type": "input.text", "text": "..."} # Text chunks
-        {"type": "input.commit", "commit_id": "..."} # Commit buffered text
         {"type": "input.done"}            # End of input
 
     Server -> Client (default, word_timestamps=false):
         {"type": "audio.start", "sentence_index": 0, "sentence_text": "...", "format": "wav"}
-        {"type": "input.committed", "commit_id": "...", "sentence_index": 0}
         <binary frame: audio bytes>
         ...
         {"type": "audio.done", "sentence_index": 0}
@@ -33,6 +30,7 @@ Protocol:
 import asyncio
 import base64
 import json
+from collections.abc import AsyncGenerator
 from contextlib import aclosing
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -57,15 +55,14 @@ _PCM_SAMPLE_RATE = 24000
 _BYTES_PER_SAMPLE = 2  # 16-bit mono PCM
 _MAX_CONFIG_MESSAGE_SIZE = 4 * 1024 * 1024  # allow large ref_audio payloads
 _MAX_INPUT_TEXT_MESSAGE_SIZE = 128 * 1024
-_MAX_BUFFER_SIZE = 100_000  # max accumulated text chars for token-level mode
+_MAX_BUFFER_SIZE = 100_000
 
 
 class OmniStreamingSpeechHandler:
     """Handles WebSocket sessions for streaming text-input TTS.
 
-    Each WebSocket connection is an independent session. Text arrives
-    incrementally, is buffered until input.done, and audio is generated once
-    for the buffered input using the existing OmniOpenAIServingSpeech pipeline.
+    A connection may carry multiple sequential sessions. Each session starts
+    with ``session.config`` and ends with ``session.done``.
 
     Args:
         speech_service: The existing TTS serving instance (reused for
@@ -85,117 +82,55 @@ class OmniStreamingSpeechHandler:
         self._config_timeout = config_timeout
 
     async def handle_session(self, websocket: WebSocket) -> None:
-        """Main session loop for a single WebSocket connection."""
+        """Serve sequential speech sessions on one WebSocket connection."""
         await websocket.accept()
+        first_session = True
 
-        try:
-            # 1. Wait for session.config
-            config = await self._receive_config(websocket)
-            if config is None:
-                return  # Error already sent, connection closing
-
-            # Validate model if specified
-            if config.model and hasattr(self._speech_service, "_check_model"):
-                error = await self._speech_service._check_model(
-                    OpenAICreateSpeechRequest(input="ping", model=config.model)
+        while True:
+            try:
+                config = await self._receive_config(
+                    websocket,
+                    timeout=self._config_timeout if first_session else None,
                 )
-                if error is not None:
-                    await self._send_error(websocket, str(error))
+                if config is None:
                     return
+                first_session = False
 
-            # Single-request streaming modes require engine-level text updates.
-            if config.streaming_mode in ("token_level", "sentence_commit"):
-                server_enabled = getattr(
-                    self._speech_service.engine_client.model_config,
-                    "streaming_text_enabled",
-                    False,
-                )
-                if not server_enabled:
-                    await self._send_error(
-                        websocket,
-                        f"{config.streaming_mode} streaming is disabled on this server "
-                        "(set streaming_text_enabled: true in stage config to enable)",
+                if config.model and hasattr(self._speech_service, "_check_model"):
+                    error = await self._speech_service._check_model(
+                        OpenAICreateSpeechRequest(input="ping", model=config.model)
                     )
-                    return
-                if config.streaming_mode == "sentence_commit":
-                    await self._handle_sentence_commit_session(websocket, config)
+                    if error is not None:
+                        await self._send_error(websocket, str(error))
+                        return
+
+                if config.streaming_mode == "sentence":
+                    await self._handle_buffered_session(websocket, config)
                 else:
-                    await self._handle_token_level_session(websocket, config)
+                    await self._handle_resumable_session(websocket, config)
+            except WebSocketDisconnect:
+                logger.info("Streaming speech: client disconnected")
+                return
+            except Exception as e:
+                logger.exception("Streaming speech session error: %s", e)
+                try:
+                    await self._send_error(websocket, f"Internal error: {e}")
+                except Exception:
+                    logger.debug("Failed to send error to streaming speech client", exc_info=True)
                 return
 
-            text_parts: list[str] = []
-
-            # 2. Receive text chunks until input.done
-            while True:
-                try:
-                    raw = await asyncio.wait_for(
-                        websocket.receive_text(),
-                        timeout=self._idle_timeout,
-                    )
-                except asyncio.TimeoutError:
-                    await self._send_error(websocket, "Idle timeout: no message received")
-                    return
-
-                if len(raw) > _MAX_INPUT_TEXT_MESSAGE_SIZE:
-                    await self._send_error(websocket, "input.text message too large")
-                    continue
-
-                try:
-                    msg = json.loads(raw)
-                except json.JSONDecodeError:
-                    await self._send_error(websocket, "Invalid JSON message")
-                    continue
-
-                if not isinstance(msg, dict):
-                    await self._send_error(websocket, "WebSocket messages must be JSON objects")
-                    continue
-
-                msg_type = msg.get("type")
-
-                if msg_type == "input.text":
-                    text = msg.get("text", "")
-                    if not isinstance(text, str):
-                        await self._send_error(websocket, "input.text requires a string value")
-                        continue
-                    text_parts.append(text)
-
-                elif msg_type == "input.done":
-                    full_text = "".join(text_parts).strip()
-                    total_sentences = 0
-                    if full_text:
-                        await self._generate_and_send(websocket, config, full_text, 0)
-                        total_sentences = 1
-
-                    await websocket.send_json(
-                        {
-                            "type": "session.done",
-                            "total_sentences": total_sentences,
-                        }
-                    )
-                    return
-
-                else:
-                    await self._send_error(
-                        websocket,
-                        f"Unknown message type: {msg_type}",
-                    )
-
-        except WebSocketDisconnect:
-            logger.info("Streaming speech: client disconnected")
-        except Exception as e:
-            logger.exception("Streaming speech session error: %s", e)
-            try:
-                await self._send_error(websocket, f"Internal error: {e}")
-            except Exception:
-                logger.debug("Failed to send error to streaming speech client", exc_info=True)
-
-    async def _receive_config(self, websocket: WebSocket) -> StreamingSpeechSessionConfig | None:
+    async def _receive_config(
+        self,
+        websocket: WebSocket,
+        *,
+        timeout: float | None,
+    ) -> StreamingSpeechSessionConfig | None:
         """Wait for and validate the session.config message."""
         try:
-            raw = await asyncio.wait_for(
-                websocket.receive_text(),
-                timeout=self._config_timeout,
-            )
+            if timeout is None:
+                raw = await websocket.receive_text()
+            else:
+                raw = await asyncio.wait_for(websocket.receive_text(), timeout=timeout)
         except asyncio.TimeoutError:
             await self._send_error(websocket, "Timeout waiting for session.config")
             return None
@@ -229,66 +164,41 @@ class OmniStreamingSpeechHandler:
 
         return config
 
-    async def _handle_token_level_session(
+    async def _receive_input_message(self, websocket: WebSocket) -> dict:
+        try:
+            raw = await asyncio.wait_for(
+                websocket.receive_text(),
+                timeout=self._idle_timeout,
+            )
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError("Idle timeout: no message received") from exc
+
+        if len(raw) > _MAX_INPUT_TEXT_MESSAGE_SIZE:
+            await self._send_error(websocket, "input.text message too large")
+            return {}
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            await self._send_error(websocket, "Invalid JSON message")
+            return {}
+        if not isinstance(msg, dict):
+            await self._send_error(websocket, "WebSocket messages must be JSON objects")
+            return {}
+        return msg
+
+    def _build_resumable_request(
         self,
-        websocket: WebSocket,
         config: StreamingSpeechSessionConfig,
-    ) -> None:
-        """True engine-level streaming: text arrives incrementally, audio
-        generation starts immediately and runs concurrently.
-
-        1. Collect minimum text buffer (MIN_INITIAL_CHARS)
-        2. Submit initial TTS request to the engine (audio generation starts)
-        3. Concurrently: read text from WebSocket -> extend_text messages to orchestrator
-                         stream audio from engine -> send to WebSocket
-        4. On input.done -> send text_finished signal
-        """
-        response_format = config.response_format or "pcm"
-        all_text = ""
-        input_done = False
-
-        MIN_INITIAL_CHARS = 60
-        while len(all_text) < MIN_INITIAL_CHARS:
-            try:
-                raw = await asyncio.wait_for(
-                    websocket.receive_text(),
-                    timeout=self._idle_timeout,
-                )
-            except asyncio.TimeoutError:
-                await self._send_error(websocket, "Idle timeout")
-                return
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(msg, dict):
-                continue
-            msg_type = msg.get("type")
-            if msg_type == "input.text":
-                text = msg.get("text", "")
-                if not isinstance(text, str):
-                    await self._send_error(websocket, "input.text requires a string value")
-                    continue
-                all_text += text
-                if len(all_text) > _MAX_BUFFER_SIZE:
-                    await self._send_error(websocket, "input.text buffer exceeded limit")
-                    return
-            elif msg_type == "input.done":
-                input_done = True
-                break
-
-        if not all_text.strip():
-            await websocket.send_json({"type": "session.done", "total_sentences": 0})
-            return
-
-        initial_request = OpenAICreateSpeechRequest(
-            input=all_text,
+        text: str,
+    ) -> OpenAICreateSpeechRequest:
+        return OpenAICreateSpeechRequest(
+            input=text,
             model=config.model,
             voice=config.voice,
             task_type=config.task_type,
             language=config.language,
             instructions=config.instructions,
-            response_format=response_format,
+            response_format="pcm",
             speed=config.speed,
             max_new_tokens=config.max_new_tokens,
             initial_codec_chunk_frames=config.initial_codec_chunk_frames,
@@ -298,209 +208,16 @@ class OmniStreamingSpeechHandler:
             x_vector_only_mode=config.x_vector_only_mode,
             speaker_embedding=config.speaker_embedding,
             stream=True,
-            streaming_text_input=True,
-            streaming_drain_max_steps=config.streaming_drain_max_steps,
-        )
-        request_id, generator, _ = await self._speech_service._prepare_speech_generation(
-            initial_request,
         )
 
-        start_payload: dict = {
-            "type": "audio.start",
-            "sentence_index": 0,
-            "sentence_text": all_text[:80] + ("..." if len(all_text) > 80 else ""),
-            "format": response_format,
-        }
-        if response_format == "pcm":
-            start_payload["sample_rate"] = _PCM_SAMPLE_RATE
-        await websocket.send_json(start_payload)
-
-        total_bytes = 0
-        generation_failed = False
-
-        _extend_count = 0
-        _extend_chars_total = 0
-
-        finished_sent = False
-        input_error: str | None = None
-
-        def _send_extend(new_text: str, finished: bool) -> None:
-            nonlocal _extend_count, _extend_chars_total
-            _extend_count += 1
-            _extend_chars_total += len(new_text) if new_text else 0
-            logger.info(
-                "[WS][extend] req=%s chunk#%d text_len=%d finished=%s cumulative_chars=%d",
-                request_id,
-                _extend_count,
-                len(new_text) if new_text else 0,
-                finished,
-                _extend_chars_total,
-            )
-            self._speech_service.engine_client.extend_streaming_text(
-                request_id,
-                new_text=new_text,
-                finished=finished,
-            )
-
-        def _finish_text() -> None:
-            nonlocal finished_sent
-            if not finished_sent:
-                finished_sent = True
-                _send_extend("", finished=True)
-
-        async def feed_text() -> None:
-            nonlocal all_text, input_error
-            if input_done:
-                _finish_text()
-                return
-            try:
-                text_chars_total = len(all_text)
-                while True:
-                    try:
-                        raw = await asyncio.wait_for(
-                            websocket.receive_text(),
-                            timeout=self._idle_timeout,
-                        )
-                    except asyncio.TimeoutError:
-                        break
-                    if len(raw) > _MAX_INPUT_TEXT_MESSAGE_SIZE:
-                        input_error = "input.text message too large"
-                        break
-                    try:
-                        msg = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(msg, dict):
-                        continue
-                    msg_type = msg.get("type")
-                    if msg_type == "input.text":
-                        new_text = msg.get("text", "")
-                        if not isinstance(new_text, str):
-                            input_error = "input.text requires a string value"
-                            break
-                        if not new_text:
-                            continue
-                        text_chars_total += len(new_text)
-                        if text_chars_total > _MAX_BUFFER_SIZE:
-                            input_error = "input.text buffer exceeded limit"
-                            break
-                        _send_extend(new_text, finished=False)
-                    elif msg_type == "input.done":
-                        break
-            except WebSocketDisconnect:
-                raise
-            except Exception:
-                logger.debug("feed_text error", exc_info=True)
-                input_error = "input.text streaming failed"
-            if input_error is None:
-                _finish_text()
-
-        text_task = asyncio.create_task(feed_text())
-
-        try:
-            async with aclosing(self._speech_service._generate_pcm_chunks(generator, request_id)) as stream:
-                async for chunk in stream:
-                    total_bytes += len(chunk)
-                    await websocket.send_bytes(chunk)
-            if not text_task.done():
-                text_task.cancel()
-                try:
-                    await text_task
-                except asyncio.CancelledError:
-                    pass
-            if input_error is None:
-                _finish_text()
-        except WebSocketDisconnect:
-            text_task.cancel()
-            try:
-                await self._speech_service.engine_client.abort(request_id)
-            except Exception:
-                pass
-            raise
-        except Exception as e:
-            generation_failed = True
-            logger.error("Token-level generation failed: %s", e)
-            await self._send_error(websocket, f"Generation failed: {e}")
-        finally:
-            if not text_task.done():
-                text_task.cancel()
-                try:
-                    await text_task
-                except asyncio.CancelledError:
-                    pass
-                except WebSocketDisconnect:
-                    pass
-            if input_error is not None:
-                generation_failed = True
-                try:
-                    await self._speech_service.engine_client.abort(request_id)
-                except Exception:
-                    pass
-                await self._send_error(websocket, input_error)
-            try:
-                await websocket.send_json(
-                    {
-                        "type": "audio.done",
-                        "sentence_index": 0,
-                        "total_bytes": total_bytes,
-                        "error": generation_failed,
-                    }
-                )
-                await websocket.send_json(
-                    {
-                        "type": "session.done",
-                        "total_sentences": 1,
-                    }
-                )
-            except Exception:
-                pass
-
-    async def _handle_sentence_commit_session(
+    async def _iter_token_level_requests(
         self,
         websocket: WebSocket,
         config: StreamingSpeechSessionConfig,
-    ) -> None:
-        """Stream committed sentences through one persistent TTS request.
-
-        ``input.text`` messages are buffered until ``input.commit``. The first
-        commit creates the request; later commits extend it without resetting
-        model state. Only ``input.done`` marks the engine request as finished.
-        """
-        response_format = config.response_format or "pcm"
-        pending_parts: list[str] = []
-        total_input_chars = 0
-        sentence_count = 0
-        input_done = False
-        first_commit: StreamingSpeechInputCommit | None = None
-        first_text = ""
-
-        async def receive_message() -> dict | None:
-            try:
-                raw = await asyncio.wait_for(
-                    websocket.receive_text(),
-                    timeout=self._idle_timeout,
-                )
-            except asyncio.TimeoutError:
-                await self._send_error(websocket, "Idle timeout")
-                return None
-            if len(raw) > _MAX_INPUT_TEXT_MESSAGE_SIZE:
-                await self._send_error(websocket, "input.text message too large")
-                return {}
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                await self._send_error(websocket, "Invalid JSON message")
-                return {}
-            if not isinstance(msg, dict):
-                await self._send_error(websocket, "WebSocket messages must be JSON objects")
-                return {}
-            return msg
-
-        # Wait for the first commit before creating the engine request.
-        while first_commit is None and not input_done:
-            msg = await receive_message()
-            if msg is None:
-                return
+    ) -> AsyncGenerator[OpenAICreateSpeechRequest, None]:
+        total_chars = 0
+        while True:
+            msg = await self._receive_input_message(websocket)
             if not msg:
                 continue
             msg_type = msg.get("type")
@@ -509,276 +226,180 @@ class OmniStreamingSpeechHandler:
                 if not isinstance(text, str):
                     await self._send_error(websocket, "input.text requires a string value")
                     continue
-                total_input_chars += len(text)
-                if total_input_chars > _MAX_BUFFER_SIZE:
-                    await self._send_error(websocket, "input.text buffer exceeded limit")
-                    return
-                pending_parts.append(text)
-            elif msg_type in ("input.commit", "input.done"):
-                text = "".join(pending_parts)
-                if not text.strip():
-                    if msg_type == "input.done":
-                        await websocket.send_json({"type": "session.done", "total_sentences": 0})
-                        return
-                    await self._send_error(websocket, "input.commit requires buffered text")
+                if not text:
                     continue
-                if msg_type == "input.commit":
-                    try:
-                        first_commit = StreamingSpeechInputCommit.model_validate(msg)
-                    except ValidationError as e:
-                        await self._send_error(websocket, f"Invalid input.commit: {e}")
-                        continue
-                else:
-                    first_commit = StreamingSpeechInputCommit(type="input.commit")
-                    input_done = True
-                first_text = text
-                pending_parts.clear()
+                total_chars += len(text)
+                if total_chars > _MAX_BUFFER_SIZE:
+                    raise ValueError("input.text buffer exceeded limit")
+                yield self._build_resumable_request(config, text)
+            elif msg_type == "input.done":
+                return
             else:
                 await self._send_error(websocket, f"Unknown message type: {msg_type}")
 
-        if first_commit is None:
-            return
+    async def _iter_sentence_commit_requests(
+        self,
+        websocket: WebSocket,
+        config: StreamingSpeechSessionConfig,
+    ) -> AsyncGenerator[OpenAICreateSpeechRequest, None]:
+        pending_parts: list[str] = []
+        total_chars = 0
+        sentence_index = 0
+        while True:
+            msg = await self._receive_input_message(websocket)
+            if not msg:
+                continue
+            msg_type = msg.get("type")
+            if msg_type == "input.text":
+                text = msg.get("text", "")
+                if not isinstance(text, str):
+                    await self._send_error(websocket, "input.text requires a string value")
+                    continue
+                total_chars += len(text)
+                if total_chars > _MAX_BUFFER_SIZE:
+                    raise ValueError("input.text buffer exceeded limit")
+                pending_parts.append(text)
+                continue
+            if msg_type not in ("input.commit", "input.done"):
+                await self._send_error(websocket, f"Unknown message type: {msg_type}")
+                continue
 
-        initial_request = OpenAICreateSpeechRequest(
-            input=first_text,
-            model=config.model,
-            voice=config.voice,
-            task_type=config.task_type,
-            language=config.language,
-            instructions=config.instructions,
-            response_format=response_format,
-            speed=config.speed,
-            max_new_tokens=config.max_new_tokens,
-            initial_codec_chunk_frames=config.initial_codec_chunk_frames,
-            non_streaming_mode=False,
-            ref_audio=config.ref_audio,
-            ref_text=config.ref_text,
-            x_vector_only_mode=config.x_vector_only_mode,
-            speaker_embedding=config.speaker_embedding,
-            stream=True,
-            streaming_text_input=True,
-            streaming_drain_max_steps=config.streaming_drain_max_steps,
-        )
-        request_id, generator, _ = await self._speech_service._prepare_speech_generation(initial_request)
-
-        sentence_count = 1
-        start_payload: dict = {
-            "type": "audio.start",
-            "sentence_index": 0,
-            "sentence_text": first_text[:80] + ("..." if len(first_text) > 80 else ""),
-            "format": response_format,
-        }
-        if response_format == "pcm":
-            start_payload["sample_rate"] = _PCM_SAMPLE_RATE
-        await websocket.send_json(start_payload)
-
-        total_bytes = 0
-        generation_failed = False
-        finished_sent = False
-        input_error: str | None = None
-
-        async def send_extend(new_text: str, *, finished: bool) -> None:
-            accepted = await self._speech_service.engine_client.extend_streaming_text_confirmed_async(
-                request_id,
-                new_text=new_text,
-                finished=finished,
-            )
-            if not accepted:
-                raise RuntimeError("TTS engine rejected the streaming text update")
-
-        async def wait_for_engine_acceptance() -> None:
-            deadline = asyncio.get_running_loop().time() + 10.0
-            while True:
-                accepted = await self._speech_service.engine_client.extend_streaming_text_confirmed_async(
-                    request_id,
-                    new_text="",
-                    finished=False,
-                )
-                if accepted:
-                    return
-                if asyncio.get_running_loop().time() >= deadline:
-                    raise RuntimeError("TTS engine did not accept the initial request")
-                await asyncio.sleep(0.01)
-
-        async def finish_text() -> None:
-            nonlocal finished_sent
-            if not finished_sent:
-                await send_extend("", finished=True)
-                finished_sent = True
-
-        async def commit_pending(commit: StreamingSpeechInputCommit) -> bool:
-            nonlocal sentence_count
             text = "".join(pending_parts)
             if not text.strip():
+                if msg_type == "input.done":
+                    return
                 await self._send_error(websocket, "input.commit requires buffered text")
-                return False
+                continue
+
+            if msg_type == "input.commit":
+                try:
+                    commit = StreamingSpeechInputCommit.model_validate(msg)
+                except ValidationError as exc:
+                    await self._send_error(websocket, f"Invalid input.commit: {exc}")
+                    continue
+            else:
+                commit = StreamingSpeechInputCommit(type="input.commit")
+
             pending_parts.clear()
-            await send_extend(text, finished=False)
+            yield self._build_resumable_request(config, text)
             await websocket.send_json(
                 StreamingSpeechInputCommitted(
                     commit_id=commit.commit_id,
-                    sentence_index=sentence_count,
+                    sentence_index=sentence_index,
                     chars_committed=len(text),
                 ).model_dump()
             )
-            sentence_count += 1
-            return True
-
-        async def feed_commits() -> None:
-            nonlocal input_done, input_error, total_input_chars
-            if input_done:
-                await finish_text()
+            sentence_index += 1
+            if msg_type == "input.done":
                 return
-            try:
-                while True:
-                    msg = await receive_message()
-                    if msg is None:
-                        input_error = "Idle timeout"
-                        break
-                    if not msg:
-                        continue
-                    msg_type = msg.get("type")
-                    if msg_type == "input.text":
-                        text = msg.get("text", "")
-                        if not isinstance(text, str):
-                            await self._send_error(websocket, "input.text requires a string value")
-                            continue
-                        total_input_chars += len(text)
-                        if total_input_chars > _MAX_BUFFER_SIZE:
-                            input_error = "input.text buffer exceeded limit"
-                            break
-                        pending_parts.append(text)
-                    elif msg_type == "input.commit":
-                        try:
-                            commit = StreamingSpeechInputCommit.model_validate(msg)
-                        except ValidationError as e:
-                            await self._send_error(websocket, f"Invalid input.commit: {e}")
-                            continue
-                        await commit_pending(commit)
-                    elif msg_type == "input.done":
-                        input_done = True
-                        if any(part.strip() for part in pending_parts):
-                            await commit_pending(StreamingSpeechInputCommit(type="input.commit"))
-                        await finish_text()
-                        break
-                    else:
-                        await self._send_error(websocket, f"Unknown message type: {msg_type}")
-            except WebSocketDisconnect:
-                raise
-            except Exception:
-                logger.debug("sentence commit feed error", exc_info=True)
-                input_error = "sentence commit streaming failed"
 
-        engine_accepted = asyncio.Event()
-
-        async def stream_audio() -> None:
-            nonlocal total_bytes
-            async with aclosing(self._speech_service._generate_pcm_chunks(generator, request_id)) as stream:
-                async for chunk in stream:
-                    await engine_accepted.wait()
-                    total_bytes += len(chunk)
-                    await websocket.send_bytes(chunk)
-
-        audio_task = asyncio.create_task(stream_audio())
-        input_task: asyncio.Task | None = None
-        try:
-            # Start consuming the async generator first so its add_request message
-            # is enqueued before the acceptance probe.
-            await asyncio.sleep(0)
-            await wait_for_engine_acceptance()
-            await websocket.send_json(
-                StreamingSpeechInputCommitted(
-                    commit_id=first_commit.commit_id,
-                    sentence_index=0,
-                    chars_committed=len(first_text),
-                ).model_dump()
-            )
-            engine_accepted.set()
-
-            input_task = asyncio.create_task(feed_commits())
-            done, _ = await asyncio.wait(
-                {input_task, audio_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if input_task in done:
-                await input_task
-                if input_error is not None:
-                    try:
-                        await self._speech_service.engine_client.abort(request_id)
-                    finally:
-                        if not audio_task.done():
-                            audio_task.cancel()
-                    try:
-                        await audio_task
-                    except asyncio.CancelledError:
-                        pass
-                else:
-                    await audio_task
-            else:
-                await audio_task
-                if not input_task.done():
-                    input_error = "Generation ended before input.done"
-                    input_task.cancel()
-                    try:
-                        await input_task
-                    except asyncio.CancelledError:
-                        pass
-        except WebSocketDisconnect:
-            if input_task is not None and not input_task.done():
-                input_task.cancel()
-            if not audio_task.done():
-                audio_task.cancel()
-            try:
-                await self._speech_service.engine_client.abort(request_id)
-            except Exception:
-                pass
-            raise
-        except Exception as e:
-            generation_failed = True
-            logger.error("Sentence-commit generation failed: %s", e)
-            try:
-                await self._speech_service.engine_client.abort(request_id)
-            except Exception:
-                pass
-            await self._send_error(websocket, f"Generation failed: {e}")
-        finally:
-            if input_task is not None and not input_task.done():
-                input_task.cancel()
-            if input_task is not None:
-                try:
-                    await input_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            if not audio_task.done():
-                audio_task.cancel()
-            try:
-                await audio_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            if input_error is not None:
-                generation_failed = True
-                try:
-                    await self._speech_service.engine_client.abort(request_id)
-                except Exception:
-                    pass
-                await self._send_error(websocket, input_error)
-            try:
-                await websocket.send_json(
-                    {
-                        "type": "audio.done",
-                        "sentence_index": 0,
-                        "total_bytes": total_bytes,
-                        "error": generation_failed,
-                    }
-                )
+    async def _handle_buffered_session(
+        self,
+        websocket: WebSocket,
+        config: StreamingSpeechSessionConfig,
+    ) -> None:
+        text_parts: list[str] = []
+        while True:
+            msg = await self._receive_input_message(websocket)
+            if not msg:
+                continue
+            msg_type = msg.get("type")
+            if msg_type == "input.text":
+                text = msg.get("text", "")
+                if not isinstance(text, str):
+                    await self._send_error(websocket, "input.text requires a string value")
+                    continue
+                text_parts.append(text)
+            elif msg_type == "input.done":
+                full_text = "".join(text_parts).strip()
+                total_sentences = 0
+                if full_text:
+                    await self._generate_and_send(websocket, config, full_text, 0)
+                    total_sentences = 1
                 await websocket.send_json(
                     {
                         "type": "session.done",
-                        "total_sentences": sentence_count,
+                        "total_sentences": total_sentences,
                     }
                 )
+                return
+            else:
+                await self._send_error(websocket, f"Unknown message type: {msg_type}")
+
+    async def _handle_resumable_session(
+        self,
+        websocket: WebSocket,
+        config: StreamingSpeechSessionConfig,
+    ) -> None:
+        if config.streaming_mode == "sentence_commit":
+            requests = self._iter_sentence_commit_requests(websocket, config)
+        else:
+            requests = self._iter_token_level_requests(websocket, config)
+
+        try:
+            initial_request = await anext(requests)
+        except StopAsyncIteration:
+            await websocket.send_json({"type": "session.done", "total_sentences": 0})
+            return
+
+        segment_count = 1
+
+        async def remaining_requests() -> AsyncGenerator[OpenAICreateSpeechRequest, None]:
+            nonlocal segment_count
+            async for request in requests:
+                segment_count += 1
+                yield request
+
+        try:
+            request_id, generator, _ = await self._speech_service._prepare_resumable_speech_generation(
+                initial_request,
+                remaining_requests(),
+            )
+        except Exception:
+            await requests.aclose()
+            raise
+        await websocket.send_json(
+            {
+                "type": "audio.start",
+                "sentence_index": 0,
+                "sentence_text": initial_request.input[:80] + ("..." if len(initial_request.input) > 80 else ""),
+                "format": "pcm",
+                "sample_rate": _PCM_SAMPLE_RATE,
+            }
+        )
+
+        total_bytes = 0
+        generation_failed = False
+        try:
+            async with aclosing(self._speech_service._generate_pcm_chunks(generator, request_id)) as stream:
+                async for chunk in stream:
+                    total_bytes += len(chunk)
+                    await websocket.send_bytes(chunk)
+        except WebSocketDisconnect:
+            await self._speech_service.engine_client.abort(request_id)
+            raise
+        except Exception as exc:
+            generation_failed = True
+            logger.exception("Resumable speech generation failed: %s", exc)
+            try:
+                await self._speech_service.engine_client.abort(request_id)
             except Exception:
                 pass
+            await self._send_error(websocket, f"Generation failed: {exc}")
+        await websocket.send_json(
+            {
+                "type": "audio.done",
+                "sentence_index": 0,
+                "total_bytes": total_bytes,
+                "error": generation_failed,
+            }
+        )
+        await websocket.send_json(
+            {
+                "type": "session.done",
+                "total_sentences": segment_count,
+            }
+        )
 
     async def _generate_and_send(
         self,

@@ -58,13 +58,6 @@ class StageEngineCoreProc(EngineCoreProc):
         scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
         return scheduler_request, current_wave
 
-    def resume_streaming_text_request(self, request_id: str, update_id: str) -> bool:
-        """Wake a scheduler request paused for more streaming text."""
-        resume = getattr(self.scheduler, "resume_streaming_text_input", None)
-        if not callable(resume):
-            return False
-        return bool(resume(request_id, update_id))
-
     @staticmethod
     def run_stage_core(
         *args: Any,

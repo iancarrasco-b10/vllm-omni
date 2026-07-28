@@ -46,7 +46,6 @@ from vllm_omni.engine.messages import (
     ShutdownRequestMessage,
     StageMetricsMessage,
     StageSubmissionMessage,
-    StreamingTextExtendMessage,
     UnregisterRemoteReplicaMessage,
 )
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
@@ -573,8 +572,6 @@ class Orchestrator:
                 await self._handle_add_request(msg)
             elif msg_type == "streaming_update":
                 await self._handle_streaming_update(msg)
-            elif msg_type == "streaming_text_extend":
-                await self._handle_streaming_text_extend(msg)
             elif msg_type == "add_companion_request":
                 await self._handle_add_companion(msg)
             elif self.duplex_control_plane is not None and self.duplex_control_plane.accepts(msg):
@@ -1988,83 +1985,6 @@ class Orchestrator:
             request_id=req_id,
             tx_ms=_tx_ms,
         )
-
-    async def _handle_streaming_text_extend(self, msg: StreamingTextExtendMessage) -> None:
-        request_id = msg.request_id
-        new_text = msg.new_text
-        finished = msg.finished
-
-        async def acknowledge(accepted: bool) -> None:
-            if msg.rpc_id is None:
-                return
-            await self.rpc_async_queue.put(
-                CollectiveRPCResultMessage(
-                    rpc_id=msg.rpc_id,
-                    method="streaming_text_extend",
-                    stage_ids=[0],
-                    results=[accepted],
-                )
-            )
-
-        # The client extends by the base API request id (e.g. "speech-<uuid>"),
-        # but the orchestrator tracks requests (and the worker keys its model
-        # buffer) under a per-request global/stage id that appends a suffix
-        # ("speech-<uuid>-<hex>"). Resolve the tracked id so the update lands on
-        # the right request instead of being silently dropped.
-        if request_id not in self.request_states:
-            prefix = request_id + "-"
-            resolved = next((k for k in self.request_states if k.startswith(prefix)), None)
-            if resolved is None:
-                await acknowledge(False)
-                return
-            request_id = resolved
-
-        state_update: dict[str, Any] = {}
-        if new_text:
-            state_update["streaming_text_new_text"] = new_text
-        if finished:
-            state_update["streaming_text_finished"] = True
-        update_id = msg.update_id or msg.rpc_id or str(_time.monotonic_ns())
-        if state_update:
-            state_update["streaming_text_epoch"] = update_id
-
-        try:
-            pool = self.stage_pools[0]
-            replica_id = pool.get_bound_replica_id(request_id)
-            if replica_id is None:
-                await acknowledge(False)
-                return
-            rpc_result = await pool.collective_rpc_for_request(
-                request_id,
-                "update_model_state",
-                args=(request_id, state_update),
-            )
-            if isinstance(rpc_result, dict) and rpc_result.get("supported") is False:
-                await acknowledge(False)
-                return
-            if isinstance(rpc_result, list):
-                accepted = bool(rpc_result) and all(result is not False for result in rpc_result)
-            else:
-                accepted = rpc_result is not False
-            if not accepted:
-                await acknowledge(False)
-                return
-            if not state_update:
-                await acknowledge(True)
-                return
-            if not await pool.resume_streaming_text_request(request_id, update_id):
-                await acknowledge(False)
-                return
-            logger.info(
-                "[Orchestrator] streaming_text_extend OK req=%s text_len=%d finished=%s",
-                request_id,
-                len(new_text) if new_text else 0,
-                finished,
-            )
-            await acknowledge(True)
-        except Exception as exc:
-            logger.warning("[Orchestrator] streaming_text_extend failed for req=%s: %s", request_id, exc)
-            await acknowledge(False)
 
     async def _prewarm_async_chunk_stages(
         self,

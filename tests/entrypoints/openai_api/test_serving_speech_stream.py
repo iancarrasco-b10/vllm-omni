@@ -1,6 +1,5 @@
 import asyncio
 import base64
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +9,7 @@ from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from vllm_omni.entrypoints.openai import serving_speech_stream as streaming_speech_module
+from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.utils.forced_aligner import WordTimestamp
@@ -53,6 +53,83 @@ def _build_test_app(
     return app, speech_service
 
 
+def _build_resumable_test_app(mocker: MockerFixture, captured_text: list[str]):
+    speech_service = mocker.MagicMock(spec=OmniOpenAIServingSpeech)
+    speech_service.engine_client = SimpleNamespace(abort=mocker.AsyncMock())
+    speech_service.forced_aligner_config = None
+
+    async def prepare(initial_request, remaining_requests):
+        async def requests():
+            yield initial_request
+            async for request in remaining_requests:
+                yield request
+
+        return "req-resumable", requests(), {}
+
+    async def chunks(generator, _request_id, *, include_sample_rate=False):
+        async for request in generator:
+            captured_text.append(request.input)
+            chunk = request.input.encode()
+            yield (chunk, 24000) if include_sample_rate else chunk
+
+    speech_service._prepare_resumable_speech_generation = prepare
+    speech_service._generate_pcm_chunks = chunks
+    return _build_test_app(speech_service)
+
+
+@pytest.mark.asyncio
+async def test_resumable_preparation_uses_sparse_native_updates(mocker: MockerFixture):
+    service = object.__new__(OmniOpenAIServingSpeech)
+    captured: dict = {}
+
+    def generate(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    service.engine_client = SimpleNamespace(
+        errored=False,
+        default_sampling_params_list=[object()],
+        generate=generate,
+    )
+    service._tts_model_type = "qwen3_tts"
+    prepared = SimpleNamespace(
+        prompt={"prompt_token_ids": [1, 2, 3]},
+        tts_params={"task_type": ["CustomVoice"]},
+        warmup_artifact_key=None,
+    )
+    adapter = SimpleNamespace(
+        validate=lambda _request: None,
+        build=mocker.AsyncMock(return_value=prepared),
+    )
+    service._get_tts_adapter = lambda: adapter
+    service._track_ref_audio_artifact_warmup = lambda *_args, **_kwargs: None
+    service._tts_x_vector_only = lambda _params: False
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_speech.coerce_param_message_types",
+        side_effect=lambda params, _streaming: params,
+    )
+
+    async def updates():
+        yield OpenAICreateSpeechRequest(input="second", voice="Vivian")
+
+    await service._prepare_resumable_speech_generation(
+        OpenAICreateSpeechRequest(input="first", voice="Vivian"),
+        updates(),
+        request_id="req-1",
+    )
+    prompt_stream = captured["prompt"]
+    first = await anext(prompt_stream)
+    second = await anext(prompt_stream)
+
+    assert first.prompt == prepared.prompt
+    assert second.prompt["prompt_token_ids"] == [1]
+    assert second.prompt["additional_information"] == {
+        "text": ["second"],
+        "meta": {"qwen3_tts_streaming_update": True},
+    }
+    assert adapter.build.await_count == 1
+
+
 class TestStreamingSpeechWebSocket:
     def test_non_streaming_single_frame(self, mocker: MockerFixture):
         app, speech_service = _build_test_app(mocker=mocker)
@@ -79,6 +156,103 @@ class TestStreamingSpeechWebSocket:
                 assert session_done == {"type": "session.done", "total_sentences": 1}
 
         assert speech_service._generate_audio_bytes.await_count == 1
+
+    def test_connection_reuse_accepts_second_session(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                for text in ("First session.", "Second session."):
+                    ws.send_json({"type": "session.config", "voice": "Vivian"})
+                    ws.send_json({"type": "input.text", "text": text})
+                    ws.send_json({"type": "input.done"})
+
+                    assert ws.receive_json()["type"] == "audio.start"
+                    assert ws.receive_bytes().startswith(b"RIFF")
+                    assert ws.receive_json()["type"] == "audio.done"
+                    assert ws.receive_json() == {
+                        "type": "session.done",
+                        "total_sentences": 1,
+                    }
+
+        assert speech_service._generate_audio_bytes.await_count == 2
+
+    def test_token_level_uses_native_resumable_input(self, mocker: MockerFixture):
+        captured_text: list[str] = []
+        app, _ = _build_resumable_test_app(mocker, captured_text)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "voice": "Vivian",
+                        "streaming_mode": "token_level",
+                        "response_format": "pcm",
+                    }
+                )
+                ws.send_json({"type": "input.text", "text": "Hello "})
+                ws.send_json({"type": "input.text", "text": "world."})
+                ws.send_json({"type": "input.done"})
+
+                assert ws.receive_json()["type"] == "audio.start"
+                assert ws.receive_bytes() == b"Hello "
+                assert ws.receive_bytes() == b"world."
+                assert ws.receive_json() == {
+                    "type": "audio.done",
+                    "sentence_index": 0,
+                    "total_bytes": 12,
+                    "error": False,
+                }
+                assert ws.receive_json() == {
+                    "type": "session.done",
+                    "total_sentences": 2,
+                }
+
+        assert captured_text == ["Hello ", "world."]
+
+    def test_sentence_commits_use_native_resumable_input(self, mocker: MockerFixture):
+        captured_text: list[str] = []
+        app, _ = _build_resumable_test_app(mocker, captured_text)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "voice": "Vivian",
+                        "streaming_mode": "sentence_commit",
+                        "response_format": "pcm",
+                    }
+                )
+                ws.send_json({"type": "input.text", "text": "First sentence."})
+                ws.send_json({"type": "input.commit", "commit_id": "first"})
+                ws.send_json({"type": "input.text", "text": " Second sentence."})
+                ws.send_json({"type": "input.commit", "commit_id": "second"})
+                ws.send_json({"type": "input.done"})
+
+                assert ws.receive_json()["type"] == "audio.start"
+                assert ws.receive_bytes() == b"First sentence."
+                assert ws.receive_json() == {
+                    "type": "input.committed",
+                    "commit_id": "first",
+                    "sentence_index": 0,
+                    "chars_committed": 15,
+                }
+                assert ws.receive_bytes() == b" Second sentence."
+                assert ws.receive_json() == {
+                    "type": "input.committed",
+                    "commit_id": "second",
+                    "sentence_index": 1,
+                    "chars_committed": 17,
+                }
+                assert ws.receive_json()["type"] == "audio.done"
+                assert ws.receive_json() == {
+                    "type": "session.done",
+                    "total_sentences": 2,
+                }
+
+        assert captured_text == ["First sentence.", " Second sentence."]
 
     def test_streaming_multiple_binary_frames(self, mocker: MockerFixture):
         captured_requests = []
@@ -391,268 +565,6 @@ class TestStreamingSpeechWebSocket:
                 }
 
                 assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
-
-    @pytest.mark.parametrize("streaming_mode", ["token_level", "sentence_commit"])
-    def test_single_request_streaming_requires_server_opt_in(self, streaming_mode: str, mocker: MockerFixture):
-        speech_service = mocker.MagicMock(spec=OmniOpenAIServingSpeech)
-        speech_service.engine_client = SimpleNamespace(
-            model_config=SimpleNamespace(streaming_text_enabled=False),
-            abort=mocker.AsyncMock(),
-        )
-        speech_service._prepare_speech_generation = mocker.AsyncMock()
-        app, _ = _build_test_app(speech_service)
-
-        with TestClient(app) as client:
-            with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json(
-                    {
-                        "type": "session.config",
-                        "voice": "Vivian",
-                        "streaming_mode": streaming_mode,
-                        "response_format": "pcm",
-                    }
-                )
-
-                error = ws.receive_json()
-                assert error["type"] == "error"
-                assert "disabled" in error["message"]
-
-        speech_service._prepare_speech_generation.assert_not_awaited()
-
-    @pytest.mark.parametrize("streaming_mode", ["token_level", "sentence_commit"])
-    def test_single_request_streaming_rejects_word_timestamps(self, streaming_mode: str):
-        with pytest.raises(ValueError, match="word_timestamps is not supported"):
-            streaming_speech_module.StreamingSpeechSessionConfig(
-                voice="Vivian",
-                streaming_mode=streaming_mode,
-                response_format="pcm",
-                word_timestamps=True,
-            )
-
-    def test_token_level_sends_finished_after_audio_stream_completes(self, mocker: MockerFixture):
-        speech_service = mocker.MagicMock(spec=OmniOpenAIServingSpeech)
-        speech_service.engine_client = SimpleNamespace(
-            model_config=SimpleNamespace(streaming_text_enabled=True),
-            abort=mocker.AsyncMock(),
-        )
-        speech_service.engine_client.extend_streaming_text = mocker.Mock()
-
-        async def prepare(request):
-            assert request.streaming_text_input is True
-            return "req-token", object(), {}
-
-        async def chunks(_generator, _request_id):
-            yield b"\x01\x02"
-
-        speech_service._prepare_speech_generation = mocker.AsyncMock(side_effect=prepare)
-        speech_service._generate_pcm_chunks = chunks
-        app, _ = _build_test_app(speech_service)
-
-        with TestClient(app) as client:
-            with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json(
-                    {
-                        "type": "session.config",
-                        "voice": "Vivian",
-                        "streaming_mode": "token_level",
-                        "response_format": "pcm",
-                    }
-                )
-                ws.send_json({"type": "input.text", "text": "x" * 60})
-
-                assert ws.receive_json()["type"] == "audio.start"
-                assert ws.receive_bytes() == b"\x01\x02"
-                assert ws.receive_json() == {
-                    "type": "audio.done",
-                    "sentence_index": 0,
-                    "total_bytes": 2,
-                    "error": False,
-                }
-                assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
-
-        speech_service.engine_client.extend_streaming_text.assert_called_with("req-token", new_text="", finished=True)
-
-    @pytest.mark.asyncio
-    async def test_token_level_buffer_limit_reports_error_and_aborts(self, monkeypatch, mocker: MockerFixture):
-        monkeypatch.setattr(streaming_speech_module, "_MAX_BUFFER_SIZE", 61)
-        speech_service = mocker.MagicMock(spec=OmniOpenAIServingSpeech)
-        speech_service.engine_client = SimpleNamespace(
-            model_config=SimpleNamespace(streaming_text_enabled=True),
-            abort=mocker.AsyncMock(),
-        )
-        speech_service.engine_client.extend_streaming_text = mocker.Mock()
-        speech_service._prepare_speech_generation = mocker.AsyncMock(return_value=("req-token", object(), {}))
-
-        async def chunks(_generator, _request_id):
-            await asyncio.sleep(0.05)
-            yield b"\x01"
-
-        speech_service._generate_pcm_chunks = chunks
-        handler = OmniStreamingSpeechHandler(speech_service=speech_service, idle_timeout=0.01)
-        websocket = mocker.MagicMock()
-        websocket.receive_text = mocker.AsyncMock(
-            side_effect=[
-                json.dumps({"type": "input.text", "text": "x" * 60}),
-                json.dumps({"type": "input.text", "text": "y" * 2}),
-            ]
-        )
-        websocket.send_json = mocker.AsyncMock()
-        websocket.send_bytes = mocker.AsyncMock()
-        config = streaming_speech_module.StreamingSpeechSessionConfig(
-            voice="Vivian",
-            streaming_mode="token_level",
-            response_format="pcm",
-        )
-
-        await handler._handle_token_level_session(websocket, config)
-
-        speech_service.engine_client.abort.assert_awaited_once_with("req-token")
-        error_payloads = [call.args[0] for call in websocket.send_json.await_args_list if call.args]
-        assert {"type": "error", "message": "input.text buffer exceeded limit"} in error_payloads
-
-    @pytest.mark.asyncio
-    async def test_sentence_commit_reuses_one_request_and_flushes_pending_text(self, mocker: MockerFixture):
-        finish_event = asyncio.Event()
-        speech_service = mocker.MagicMock(spec=OmniOpenAIServingSpeech)
-        speech_service.engine_client = SimpleNamespace(
-            model_config=SimpleNamespace(streaming_text_enabled=True),
-            abort=mocker.AsyncMock(),
-        )
-
-        async def extend_streaming_text(_request_id, *, new_text, finished: bool):
-            if finished:
-                assert new_text == ""
-                finish_event.set()
-            return True
-
-        speech_service.engine_client.extend_streaming_text_confirmed_async = mocker.AsyncMock(
-            side_effect=extend_streaming_text
-        )
-
-        async def prepare(request):
-            assert request.input == "First sentence."
-            assert request.streaming_text_input is True
-            assert request.non_streaming_mode is False
-            return "req-commit", object(), {}
-
-        async def chunks(_generator, _request_id):
-            yield b"\x01"
-            await asyncio.wait_for(finish_event.wait(), timeout=1)
-            yield b"\x02"
-
-        speech_service._prepare_speech_generation = mocker.AsyncMock(side_effect=prepare)
-        speech_service._generate_pcm_chunks = chunks
-        handler = OmniStreamingSpeechHandler(speech_service=speech_service)
-        websocket = mocker.MagicMock()
-        websocket.receive_text = mocker.AsyncMock(
-            side_effect=[
-                json.dumps({"type": "input.text", "text": "First sentence."}),
-                json.dumps({"type": "input.commit", "commit_id": "first"}),
-                json.dumps({"type": "input.text", "text": " Second sentence."}),
-                json.dumps({"type": "input.commit", "commit_id": "second"}),
-                json.dumps({"type": "input.text", "text": " Final sentence."}),
-                json.dumps({"type": "input.done"}),
-            ]
-        )
-        websocket.send_json = mocker.AsyncMock()
-        websocket.send_bytes = mocker.AsyncMock()
-        config = streaming_speech_module.StreamingSpeechSessionConfig(
-            voice="Vivian",
-            streaming_mode="sentence_commit",
-            response_format="pcm",
-        )
-
-        await handler._handle_sentence_commit_session(websocket, config)
-
-        speech_service._prepare_speech_generation.assert_awaited_once()
-        assert speech_service.engine_client.extend_streaming_text_confirmed_async.call_args_list == [
-            mocker.call("req-commit", new_text="", finished=False),
-            mocker.call("req-commit", new_text=" Second sentence.", finished=False),
-            mocker.call("req-commit", new_text=" Final sentence.", finished=False),
-            mocker.call("req-commit", new_text="", finished=True),
-        ]
-        json_payloads = [call.args[0] for call in websocket.send_json.await_args_list]
-        assert [payload for payload in json_payloads if payload["type"] == "input.committed"] == [
-            {
-                "type": "input.committed",
-                "commit_id": "first",
-                "sentence_index": 0,
-                "chars_committed": 15,
-            },
-            {
-                "type": "input.committed",
-                "commit_id": "second",
-                "sentence_index": 1,
-                "chars_committed": 17,
-            },
-            {
-                "type": "input.committed",
-                "commit_id": None,
-                "sentence_index": 2,
-                "chars_committed": 16,
-            },
-        ]
-        assert json_payloads[-2] == {
-            "type": "audio.done",
-            "sentence_index": 0,
-            "total_bytes": 2,
-            "error": False,
-        }
-        assert json_payloads[-1] == {"type": "session.done", "total_sentences": 3}
-
-    @pytest.mark.asyncio
-    async def test_sentence_commit_rejects_empty_commit_without_ending_session(self, mocker: MockerFixture):
-        finish_event = asyncio.Event()
-        speech_service = mocker.MagicMock(spec=OmniOpenAIServingSpeech)
-        speech_service.engine_client = SimpleNamespace(
-            model_config=SimpleNamespace(streaming_text_enabled=True),
-            abort=mocker.AsyncMock(),
-        )
-
-        async def extend_streaming_text(_request_id, *, new_text, finished: bool):
-            if finished:
-                finish_event.set()
-            return True
-
-        speech_service.engine_client.extend_streaming_text_confirmed_async = mocker.AsyncMock(
-            side_effect=extend_streaming_text
-        )
-        speech_service._prepare_speech_generation = mocker.AsyncMock(return_value=("req-commit", object(), {}))
-
-        async def chunks(_generator, _request_id):
-            await asyncio.wait_for(finish_event.wait(), timeout=1)
-            yield b"\x01"
-
-        speech_service._generate_pcm_chunks = chunks
-        handler = OmniStreamingSpeechHandler(speech_service=speech_service)
-        websocket = mocker.MagicMock()
-        websocket.receive_text = mocker.AsyncMock(
-            side_effect=[
-                json.dumps({"type": "input.commit", "commit_id": "empty"}),
-                json.dumps({"type": "input.text", "text": "Committed sentence."}),
-                json.dumps({"type": "input.commit", "commit_id": "valid"}),
-                json.dumps({"type": "input.done"}),
-            ]
-        )
-        websocket.send_json = mocker.AsyncMock()
-        websocket.send_bytes = mocker.AsyncMock()
-        config = streaming_speech_module.StreamingSpeechSessionConfig(
-            voice="Vivian",
-            streaming_mode="sentence_commit",
-            response_format="pcm",
-        )
-
-        await handler._handle_sentence_commit_session(websocket, config)
-
-        payloads = [call.args[0] for call in websocket.send_json.await_args_list]
-        assert {"type": "error", "message": "input.commit requires buffered text"} in payloads
-        assert {
-            "type": "input.committed",
-            "commit_id": "valid",
-            "sentence_index": 0,
-            "chars_committed": 19,
-        } in payloads
-        assert payloads[-1] == {"type": "session.done", "total_sentences": 1}
 
     def test_config_timeout_closes_session(self, mocker: MockerFixture):
         app, _ = _build_test_app(config_timeout=0.01, mocker=mocker)

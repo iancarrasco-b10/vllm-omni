@@ -166,18 +166,6 @@ class OpenAICreateSpeechRequest(BaseModel):
             "when streaming is off."
         ),
     )
-    streaming_text_input: bool = Field(
-        default=False,
-        description="Internal flag: set by token_level streaming handler to enable "
-        "incremental text embedding append in the Talker model.",
-    )
-    streaming_drain_max_steps: int = Field(
-        default=100,
-        ge=0,
-        description="Max decode steps after text input is fully drained before "
-        "runtime force-finishes the request. 0 means force-finish immediately "
-        "when text + EOS are consumed (no grace period for natural codec EOS).",
-    )
 
     @field_validator("stream_format")
     @classmethod
@@ -516,7 +504,7 @@ class StreamingSpeechInputCommit(BaseModel):
 
 
 class StreamingSpeechInputCommitted(BaseModel):
-    """Acknowledgement that a text commit was accepted by the engine."""
+    """Acknowledgement that a text commit was queued for the resumable request."""
 
     type: Literal["input.committed"] = "input.committed"
     commit_id: str | None = None
@@ -579,14 +567,6 @@ class StreamingSpeechSessionConfig(BaseModel):
             "'token_level' feeds text incrementally to a single TTS request; "
             "'sentence_commit' buffers input.text messages until input.commit, then appends "
             "each commit to one persistent TTS request."
-        ),
-    )
-    streaming_drain_max_steps: int = Field(
-        default=100,
-        ge=0,
-        description=(
-            "Max decode steps after text + EOS are fully consumed before "
-            "runtime force-finishes the request. Used in token_level and sentence_commit modes."
         ),
     )
 
