@@ -79,6 +79,114 @@ class TestStreamingSpeechWebSocket:
 
         assert speech_service._generate_audio_bytes.await_count == 1
 
+    def test_input_done_flushes_and_keeps_connection_open(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json({"type": "session.config", "voice": "Vivian"})
+
+                # The same connection serves several utterances; the config
+                # sent once at the top keeps applying and indices keep rising.
+                for expected_index, text in enumerate(("First utterance. ", "Second utterance. ")):
+                    ws.send_json({"type": "input.text", "text": text})
+                    ws.send_json({"type": "input.done"})
+
+                    start = ws.receive_json()
+                    assert start["type"] == "audio.start"
+                    assert start["sentence_index"] == expected_index
+                    assert start["sentence_text"] == text.strip()
+                    assert ws.receive_bytes().startswith(b"RIFF")
+                    assert ws.receive_json()["type"] == "audio.done"
+                    assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
+
+        assert speech_service._generate_audio_bytes.await_count == 2
+        assert [call.args[0].voice for call in speech_service._generate_audio_bytes.await_args_list] == [
+            "Vivian",
+            "Vivian",
+        ]
+
+    def test_session_config_between_utterances_replaces_config(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                for voice in ("Vivian", "Serena"):
+                    ws.send_json({"type": "session.config", "voice": voice})
+                    ws.send_json({"type": "input.text", "text": "Hello world. "})
+                    ws.send_json({"type": "input.done"})
+
+                    assert ws.receive_json()["type"] == "audio.start"
+                    ws.receive_bytes()
+                    assert ws.receive_json()["type"] == "audio.done"
+                    assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
+
+        assert [call.args[0].voice for call in speech_service._generate_audio_bytes.await_args_list] == [
+            "Vivian",
+            "Serena",
+        ]
+
+    def test_session_config_rejected_while_input_is_buffered(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "input.text", "text": "Hello world. "})
+                ws.send_json({"type": "session.config", "voice": "Serena"})
+
+                error = ws.receive_json()
+                assert error["type"] == "error"
+                assert "while input is buffered" in error["message"]
+
+                # The buffered text survives the rejected reconfiguration.
+                ws.send_json({"type": "input.done"})
+                assert ws.receive_json()["sentence_text"] == "Hello world."
+                ws.receive_bytes()
+                assert ws.receive_json()["type"] == "audio.done"
+                assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
+
+        assert speech_service._generate_audio_bytes.await_args_list[0].args[0].voice == "Vivian"
+
+    def test_session_close_ends_connection(self, mocker: MockerFixture):
+        app, _ = _build_test_app(mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "input.text", "text": "Hello world. "})
+                ws.send_json({"type": "input.done"})
+
+                assert ws.receive_json()["type"] == "audio.start"
+                ws.receive_bytes()
+                assert ws.receive_json()["type"] == "audio.done"
+                assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
+
+                ws.send_json({"type": "session.close"})
+                with pytest.raises(WebSocketDisconnect):
+                    ws.receive_json()
+
+    def test_idle_timeout_closes_reused_connection(self, mocker: MockerFixture):
+        app, _ = _build_test_app(idle_timeout=0.05, mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "input.text", "text": "Hello world. "})
+                ws.send_json({"type": "input.done"})
+
+                assert ws.receive_json()["type"] == "audio.start"
+                ws.receive_bytes()
+                assert ws.receive_json()["type"] == "audio.done"
+                assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
+
+                # Holding a connection open is not free: an idle client still
+                # gets timed out after the flush.
+                assert ws.receive_json() == {
+                    "type": "error",
+                    "message": "Idle timeout: no message received",
+                }
+
     def test_streaming_multiple_binary_frames(self, mocker: MockerFixture):
         captured_requests = []
 
