@@ -50,6 +50,15 @@ class InteractionMessage(EngineQueueMessage, kw_only=True):
     interaction: OmniInteractionPrompt
 
 
+class StreamingTextExtendMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["streaming_text_extend"] = "streaming_text_extend"
+    request_id: str
+    new_text: str
+    finished: bool
+    rpc_id: str | None = None
+    update_id: str | None = None
+
+
 class CollectiveRPCRequestMessage(EngineQueueMessage, kw_only=True):
     type: Literal["collective_rpc"] = "collective_rpc"
     rpc_id: str

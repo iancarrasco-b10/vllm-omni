@@ -1746,6 +1746,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
         needs_pooler_payload = len(downstream_req_ids) > 0
         downstream_req_id_set = set(downstream_req_ids)
+        skipped_streaming_ids = getattr(self, "_streaming_starving_req_ids", set()) | getattr(
+            self,
+            "_streaming_drained_req_ids",
+            set(),
+        )
+        if skipped_streaming_ids:
+            downstream_req_id_set -= skipped_streaming_ids
+            downstream_req_ids = [rid for rid in downstream_req_ids if rid in downstream_req_id_set]
+            needs_pooler_payload = bool(downstream_req_ids)
         hidden_states_cpu = None
         req_hidden_states_cpu: dict[str, torch.Tensor] | None = None
         include_hidden_payload = self._model_omni_pooler_payload_include_hidden()
@@ -1889,6 +1898,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             with record_function_or_nullcontext("omni_output_builder:get_omni_connector_output"):
                 output.omni_connector_output = self.get_omni_connector_output()
             output.routed_experts = routed_experts_lists
+            starving = getattr(self, "_streaming_starving_req_ids", None)
+            if starving:
+                output.streaming_starving_req_ids = starving
+                output.streaming_starving_req_epochs = getattr(self, "_streaming_starving_req_epochs", {})
+            drained = getattr(self, "_streaming_drained_req_ids", None)
+            if drained:
+                output.streaming_drained_req_ids = drained
         return output
 
     @torch.inference_mode()
@@ -2025,6 +2041,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
             )
+
+        _skip_ids_bk = getattr(self, "_streaming_starving_req_ids", set()) | getattr(
+            self,
+            "_streaming_drained_req_ids",
+            set(),
+        )
+        if _skip_ids_bk and valid_sampled_token_ids is not None:
+            for rid in _skip_ids_bk:
+                idx = req_id_to_index_output_copy.get(rid)
+                if idx is not None and idx < len(valid_sampled_token_ids):
+                    valid_sampled_token_ids[idx] = []
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled

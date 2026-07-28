@@ -100,6 +100,28 @@ def _make_minimal_builder(
     return builder
 
 
+def test_streaming_icl_prompt_does_not_append_text_eos():
+    builder = _make_minimal_builder()
+    builder._text_embedding = lambda ids: ids.unsqueeze(-1).expand(*ids.shape, 4).to(torch.float32)
+    builder._residual_code_embeddings = lambda: [
+        lambda ids: torch.zeros((*ids.shape, 4), dtype=torch.float32, device=ids.device)
+    ]
+    kwargs = {
+        "text_id": torch.tensor([[3, 4]]),
+        "ref_id": torch.tensor([[1, 2]]),
+        "ref_code": torch.tensor([[5, 6]]),
+        "tts_pad_embed": torch.zeros((1, 1, 4)),
+        "tts_eos_embed": torch.full((1, 1, 4), 101.0),
+        "non_streaming_mode": False,
+    }
+
+    _, streaming_tail = builder._generate_icl_prompt(**kwargs, append_text_eos=False)
+    _, complete_tail = builder._generate_icl_prompt(**kwargs, append_text_eos=True)
+
+    assert streaming_tail.shape[1] + 1 == complete_tail.shape[1]
+    assert torch.equal(complete_tail[:, -1:], kwargs["tts_eos_embed"])
+
+
 def test_single_token_prefill_uses_prefill_path():
     full_prompt_embeds = torch.arange(12, dtype=torch.float32).reshape(3, 4)
     trailing_text = torch.ones((2, 4), dtype=torch.float32)
@@ -284,6 +306,39 @@ def test_decode_replay_span_embeds_all_tokens_without_mutating_decode_state():
         torch.tensor([[101.0] * 4, [202.0] * 4, [303.0] * 4], dtype=torch.bfloat16),
     )
     assert update == {"meta": {"codec_streaming": True}}
+
+
+def test_streaming_text_starvation_pauses_before_decode():
+    model = _make_minimal_talker()
+
+    out_ids, out_embeds, update = model.preprocess(
+        input_ids=torch.tensor([123], dtype=torch.long),
+        input_embeds=None,
+        text=["hello"],
+        task_type=["CustomVoice"],
+        hidden_states={
+            "trailing_text": torch.empty((0, 4), dtype=torch.bfloat16),
+            "last": torch.ones((4,), dtype=torch.bfloat16),
+        },
+        meta={"streaming_text_input": True, "talker_text_offset": 0},
+        streaming_text_finished=False,
+        _omni_is_prefill=False,
+        _omni_num_computed_tokens=2,
+        _omni_prompt_len=2,
+    )
+
+    assert out_ids.tolist() == [123]
+    assert out_embeds is None
+    assert update["meta"]["streaming_wait_for_input"] is True
+    assert update["streaming_text_new_text"] is None
+
+
+def test_streaming_text_requests_bypass_decode_batch_fast_path():
+    model = _make_minimal_talker()
+
+    assert model.can_preprocess_decode_batch({"meta": {"streaming_text_input": False}})
+    assert not model.can_preprocess_decode_batch({"meta": {"streaming_text_input": True}})
+    assert not model.can_preprocess_decode_batch({"additional_information": {"meta": {"streaming_text_input": True}}})
 
 
 def test_decode_batch_preprocess_matches_decode_state_updates():

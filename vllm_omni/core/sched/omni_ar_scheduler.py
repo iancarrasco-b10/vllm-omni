@@ -335,10 +335,38 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 except Exception:
                     init_logger(__name__).exception("Failed to pre-process KV extraction for %s", req_id)
 
+        # Roll back num_computed_tokens for requests that were skipped during
+        # forward (streaming text starving). schedule() already incremented
+        # num_computed_tokens before execute_model, but the model runner
+        # skipped these requests, so no token was actually computed.
+        starving_ids = getattr(model_runner_output, "streaming_starving_req_ids", None) or set()
+        starving_epochs = getattr(model_runner_output, "streaming_starving_req_epochs", None) or {}
+        wake_epochs = getattr(self, "_streaming_text_wake_epochs", {})
+        starving_running_reqs: set[Request] = set()
+        for sid in starving_ids:
+            req = self.requests.get(sid)
+            if req is not None and sid in num_scheduled_tokens:
+                req.num_computed_tokens -= num_scheduled_tokens[sid]
+                if self._is_stale_streaming_text_starvation(sid, starving_epochs.get(sid), wake_epochs):
+                    continue
+                if self._pause_streaming_text_input(req):
+                    starving_running_reqs.add(req)
+
+        # Force-finish requests whose streaming text input is fully drained.
+        # Same rollback as starving (forward was skipped), then mark FINISHED.
+        drained_ids = getattr(model_runner_output, "streaming_drained_req_ids", None) or set()
+        for did in drained_ids:
+            req = self.requests.get(did)
+            if req is not None:
+                if did in num_scheduled_tokens:
+                    req.num_computed_tokens -= num_scheduled_tokens[did]
+                if not req.is_finished():
+                    req.status = RequestStatus.FINISHED_STOPPED
+
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
         # to avoid expensive operations inside the loop.
-        stopped_running_reqs: set[Request] = set()
+        stopped_running_reqs: set[Request] = set(starving_running_reqs)
         stopped_preempted_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
@@ -353,6 +381,26 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 request.num_in_flight_tokens -= num_tokens_scheduled
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # Skip requests that were recovered from KV load failure
+                continue
+            if req_id in starving_ids:
+                continue
+            if req_id in drained_ids:
+                if request is not None and request.is_finished():
+                    finish_reason = request.get_finished_reason()
+                    finished = self._handle_stopped_request(request)
+                    if finished:
+                        self._free_request(request)
+                    stopped_running_reqs.add(request)
+                    outputs[request.client_index].append(
+                        EngineCoreOutput(
+                            request_id=req_id,
+                            new_token_ids=[],
+                            finish_reason=finish_reason,
+                            events=request.take_events(),
+                            trace_headers=request.trace_headers,
+                            num_cached_tokens=request.num_cached_tokens,
+                        )
+                    )
                 continue
             if request is None or request.is_finished():
                 # The request is already finished. This can happen if the
@@ -701,6 +749,45 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self._free_input_coordinator_request(request.request_id)
         return finished
 
+    @staticmethod
+    def _is_stale_streaming_text_starvation(
+        request_id: str,
+        observed_epoch: str | None,
+        wake_epochs: dict[str, str],
+    ) -> bool:
+        return request_id in wake_epochs and observed_epoch != wake_epochs[request_id]
+
+    def _pause_streaming_text_input(self, request: Request) -> bool:
+        """Move a starved running request to the blocked waiting queue."""
+        if request.status != RequestStatus.RUNNING:
+            return False
+        request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+        self.num_waiting_for_streaming_input += 1
+        self.prev_step_scheduled_req_ids.discard(request.request_id)
+        self._enqueue_waiting_request(request)
+        return True
+
+    def resume_streaming_text_input(self, request_id: str, update_id: str) -> bool:
+        """Requeue a request paused because its streaming text was exhausted."""
+        request = self.requests.get(request_id)
+        if request is None or request.is_finished():
+            return False
+        wake_epochs = getattr(self, "_streaming_text_wake_epochs", None)
+        if wake_epochs is None:
+            wake_epochs = self._streaming_text_wake_epochs = {}
+        wake_epochs[request_id] = update_id
+        if request.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
+            return True
+
+        self.num_waiting_for_streaming_input -= 1
+        request.status = RequestStatus.PREEMPTED
+        if request in self.skipped_waiting:
+            self.skipped_waiting.remove_requests((request,))
+        self._enqueue_waiting_request(request)
+        if self.log_stats:
+            request.record_event(EngineCoreEventType.QUEUED)
+        return True
+
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
         """
         Override: Only extend prompt at stage 0, and replace
@@ -757,6 +844,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         assert request.is_finished()
 
         self._omits_kv_transfer_cache.pop(request.request_id, None)
+        getattr(self, "_streaming_text_wake_epochs", {}).pop(request.request_id, None)
 
         # [Upstream compat] Discard request from in-flight prefills set added
         # upstream for routed-experts in-flight reservation tracking.
