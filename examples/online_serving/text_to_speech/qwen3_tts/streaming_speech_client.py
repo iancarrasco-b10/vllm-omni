@@ -70,18 +70,27 @@ except ImportError:
     raise SystemExit(1)
 
 
-def save_audio_file(output_dir: str, sentence_index: int, response_format: str, chunks: list[bytes]) -> str:
+def frame_basename(msg: dict) -> str:
+    """Name a file after the utterance and sentence a frame belongs to.
+
+    Every utterance is sentence 0, so the utterance index is what keeps the
+    files of one connection from overwriting each other.
+    """
+    return f"utterance_{msg['utterance_index']:03d}_sentence_{msg['sentence_index']:03d}"
+
+
+def save_audio_file(output_dir: str, basename: str, response_format: str, chunks: list[bytes]) -> str:
     audio_bytes = b"".join(chunks)
     if response_format == "pcm":
-        raw_path = os.path.join(output_dir, f"sentence_{sentence_index:03d}.pcm")
+        raw_path = os.path.join(output_dir, f"{basename}.pcm")
         with open(raw_path, "wb") as f:
             f.write(audio_bytes)
 
-        wav_path = os.path.join(output_dir, f"sentence_{sentence_index:03d}.wav")
+        wav_path = os.path.join(output_dir, f"{basename}.wav")
         save_pcm_wav(wav_path, audio_bytes)
         return wav_path
 
-    filename = os.path.join(output_dir, f"sentence_{sentence_index:03d}.{response_format}")
+    filename = os.path.join(output_dir, f"{basename}.{response_format}")
     with open(filename, "wb") as f:
         f.write(audio_bytes)
     return filename
@@ -140,7 +149,7 @@ async def receive_utterance(
     save_chunks: bool,
 ) -> None:
     """Consume frames until session.done marks the flushed utterance complete."""
-    current_sentence_index = 0
+    current_label = "utterance 0"
     current_sentence_text = ""
     current_chunks: list[bytes] = []
     current_timestamps: list[dict] = []
@@ -153,19 +162,19 @@ async def receive_utterance(
 
         if isinstance(message, bytes):
             current_chunks.append(message)
-            print(f"  Received audio chunk for sentence {current_sentence_index}: {len(message)} bytes")
+            print(f"  Received audio chunk for {current_label}: {len(message)} bytes")
         else:
             # JSON frame
             msg = json.loads(message)
             msg_type = msg.get("type")
 
             if msg_type == "audio.start":
-                current_sentence_index = msg["sentence_index"]
+                current_label = f"utterance {msg['utterance_index']}"
                 current_sentence_text = msg.get("sentence_text", "")
                 current_chunks = []
                 current_timestamps = []
                 alignment_frame_seen = False
-                print(f"  [sentence {msg['sentence_index']}] Generating: {current_sentence_text!r}")
+                print(f"  [{current_label}] Generating: {current_sentence_text!r}")
             elif msg_type == "audio.chunk":
                 audio = base64.b64decode(msg["audio_b64"])
                 current_chunks.append(audio)
@@ -175,7 +184,7 @@ async def receive_utterance(
                 if save_chunks and audio:
                     chunk_base = os.path.join(
                         output_dir,
-                        f"sentence_{msg['sentence_index']:03d}_chunk_{msg['chunk_id']:03d}",
+                        f"{frame_basename(msg)}_chunk_{msg['chunk_id']:03d}",
                     )
                     chunk_pcm = f"{chunk_base}.pcm"
                     chunk_wav = f"{chunk_base}.wav"
@@ -186,6 +195,7 @@ async def receive_utterance(
                     with open(chunk_json, "w", encoding="utf-8") as f:
                         json.dump(
                             {
+                                "utterance_index": msg["utterance_index"],
                                 "sentence_index": msg["sentence_index"],
                                 "chunk_id": msg["chunk_id"],
                                 "chunk_start_ms": msg.get("chunk_start_ms"),
@@ -199,15 +209,12 @@ async def receive_utterance(
                             indent=2,
                         )
                 if chunk_timestamps is None:
-                    print(
-                        f"  [sentence {msg['sentence_index']}] chunk {msg['chunk_id']}: "
-                        f"{len(audio)} bytes, timestamps unavailable"
-                    )
+                    print(f"  [{current_label}] chunk {msg['chunk_id']}: {len(audio)} bytes, timestamps unavailable")
                 else:
                     alignment_frame_seen = True
                     current_timestamps.extend(chunk_timestamps)
                     print(
-                        f"  [sentence {msg['sentence_index']}] chunk {msg['chunk_id']}: "
+                        f"  [{current_label}] chunk {msg['chunk_id']}: "
                         f"{len(audio)} bytes, {len(chunk_timestamps)} timestamp(s)"
                     )
                 if save_chunks and audio:
@@ -215,7 +222,7 @@ async def receive_utterance(
             elif msg_type == "audio.done":
                 filename = save_audio_file(
                     output_dir,
-                    msg["sentence_index"],
+                    frame_basename(msg),
                     response_format,
                     current_chunks,
                 )
@@ -224,11 +231,12 @@ async def receive_utterance(
                     sentence_timestamps = current_timestamps if alignment_frame_seen else None
                     ts_filename = os.path.join(
                         output_dir,
-                        f"sentence_{msg['sentence_index']:03d}_timestamps.json",
+                        f"{frame_basename(msg)}_timestamps.json",
                     )
                     with open(ts_filename, "w", encoding="utf-8") as f:
                         json.dump(
                             {
+                                "utterance_index": msg["utterance_index"],
                                 "sentence_index": msg["sentence_index"],
                                 "sentence_text": current_sentence_text,
                                 "covered_text": timestamp_words_text(sentence_timestamps),
@@ -239,18 +247,18 @@ async def receive_utterance(
                             indent=2,
                         )
                 print(
-                    f"  [sentence {msg['sentence_index']}] Done"
+                    f"  [{current_label}] Done"
                     f" bytes={msg.get('total_bytes', len(b''.join(current_chunks)))}"
                     f" error={msg.get('error', False)}"
                     f" -> {filename}"
                 )
                 if word_timestamps:
-                    print(f"  [sentence {msg['sentence_index']}] Timestamps -> {ts_filename}")
+                    print(f"  [{current_label}] Timestamps -> {ts_filename}")
                 current_chunks = []
                 current_timestamps = []
                 alignment_frame_seen = False
             elif msg_type == "session.done":
-                print(f"\nUtterance complete: {msg['total_sentences']} sentence(s) generated")
+                print(f"\nUtterance {msg['utterance_index']} complete: {msg['total_sentences']} sentence(s) generated")
                 return
             elif msg_type == "error":
                 print(f"  ERROR: {msg['message']}")

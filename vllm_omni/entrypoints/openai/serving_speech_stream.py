@@ -10,6 +10,10 @@ session.close, on the idle timeout, or when the client closes the socket.
 The session config is sticky across flushes and can be replaced by sending
 another session.config between utterances.
 
+"Utterance" here names the flush unit rather than any linguistic unit: it is
+whatever text the client had buffered when it sent input.done, from a word to
+several paragraphs, synthesized as a single request.
+
 Protocol:
     Client -> Server:
         {"type": "session.config", ...}   # Session config (first message; repeatable)
@@ -18,21 +22,27 @@ Protocol:
         {"type": "session.close"}         # End of connection
 
     Server -> Client (default, word_timestamps=false):
-        {"type": "audio.start", "sentence_index": 0, "sentence_text": "...", "format": "wav"}
+        {"type": "audio.start", "utterance_index": 0, "sentence_index": 0,
+         "sentence_text": "...", "format": "wav"}
         <binary frame: audio bytes>
         ...
-        {"type": "audio.done", "sentence_index": 0}
-        {"type": "session.done", "total_sentences": N}
+        {"type": "audio.done", "utterance_index": 0, "sentence_index": 0}
+        {"type": "session.done", "utterance_index": 0, "total_sentences": N}
         {"type": "error", "message": "..."}
-        # session.done ends the flushed utterance, not the connection. Indices
-        # keep counting up across the utterances of one connection.
+        # session.done ends the flushed utterance, not the connection. An
+        # utterance is just the flush unit: whatever text was buffered when
+        # input.done arrived, of any length. utterance_index counts those
+        # flushes across the connection, while sentence_index counts within
+        # one of them and so pairs with total_sentences.
 
     Server -> Client (when word_timestamps=true):
-        {"type": "audio.start", "sentence_index": 0, "sentence_text": "...", "format": "pcm"}
-        {"type": "audio.chunk", "sentence_index": 0, "chunk_id": 0, "audio_b64": "<base64 PCM>", "timestamps": null}
+        {"type": "audio.start", "utterance_index": 0, "sentence_index": 0,
+         "sentence_text": "...", "format": "pcm"}
+        {"type": "audio.chunk", "utterance_index": 0, "sentence_index": 0, "chunk_id": 0,
+         "audio_b64": "<base64 PCM>", "timestamps": null}
         ...
         {"type": "audio.chunk", "audio_b64": "", "timestamps": [{"word", "start_ms", "end_ms"}, ...]}
-        {"type": "audio.done", "sentence_index": 0}
+        {"type": "audio.done", "utterance_index": 0, "sentence_index": 0}
         # Audio is JSON base64 PCM (not binary). A trailing empty-audio chunk carries the
         # full sentence-relative alignment. timestamps: list = aligned, [] = silence, null = failed.
 """
@@ -103,7 +113,7 @@ class OmniStreamingSpeechHandler:
 
         config: StreamingSpeechSessionConfig | None = None
         text_parts: list[str] = []
-        sentence_index = 0
+        utterance_index = 0
 
         try:
             while True:
@@ -160,16 +170,25 @@ class OmniStreamingSpeechHandler:
                     text_parts.clear()
                     total_sentences = 0
                     if full_text:
-                        await self._generate_and_send(websocket, config, full_text, sentence_index)
-                        sentence_index += 1
+                        # However long the buffered text is, the pipeline takes
+                        # it as one request, so every flush is sentence 0 of 1.
+                        await self._generate_and_send(
+                            websocket,
+                            config,
+                            full_text,
+                            utterance_index=utterance_index,
+                            sentence_index=0,
+                        )
                         total_sentences = 1
 
                     await websocket.send_json(
                         {
                             "type": "session.done",
+                            "utterance_index": utterance_index,
                             "total_sentences": total_sentences,
                         }
                     )
+                    utterance_index += 1
 
                 elif msg_type == "session.close":
                     await websocket.close()
@@ -241,9 +260,15 @@ class OmniStreamingSpeechHandler:
         websocket: WebSocket,
         config: StreamingSpeechSessionConfig,
         sentence_text: str,
+        *,
+        utterance_index: int,
         sentence_index: int,
     ) -> None:
-        """Generate audio for a single sentence and send it over WebSocket."""
+        """Generate audio for a single sentence and send it over WebSocket.
+
+        ``utterance_index`` identifies the flush this sentence belongs to and
+        ``sentence_index`` its position inside that flush.
+        """
         response_format = config.response_format or "wav"
 
         # Reject unmet word-timestamps preconditions early with a clear reason.
@@ -286,6 +311,7 @@ class OmniStreamingSpeechHandler:
 
         start_payload = {
             "type": "audio.start",
+            "utterance_index": utterance_index,
             "sentence_index": sentence_index,
             "sentence_text": sentence_text,
             "format": response_format,
@@ -310,6 +336,7 @@ class OmniStreamingSpeechHandler:
                         request_id=request_id,
                         generator=generator,
                         sentence_text=sentence_text,
+                        utterance_index=utterance_index,
                         sentence_index=sentence_index,
                         language=config.language,
                     )
@@ -331,13 +358,22 @@ class OmniStreamingSpeechHandler:
             raise
         except Exception as e:
             generation_failed = True
-            logger.error("Generation failed for sentence %d: %s", sentence_index, e)
-            await self._send_error(websocket, f"Generation failed for sentence {sentence_index}: {e}")
+            logger.error(
+                "Generation failed for utterance %d, sentence %d: %s",
+                utterance_index,
+                sentence_index,
+                e,
+            )
+            await self._send_error(
+                websocket,
+                f"Generation failed for utterance {utterance_index}, sentence {sentence_index}: {e}",
+            )
         finally:
             try:
                 await websocket.send_json(
                     {
                         "type": "audio.done",
+                        "utterance_index": utterance_index,
                         "sentence_index": sentence_index,
                         "total_bytes": total_bytes,
                         "error": generation_failed,
@@ -353,6 +389,7 @@ class OmniStreamingSpeechHandler:
         request_id: str,
         generator,
         sentence_text: str,
+        utterance_index: int,
         sentence_index: int,
         language: str | None = None,
     ) -> int:
@@ -383,6 +420,7 @@ class OmniStreamingSpeechHandler:
             await websocket.send_json(
                 {
                     "type": "audio.chunk",
+                    "utterance_index": utterance_index,
                     "sentence_index": sentence_index,
                     "chunk_id": chunk_id,
                     "chunk_start_ms": chunk_start_ms,

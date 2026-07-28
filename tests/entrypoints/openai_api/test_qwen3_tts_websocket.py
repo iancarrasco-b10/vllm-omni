@@ -137,6 +137,7 @@ class TestQwen3TTSWebSocket:
         session_done = result["session_done"]
 
         assert session_done is not None
+        assert session_done["utterance_index"] == 0
         assert session_done["total_sentences"] == 1
         assert len(starts) == 1
         assert len(dones) == 1
@@ -171,10 +172,16 @@ class TestQwen3TTSWebSocket:
 
         assert len(results) == len(texts)
         for expected_index, result in enumerate(results):
-            assert result["session_done"] == {"type": "session.done", "total_sentences": 1}
+            assert result["session_done"] == {
+                "type": "session.done",
+                "utterance_index": expected_index,
+                "total_sentences": 1,
+            }
             assert len(result["starts"]) == 1
             assert len(result["dones"]) == 1
-            # Indices keep counting up across the utterances of one connection.
-            assert result["starts"][0]["sentence_index"] == expected_index
+            # utterance_index counts the flushes of the connection, while
+            # sentence_index stays within the flush it belongs to.
+            assert result["starts"][0]["utterance_index"] == expected_index
+            assert result["starts"][0]["sentence_index"] == 0
             assert result["dones"][0]["error"] is False
             assert result["dones"][0]["total_bytes"] > 0

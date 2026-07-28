@@ -285,10 +285,10 @@ Server -> Client:
 
 | Message | Description |
 |---------|-------------|
-| `{"type": "audio.start", "sentence_index": 0, "sentence_text": "...", "format": "pcm", "sample_rate": 24000}` | Audio generation starting for the buffered input |
+| `{"type": "audio.start", "utterance_index": 0, "sentence_index": 0, "sentence_text": "...", "format": "pcm", "sample_rate": 24000}` | Audio generation starting for the buffered input |
 | Binary frame | Raw audio bytes (one or more PCM chunks when `stream_audio=true`) |
-| `{"type": "audio.done", "sentence_index": 0, "total_bytes": 96000, "error": false}` | Audio complete for the buffered input |
-| `{"type": "session.done", "total_sentences": N}` | Flushed utterance complete |
+| `{"type": "audio.done", "utterance_index": 0, "sentence_index": 0, "total_bytes": 96000, "error": false}` | Audio complete for the buffered input |
+| `{"type": "session.done", "utterance_index": 0, "total_sentences": N}` | Flushed utterance complete |
 | `{"type": "error", "message": "..."}` | Non-fatal error |
 
 ### Flushing vs. Closing
@@ -302,9 +302,12 @@ upstream LLM) pays the WebSocket handshake once instead of once per utterance.
   `session.done` to reuse it, or send another `session.config` first to change
   voice, format, or reference audio. A `session.config` sent while text is
   still buffered is rejected so no pending input is silently dropped.
-* `sentence_index` keeps counting up across the utterances of one connection;
-  `total_sentences` counts the utterance that was just flushed (`1`, or `0`
-  when the buffer was empty).
+* An utterance is the flush unit, not a linguistic one: it is whatever text was
+  buffered when `input.done` arrived, of any length, synthesized as one request.
+  `utterance_index` counts those flushes across the connection, so it tells you
+  which `input.done` a frame belongs to. `sentence_index` counts within one
+  flush and so pairs with `total_sentences`, which means every utterance reports
+  `sentence_index: 0` of `total_sentences: 1` (or `0` for an empty buffer).
 * End the connection with `session.close`, or by closing the socket. An idle
   connection is still closed after the server's idle timeout, which now also
   applies to the gap between utterances.
